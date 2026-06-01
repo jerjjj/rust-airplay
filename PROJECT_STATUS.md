@@ -1,7 +1,7 @@
 # Rust AirPlay 镜像接收器 — 开发状态
 
-> 最后更新: 2026-05-31
-> 目标: 用 Rust 实现 AirPlay 镜像接收器，iPad 投屏可用
+> 最后更新: 2026-06-01
+> 状态: ✅ 视频画面可正常解密播放
 
 ## 一、已完成功能 ✅
 
@@ -38,31 +38,24 @@
 
 ---
 
-## 二、待解决问题 🔴
+## 二、已修复问题 ✅
 
-### 问题 1: OmgHax 密钥解密错误（核心阻塞）
-**症状**: Rust 和 C 两种 OmgHax 实现都产生错误的 AES key
+### 问题 1: C 源码与 UxPlay 不一致（核心阻塞 ✅ 已修复）
+**根因**: `omg_hax.c`、`hand_garble.c`、`modified_md5_c.c` 三个 C 文件与上游 UxPlay 的 SHA256 不一致。`omg_hax.h` 头文件一致。
+**修复**: 从 https://github.com/FDH2/UxPlay 下载正确版本替换。
+**影响**: 修复后 OmgHax 产生正确的 AES key，视频解密正常。
 
-**验证**: 使用已知测试向量（从 java-airplay 日志获取），预期 AES key = `655a5ffc2720ea6d9730f16eb17f58e2`
+### 问题 2: `DEFAULT_SAP` 转录错误 ✅ 已修复
+**根因**: Rust 常量中 `0xAA,0xBB` 被误写为 `0xAB`，丢失 1 字节导致 81 字节偏移。
+**修复**: 更正为 `0xAA, 0xBB, 0xE4, 0x0F, ...`。
 
-| 实现 | 输出 | 结果 |
-|------|------|------|
-| Rust `omghax::decrypt_aes_key` | `1688629efaee5d95...` | ❌ 错误 |
-| C `playfair_decrypt` (FFI) | `e10f3c86bf903105...` | ❌ 错误 |
-| java-airplay | `655a5ffc2720ea6d97...` | ✅ 正确 |
+### 问题 3: 视频解密器初始化时序 ✅ 已修复
+**根因**: `streams` SETUP 先于 `ekey` 到达时，用硬编码测试值初始化视频解密器。
+**修复**: 移除测试值回退，改为延迟初始化（ekey 和 streams 任一到达时检查对方是否就绪）。
 
-**分析**: Rust 和 C 的 `generate_session_key` 产生相同的错误 sapKey，说明两者有共同的 bug。C 代码来自 UxPlay（理论上已验证），但可能 MSVC 编译器引入问题，或表格常量有差异。
-
-**影响**: 没有正确的 AES key，视频无法解密。
-
-### 问题 2: 视频解密失败
-- 即使 connId 修复（有符号→无符号），仍无法解密
-- 因为 AES key 不正确，KDF 产生错误的 decrypt_key/decrypt_iv
-- 尝试硬编码 java-airplay 的正确 AES key + shared_secret + connId 仍失败（因为 iPad 加密时使用的是自己 session 的密钥）
-
-### 问题 3: SapHash C/Rust 循环调用
-- C → Rust `sap_hash` (#[no_mangle]) → C `garble` (FFI)
-- 如果 garble 有 MSVC 问题，整个链都有问题
+### 问题 4: `streamConnectionID` PLIST 解析 ✅ 已修复
+**根因**: 只尝试 `as_signed_integer()`，ID 存为 unsigned 时解析失败→默认 0→KDF 错误。
+**修复**: 先尝试 `as_unsigned_integer()`，再回退 `as_signed_integer()`。
 
 ---
 
