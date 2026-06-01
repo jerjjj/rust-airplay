@@ -23,3 +23,18 @@ airplay*.log
 
 # Reasonix
 .reasonix/
+
+# Reference JARs (download from GitHub)
+*.jar
+
+# Extracted table files (regenerated via convert_tables.py)
+table_s1
+table_s2
+table_s3
+table_s4
+table_s5
+table_s6
+table_s7
+table_s8
+table_s9
+table_s10
