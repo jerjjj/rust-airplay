@@ -111,7 +111,7 @@ async fn process_msg(stream: &mut TcpStream, state: &Arc<AppState>, msg: &[u8]) 
 
     match (method, path) {
         ("OPTIONS", _) => {
-            stream.write_all(b"RTSP/1.0 200 OK\r\nPublic: GET, POST, OPTIONS, SETUP, TEARDOWN\r\n\r\n").await?;
+            stream.write_all(b"RTSP/1.0 200 OK\r\nPublic: GET, POST, OPTIONS, SETUP, TEARDOWN, RECORD, GET_PARAMETER, SET_PARAMETER\r\n\r\n").await?;
         }
         ("GET", "/info") => {
             let data = plist::build_info_plist(&state.config);
