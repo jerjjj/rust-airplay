@@ -1,0 +1,45 @@
+[package]
+name = "airplay-service"
+version = "0.1.0"
+edition = "2021"
+description = "AirPlay mirroring receiver service in Rust"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP/RTSP server
+axum = "0.7"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.4"
+
+# mDNS / Bonjour
+mdns-sd = "0.11"
+
+# Binary plist
+plist = "1"
+
+# Cryptography
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes = "0.8"
+ctr = "0.9"
+cbc = "0.1"
+sha2 = "0.10"
+rand = "0.8"
+
+# Utilities
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+if-addrs = "0.13"
+
+hex = "0.4"
+
+[build-dependencies]
+cc = "1"

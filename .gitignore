@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts
+video.h264
+audio.alac
+encrypted_frame.bin
+decrypted_frame.bin
+decrypted_frame_le.bin
+video_keys.txt
+airplay*.log
+
+# Reasonix
+.reasonix/
