@@ -37,7 +37,6 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hyper",
- "hyper-util",
  "if-addrs",
  "mdns-sd",
  "plist",

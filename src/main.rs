@@ -34,9 +34,7 @@ pub struct RuntimeState {
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            "airplay_service=info,mdns_sd=info,tracing=warn".parse().unwrap()
-        });
+        .unwrap_or_else(|_| EnvFilter::new("airplay_service=info,mdns_sd=info,tracing=warn"));
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
@@ -88,6 +86,7 @@ async fn main() -> Result<()> {
 
     // Spawn stream servers
     tokio::spawn(async move { let _ = stream::video::run_video_server(video_data_port, video_decryptor).await; });
+    tokio::spawn(async move { let _ = stream::video::run_video_event_server(video_event_port).await; });
     tokio::spawn(async move { let _ = stream::audio::run_audio_server(audio_data_port, audio_control_port, audio_decryptor).await; });
     tokio::spawn(async move { let _ = stream::audio::run_audio_control_server(audio_control_port).await; });
 

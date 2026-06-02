@@ -1,8 +1,7 @@
 //! TCP video stream handler — decrypts and outputs H.264 Annex B to file.
 
-use std::io::Write;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
@@ -10,6 +9,23 @@ use crate::fairplay::video_decrypt::VideoDecryptor;
 use crate::stream::nal;
 
 const HEADER_SIZE: usize = 128;
+
+pub async fn run_video_event_server(port: u16) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    tracing::info!("Video event server on {}", port);
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+}
 
 pub async fn run_video_server(
     port: u16,
@@ -36,9 +52,10 @@ async fn handle_video_connection(
     decryptor: Arc<Mutex<VideoDecryptor>>,
 ) -> anyhow::Result<()> {
     let mut header_buf = vec![0u8; HEADER_SIZE];
-    let mut out = std::fs::File::create("video.h264")?;
+    let mut out = tokio::fs::File::create("video.h264").await?;
     let mut sps_pps: Option<Vec<u8>> = None;
     let mut frame_count = 0u64;
+    let mut payload_buf = Vec::with_capacity(65536);
 
     loop {
         if let Err(e) = stream.read_exact(&mut header_buf).await {
@@ -50,60 +67,44 @@ async fn handle_video_connection(
         let payload_type = u16::from_le_bytes([header_buf[4], header_buf[5]]) & 0xFF;
 
         if payload_size == 0 { continue; }
-        let mut payload = vec![0u8; payload_size];
-        stream.read_exact(&mut payload).await?;
+        if payload_buf.len() < payload_size { payload_buf.resize(payload_size, 0); }
+        stream.read_exact(&mut payload_buf[..payload_size]).await?;
+        let payload = &mut payload_buf[..payload_size];
 
         match payload_type {
             0 => {
-                // Save first encrypted frame to file for debugging
-                if frame_count == 0 {
-                    let mut f = std::fs::File::create("encrypted_frame.bin").unwrap();
-                    std::io::Write::write_all(&mut f, &payload).unwrap();
-                    tracing::warn!("Saved encrypted frame: {} bytes to encrypted_frame.bin", payload.len());
-                    tracing::warn!("Encrypted first 32: {:02x?}", &payload[..32.min(payload.len())]);
-                }
-                let has_cipher = { let d = decryptor.lock().await; d.cipher.is_some() };
-                if !has_cipher {
-                    tracing::error!("Video decryptor NOT initialized — waiting for ekey+streams SETUP. Skipping frame.");
+                let mut d = decryptor.lock().await;
+                if d.cipher.is_none() {
+                    tracing::error!("Video decryptor NOT initialized — skipping frame.");
                     continue;
                 }
-                { let mut d = decryptor.lock().await; d.decrypt(&mut payload); }
-                if frame_count == 0 {
-                    tracing::warn!("Decrypted first 32: {:02x?}", &payload[..32.min(payload.len())]);
-                }
-                let annex = nal::nalus_to_annex_b(&payload);
-                if frame_count < 3 {
-                    let nalu0 = if payload.len() >= 4 { u32::from_be_bytes([payload[0],payload[1],payload[2],payload[3]]) } else { 0 };
-                    tracing::warn!("Frame {}: {}B nalu0_size={} annex={}", 
-                        frame_count, payload_size, nalu0, annex.len());
-                }
+                d.decrypt(payload);
+                drop(d);
+
+                let annex = nal::nalus_to_annex_b(payload);
                 if !annex.is_empty() {
-                    // Prepend SPS/PPS for key frames
                     if let Some(ref sps) = sps_pps {
-                        if annex.windows(4).any(|w| {
-                            (w[3] & 0x1F) == 5 // IDR slice
-                        }) {
-                            out.write_all(sps)?;
+                        if annex.windows(4).any(|w| (w[3] & 0x1F) == 5) {
+                            out.write_all(sps).await?;
                         }
                     }
-                    out.write_all(&annex)?;
+                    out.write_all(&annex).await?;
                     frame_count += 1;
                     if frame_count % 60 == 0 {
-                        tracing::info!("Video: {} frames written", frame_count);
+                        tracing::info!("Video: {} frames", frame_count);
                     }
                 }
             }
             1 => {
-                if let Some(annex) = nal::extract_sps_pps(&payload) {
-                    tracing::warn!("SPS/PPS: {} bytes", annex.len());
-                    out.write_all(&annex)?;
+                if let Some(annex) = nal::extract_sps_pps(payload) {
+                    out.write_all(&annex).await?;
                     sps_pps = Some(annex);
                 }
             }
             _ => {}
         }
     }
-    out.flush()?;
-    tracing::warn!("Video done: {} frames to video.h264", frame_count);
+    out.flush().await?;
+    tracing::warn!("Video done: {} frames", frame_count);
     Ok(())
 }

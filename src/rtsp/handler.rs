@@ -164,8 +164,8 @@ async fn process_msg(stream: &mut TcpStream, state: &Arc<AppState>, msg: &[u8]) 
             stream.write_all(b"RTSP/1.0 200 OK\r\n\r\n").await?;
         }
         _ => {
-            tracing::warn!("Unknown method: {} {}", method, path);
-            stream.write_all(b"RTSP/1.0 200 OK\r\n\r\n").await?;
+            tracing::warn!("Unknown: {} {}", method, path);
+            stream.write_all(b"RTSP/1.0 501 Not Implemented\r\n\r\n").await?;
         }
     }
     Ok(())
@@ -183,14 +183,13 @@ async fn handle_pair_verify(stream: &mut TcpStream, state: &Arc<AppState>, body:
     use crate::pairing::PairVerifySession;
     use aes::cipher::KeyIvInit;
 
-    tracing::info!("pair-verify: {} bytes, first 4: {:02x?}", body.len(), &body[..4.min(body.len())]);
+    if body.len() < 68 { stream.write_all(b"RTSP/1.0 400 Bad Request\r\n\r\n").await?; return Ok(()); }
+    tracing::info!("pair-verify: {} bytes", body.len());
 
     let mut sg = state.session.lock().await;
     if sg.is_none() { *sg = Some(Session::new(PairingKeys::generate())); }
-    let s = sg.as_mut().unwrap();
+    let Some(s) = sg.as_mut() else { stream.write_all(b"RTSP/1.0 500\r\n\r\n").await?; return Ok(()); };
 
-    // iPad sends flag in LITTLE-ENDIAN: [1,0,0,0] = 0x00000001
-    // Also accept big-endian [0,0,0,1] for compatibility
     let flag = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
     if flag == 1 {
         tracing::info!("pair-verify ROUND1");

@@ -11,7 +11,6 @@ tokio = { version = "1", features = ["full"] }
 # HTTP/RTSP server
 axum = "0.7"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.4"
 
 # mDNS / Bonjour

@@ -2,7 +2,7 @@
 
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use sha2::{Sha512, Digest};
+use sha2::{Digest, Sha512};
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
@@ -40,15 +40,6 @@ impl VideoDecryptor {
         self.cipher = Some(Aes128Ctr::new(&key.into(), &iv.into()));
         tracing::warn!("Video KDF: aes={:02x?} ss={:02x?}... conn={} key={:02x?} iv={:02x?}",
             aes_key, &shared_secret[..8], stream_connection_id, &key, &iv);
-        // Save keys for offline debugging
-        let _ = std::fs::write("video_keys.txt", format!(
-            "aes_key={}\nshared_secret={}\nconn_id={}\ndecrypt_key={}\ndecrypt_iv={}\n",
-            hex::encode(aes_key),
-            hex::encode(shared_secret),
-            stream_connection_id,
-            hex::encode(key),
-            hex::encode(iv),
-        ));
     }
 
     pub fn decrypt(&mut self, payload: &mut [u8]) {
