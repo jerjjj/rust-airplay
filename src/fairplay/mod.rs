@@ -11,11 +11,11 @@ pub mod hand_garble;
 pub mod modified_md5;
 pub mod omghax;
 pub mod omghax_const;
-pub mod playfair_ffi;
 pub mod sap_hash;
 pub mod video_decrypt;
 #[cfg(test)] mod omghax_test;
 #[cfg(test)] mod omghax_debug;
+#[cfg(test)] mod java_verify;
 
 use crate::session::Session;
 
@@ -86,16 +86,8 @@ impl FairPlayHandler {
 
     /// Decrypt the AES stream key from the keyMsg and ekey.
     pub fn decrypt_aes_key(&self, key_msg: &[u8], ekey: &[u8]) -> [u8; 16] {
-        // Use verified C implementation from UxPlay
-        let mut out = [0u8; 16];
-        unsafe {
-            crate::fairplay::playfair_ffi::playfair_decrypt(
-                key_msg.as_ptr(),
-                ekey.as_ptr(),
-                out.as_mut_ptr(),
-            );
-        }
-        out
+        // Pure Rust OmgHax — byte-level identical to java-airplay
+        crate::fairplay::omghax::decrypt_aes_key(key_msg, ekey)
     }
 }
 

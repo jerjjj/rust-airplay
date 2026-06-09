@@ -1,4 +1,4 @@
-//! Detailed debug test for OmgHax with known values.
+//! Detailed debug test for OmgHax with known values — Pure Rust.
 //! Run with: cargo test omghax_debug -- --nocapture
 
 #[cfg(test)]
@@ -27,12 +27,12 @@ mod tests {
             0xd5,0x03,0x11,0xe9,0x26,0x79,0xa3,0xe3,
         ];
 
-        let expected: [u8; 16] = [
+        let expected_key: [u8; 16] = [
             0x65,0x5a,0x5f,0xfc,0x27,0x20,0xea,0x6d,
             0x97,0x30,0xf1,0x6e,0xb1,0x7f,0x58,0xe2,
         ];
 
-        // Test: compare Rust and C generate_key_schedule
+        // Test generate_key_schedule with known sap_key
         let sap_key: [u8; 16] = [0xa8, 0x6f, 0xdb, 0x2b, 0x79, 0x82, 0x6d, 0x3d, 0x46, 0xa3, 0x13, 0x62, 0x4a, 0xfe, 0x80, 0xf1];
         
         let mut rust_ks = [[0xdeadbeefu32; 4]; 11];
@@ -40,106 +40,31 @@ mod tests {
         println!("Rust key_schedule[0]: {:08x?}", rust_ks[0]);
         println!("Rust key_schedule[10]: {:08x?}", rust_ks[10]);
 
-        // C generate_key_schedule
-        extern "C" {
-            fn generate_key_schedule(key_material: *const u8, key_schedule: *mut u32);
-        }
-        let mut c_ks = [[0xdeadbeefu32; 4]; 11];
-        unsafe {
-            generate_key_schedule(sap_key.as_ptr(), c_ks.as_mut_ptr() as *mut u32);
-        }
-        println!("C   key_schedule[0]: {:08x?}", c_ks[0]);
-        println!("C   key_schedule[10]: {:08x?}", c_ks[10]);
-
-        assert_eq!(rust_ks[0], c_ks[0], "key_schedule[0] mismatch!");
-        assert_eq!(rust_ks[10], c_ks[10], "key_schedule[10] mismatch!");
-
-        // Test: compare Rust and C modified_md5
-        let block = [0u8; 64];
-        let key = [0u8; 16];
-        let mut rust_md5 = [0u8; 16];
-        crate::fairplay::modified_md5::modified_md5(&block, &key, &mut rust_md5);
-        
-        extern "C" {
-            fn modified_md5(block: *const u8, key: *const u8, out: *mut u8);
-        }
-        let mut c_md5 = [0u8; 16];
-        unsafe {
-            modified_md5(block.as_ptr(), key.as_ptr(), c_md5.as_mut_ptr());
-        }
-        println!("Rust modified_md5: {:02x?}", rust_md5);
-        println!("C   modified_md5: {:02x?}", c_md5);
-        assert_eq!(rust_md5, c_md5, "modified_md5 mismatch!");
-
-        // Test: compare Rust and C sap_hash
-        let mut rust_sap = [0u8; 16];
-        crate::fairplay::sap_hash::sap_hash_impl(&block, &mut rust_sap);
-        
-        let mut c_sap = [0u8; 16];
-        unsafe {
-            crate::fairplay::playfair_ffi::sap_hash(block.as_ptr(), c_sap.as_mut_ptr());
-        }
-        println!("Rust sap_hash: {:02x?}", rust_sap);
-        println!("C   sap_hash: {:02x?}", c_sap);
-        assert_eq!(rust_sap, c_sap, "sap_hash mismatch!");
-
-        // Test: compare Rust and C generate_session_key
+        // Test generate_session_key
         let default_sap = crate::fairplay::omghax_const::DEFAULT_SAP;
         let mut rust_sk = [0u8; 16];
         crate::fairplay::omghax::generate_session_key(&default_sap, &key_msg, &mut rust_sk);
-        
-        let mut c_sk = [0u8; 16];
-        unsafe {
-            extern "C" {
-                fn generate_session_key(oldSap: *const u8, messageIn: *const u8, sessionKey: *mut u8);
-            }
-            generate_session_key(default_sap.as_ptr(), key_msg.as_ptr(), c_sk.as_mut_ptr());
-        }
         println!("Rust sapKey: {:02x?}", rust_sk);
-        println!("C   sapKey: {:02x?}", c_sk);
-        assert_eq!(rust_sk, c_sk, "sapKey mismatch!");
 
-        // Test: compare Rust and C cycle
+        // Test cycle with chunk2
         let chunk2: [u8; 16] = ekey[56..72].try_into().unwrap();
         let mut rust_block = [0u8; 16];
+        let mut ks_for_cycle = [[0xdeadbeefu32; 4]; 11];
+        crate::fairplay::omghax::generate_key_schedule(&rust_sk, &mut ks_for_cycle);
+        
+        // z_xor(chunk2, block_in)
         for i in 0..16 {
             rust_block[i] = chunk2[i] ^ crate::fairplay::omghax_const::Z_KEY[i];
         }
-        crate::fairplay::omghax::cycle(&mut rust_block, &rust_ks);
-        
-        let mut c_block = [0u8; 16];
-        for i in 0..16 {
-            c_block[i] = chunk2[i] ^ crate::fairplay::omghax_const::Z_KEY[i];
-        }
-        unsafe {
-            extern "C" {
-                fn cycle(block: *mut u8, key_schedule: *mut u32);
-            }
-            cycle(c_block.as_mut_ptr(), c_ks.as_mut_ptr() as *mut u32);
-        }
-        println!("Rust cycle: {:02x?}", rust_block);
-        println!("C   cycle: {:02x?}", c_block);
-        assert_eq!(rust_block, c_block, "cycle mismatch!");
+        crate::fairplay::omghax::cycle(&mut rust_block, &ks_for_cycle);
+        println!("Rust cycle output: {:02x?}", rust_block);
 
-        // Test: compare full decrypt_aes_key
-        let chunk1_rust = &ekey[16..];
-        let chunk2_rust = &ekey[56..];
-        println!("Rust chunk1[0..16]: {:02x?}", &chunk1_rust[..16]);
-        println!("Rust chunk2[0..16]: {:02x?}", &chunk2_rust[..16]);
-
+        // Test full decrypt_aes_key
         let rust_key = crate::fairplay::omghax::decrypt_aes_key(&key_msg, &ekey);
-        let mut c_key = [0u8; 16];
-        unsafe {
-            extern "C" {
-                fn playfair_decrypt(message3: *const u8, cipher_text: *const u8, key_out: *mut u8);
-            }
-            playfair_decrypt(key_msg.as_ptr(), ekey.as_ptr(), c_key.as_mut_ptr());
-        }
-        println!("Rust key: {:02x?}", rust_key);
-        println!("C   key: {:02x?}", c_key);
-        assert_eq!(rust_key, c_key, "Final key mismatch!");
+        println!("Rust final key: {:02x?}", rust_key);
+        println!("Expected:       {:02x?}", expected_key);
+        assert_eq!(rust_key, expected_key, "Final key mismatch!");
 
-        // Both implementations should agree
-        println!("All intermediate values match between Rust and C!");
+        println!("All pure Rust OmgHax values verified!");
     }
 }

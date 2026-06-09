@@ -86,17 +86,32 @@ async fn handle_connection(mut stream: TcpStream, peer: std::net::SocketAddr, st
 
 fn find_msg_end(data: &[u8]) -> Option<usize> {
     let he = data.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let cl = String::from_utf8_lossy(&data[..he])
+    let headers = &data[..he];
+    let cl = std::str::from_utf8(headers)
+        .unwrap_or("")
         .lines()
-        .find(|l| l.to_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|s| s.trim().parse::<usize>().ok())
+        .find(|l| l.len() > 15 && l[..15].eq_ignore_ascii_case("content-length:"))
+        .and_then(|l| l[15..].trim().parse::<usize>().ok())
         .unwrap_or(0);
     let total = he + 4 + cl;
     if data.len() >= total { Some(total) } else { None }
 }
 
 async fn process_msg(stream: &mut TcpStream, state: &Arc<AppState>, msg: &[u8]) -> Result<()> {
+    // Auto-retry: if video decryption failed, full reset and close connection
+    if state.runtime.needs_retry.load(std::sync::atomic::Ordering::SeqCst) {
+        state.runtime.needs_retry.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!("Auto-retry: fully resetting session and closing connection");
+        // Full reset — set session to None so next pair-verify creates a fresh one
+        *state.session.lock().await = None;
+        state.runtime.video_decryptor.lock().await.cipher = None;
+        state.runtime.audio_decryptor.lock().await.reset();
+        // Close the connection so iPad reconnects fresh
+        stream.write_all(b"RTSP/1.0 200 OK\r\nConnection: close\r\n\r\n").await?;
+        let _ = stream.shutdown().await;
+        return Ok(()); // Don't error — this is normal retry flow
+    }
+
     let he = msg.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(msg.len());
     let body = if he + 4 < msg.len() { &msg[he + 4..] } else { &[] };
     let first = String::from_utf8_lossy(&msg[..he.min(256)])
@@ -148,14 +163,28 @@ async fn process_msg(stream: &mut TcpStream, state: &Arc<AppState>, msg: &[u8]) 
             handle_setup(stream, state, body).await?;
         }
         ("TEARDOWN", _) => {
-            tracing::info!("TEARDOWN received, clearing session");
+            tracing::info!("TEARDOWN received, clearing session and decryptors");
             let mut sg = state.session.lock().await;
             *sg = None;
+            drop(sg);
+            state.runtime.video_decryptor.lock().await.cipher = None;
+            state.runtime.audio_decryptor.lock().await.reset();
             stream.write_all(b"RTSP/1.0 200 OK\r\n\r\n").await?;
         }
         ("RECORD", _) => {
-            // RECORD starts the stream — just acknowledge
+            // RECORD — last chance to init video decryptor
             tracing::info!("RECORD ack");
+            let mut sg = state.session.lock().await;
+            if let Some(ref s) = *sg {
+                if let (Some(ref ak), Some(ref ss), Some(conn_id)) = (&s.aes_key, &s.shared_secret, s.stream_connection_id) {
+                    let mut vd = state.runtime.video_decryptor.lock().await;
+                    if vd.cipher.is_none() {
+                        vd.init(ak, ss, conn_id as i64);
+                        tracing::warn!("Video decryptor INITIALIZED at RECORD (late init)");
+                    }
+                }
+            }
+            drop(sg);
             stream.write_all(b"RTSP/1.0 200 OK\r\n\r\n").await?;
         }
         ("POST", _) => {
@@ -195,7 +224,7 @@ async fn handle_pair_verify(stream: &mut TcpStream, state: &Arc<AppState>, body:
         tracing::info!("pair-verify ROUND1");
         let mut ce = [0u8;32]; let mut cd = [0u8;32];
         ce.copy_from_slice(&body[4..36]); cd.copy_from_slice(&body[36..68]);
-        let r = PairVerifySession::round1(&state.pairing_keys, &ce, &cd, &ce);
+        let r = PairVerifySession::round1(&state.pairing_keys, &ce);
         s.client_ecdh_public = Some(ce);
         s.client_ed25519_public = Some(cd);
         s.ecdh_public = Some(r.server_ecdh_public);
@@ -283,23 +312,12 @@ async fn handle_setup(stream: &mut TcpStream, state: &Arc<AppState>, body: &[u8]
                     if let Some(v) = d.get("eiv").and_then(|v| v.as_data()) { if v.len()>=16 { let mut e=[0u8;16]; e.copy_from_slice(&v[..16]); s.eiv=Some(e); } }
                     if let Some(v) = d.get("ekey").and_then(|v| v.as_data()) {
                         tracing::warn!("ekey len={} first 16: {:02x?}", v.len(), &v[..16.min(v.len())]);
-                        // Check for hardcoded key first
-                        let ak = unsafe {
-                            if let Some(hk) = crate::HARDCODED_AES_KEY {
-                                tracing::warn!("*** USING HARDCODED AES KEY ***");
-                                Some(hk)
-                            } else {
-                                None
-                            }
-                        };
-                        let ak = match ak {
-                            Some(k) => k,
-                            None => match s.key_msg {
-                                Some(ref km) => state.fp_handler.decrypt_aes_key(km, v),
-                                None => {
-                                    stream.write_all(b"RTSP/1.0 200 OK\r\n\r\n").await?;
-                                    return Ok(());
-                                }
+                        let ak = match s.key_msg {
+                            Some(ref km) => state.fp_handler.decrypt_aes_key(km, v),
+                            None => {
+                                tracing::warn!("No key_msg — fp-setup not completed, rejecting SETUP");
+                                stream.write_all(b"RTSP/1.0 503 Service Unavailable\r\n\r\n").await?;
+                                return Ok(());
                             }
                         };
                         s.aes_key = Some(ak);

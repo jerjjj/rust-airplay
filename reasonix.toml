@@ -1,0 +1,82 @@
+# Reasonix configuration.
+# Resolution order: flag > ./reasonix.toml > ~/.config/reasonix/config.toml > built-in defaults.
+# Secrets come from the environment via api_key_env; never put keys here.
+
+config_version = 2   # schema marker for diagnostics; old versions may ignore it
+default_model = "deepseek-flash"
+# language      = "zh"   # ui/model language; empty = auto-detect from $LANG / $REASONIX_LANG
+
+[agent]
+# system_prompt = """..."""   # omit to use the built-in prompt for this version
+# system_prompt_file = "prompts/system.md"   # overrides system_prompt when set
+max_steps         = 0   # executor tool-call rounds; 0 = no limit
+planner_max_steps = 12   # planner read-only tool-call rounds; 0 = no limit
+temperature       = 0.0
+auto_plan   = "off"   # off|on; off keeps plan mode manual
+# auto_plan_classifier = "deepseek-flash"   # optional; only used for borderline tasks
+soft_compact_ratio  = 0.5   # notice only; keeps cache-first prefix intact
+compact_ratio       = 0.8   # try compacting when prompt reaches this fraction
+compact_force_ratio = 0.9   # force compacting at this high-water mark
+# planner_model = "mimo"   # optional: enable two-model collaboration
+# subagent_model = "deepseek-pro"   # optional default for runAs=subagent skills
+# subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }   # per-skill overrides
+# subagent_effort = "high"   # optional default effort for subagents
+# subagent_efforts = { review = "max", task = "high" }   # per-tool/skill effort overrides
+# output_style = "explanatory"   # explanatory | learning | concise | custom; empty = default
+
+[tools]
+enabled = []   # empty = all built-in tools
+bash_timeout_seconds = 120   # foreground safety cap; set 0 for no tool-local cap
+
+[codegraph]
+enabled      = true   # built-in MCP server; off by default for first-run sessions
+auto_install = true   # fetch the runtime when CodeGraph is enabled but missing
+# path       = ""   # empty = cache, then PATH, then a bundle beside reasonix
+
+[lsp]
+enabled = true   # language server tools; servers launch lazily when used
+# [lsp.servers.go]
+# command = "gopls"
+# args = []
+# extensions = [".go"]
+
+[skills]
+# paths = ["~/my-skills", "../shared/skills"]   # extra custom skill roots
+# excluded_paths = ["~/.agents/skills"]   # hide convention roots without deleting folders
+# max_depth = 3   # nested scan depth; set 1 for legacy root-only discovery
+# disabled_skills = ["review"]   # hide noisy or unwanted skills
+
+[permissions]
+# Per-call gating. mode = writer fallback when no rule matches: ask|allow|deny.
+# Readers always default to allow. Precedence: deny > ask > allow > fallback.
+# Rules are "Tool" or "Tool(specifier)"; e.g. Bash(go test:*), Edit(src/**).
+mode  = "ask"
+# deny = ["Bash(rm -rf*)", "Bash(git push*)"]   # hard-blocked in every mode
+allow = ["Edit(E:\\Projects\\rust-airplay\\src\\fairplay\\omghax.rs)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo build 2>&1)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test fairplay -- --nocapture 2>&1)", "Bash(cd \"E:\\Projects\\rust-airplay\" && grep -n \"TABLE_S9\\|TABLE_S5\\|TABLE_S2\\b\" src/fairplay/rust_tables.rs | head -20 2>&1 || head -300 src/fairplay/rust_tables.rs | findstr /N \"TABLE_S\" 2>&1)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test fairplay::sap_hash -- --nocapture 2>&1 | head -30)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test fairplay::compare_tests -- --nocapture 2>&1)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test fairplay::compare_tests::compare_garble -- --nocapture 2>&1)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test compare_garble -- --nocapture 2>&1)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test -- --nocapture 2>&1)", "Bash(cd \"E:\\Projects\\rust-airplay\" && grep -n \"rol8x\\|rol8\\|weird_rol8\\|weird_ror8\\|weird_rol32\" src/fairplay/hand_garble.c)", "Bash(cd \"E:\\Projects\\rust-airplay\" && grep -n \"buffer1\\[124\\]\" src/fairplay/hand_garble.rs)", "Bash(cd \"E:\\Projects\\rust-airplay\" && grep -n \"buffer3\\[36\\]\" src/fairplay/hand_garble.rs)", "Bash(cd \"E:\\Projects\\rust-airplay\" && grep -n \"weird_rol8\\|weird_ror8\\|weird_rol32\\|rol8x\\|rol8(\" src/fairplay/hand_garble.rs)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test compare -- --nocapture 2>&1 | tail -30)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test hand_garble -- --nocapture 2>&1 | tail -35)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test fairplay -- --nocapture 2>&1 | tail -25)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo test 2>&1 | tail -15)", "Bash(cd \"E:\\Projects\\rust-airplay\" && cargo build 2>&1 | tail -3)", "Bash(cd \"E:\\Projects\\rust-airplay\" && grep -A3 \"fn decrypt_aes_key\" src/fairplay/mod.rs)", "Bash(cd \"E:\\Projects\\rust-airplay\" && del src\\fairplay\\playfair_ffi.rs src\\fairplay\\hand_garble.c src\\fairplay\\omg_hax.c src\\fairplay\\omg_hax.h src\\fairplay\\modified_md5_c.c src\\fairplay\\playfair.c src\\fairplay\\playfair.h src\\fairplay\\sap_hash.c 2>&1 && del src\\fairplay\\compare_tests.rs 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && rm -v src/fairplay/playfair_ffi.rs src/fairplay/hand_garble.c src/fairplay/omg_hax.c src/fairplay/omg_hax.h src/fairplay/modified_md5_c.c src/fairplay/playfair.c src/fairplay/playfair.h src/fairplay/sap_hash.c src/fairplay/compare_tests.rs 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo build 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo test 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && git status --short src/fairplay/ 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && git checkout -- src/fairplay/hand_garble.c src/fairplay/modified_md5_c.c src/fairplay/omg_hax.c src/fairplay/omg_hax.h src/fairplay/playfair.c src/fairplay/playfair.h src/fairplay/playfair_ffi.rs src/fairplay/sap_hash.c 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo test compare_garble_debug -- --nocapture 2>&1 | tail -30)", "Bash(cd \"E:/Projects/rust-airplay\" && rm -v src/fairplay/omg_hax.c src/fairplay/omg_hax.h src/fairplay/playfair.c src/fairplay/playfair.h src/fairplay/modified_md5_c.c 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && rm -v src/fairplay/playfair_ffi.rs src/fairplay/compare_tests.rs 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo build 2>&1 | tail -5)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo test 2>&1 | grep -E \"test result|running|FAILED|passed\")", "Bash(cd \"E:/Projects/rust-airplay\" && ls src/fairplay/*.c src/fairplay/*.h 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && ls src/fairplay/hand_garble.c src/fairplay/sap_hash.c && echo \"C files OK\" && cargo test 2>&1 | grep \"test result\")", "Bash(cd \"E:/Projects/rust-airplay\" && cargo test 2>&1 | grep \"test result\")", "Bash(cd \"E:/Projects/rust-airplay\" && ls src/fairplay/*.c && echo \"---\" && grep \"pub mod\" src/fairplay/mod.rs && echo \"---\" && head -5 build.rs && echo \"---\" && grep \"build-dependencies\" Cargo.toml || echo \"no build-deps\")", "Bash(cd \"E:/Projects/rust-airplay\" && grep -c \"extern \\\"C\\\"\" src/fairplay/*.rs)", "Bash(cd \"E:/Projects/rust-airplay\" && git status --short src/ 2>&1 | head -30)", "Bash(cd \"E:/Projects/rust-airplay\" && grep \"\\.file\" build.rs && ls src/fairplay/*.c src/fairplay/*.h 2>&1)", "Bash(cd \"E:/Projects/rust-airplay\" && rm -v src/fairplay/playfair.c src/fairplay/playfair.h src/fairplay/omg_hax.c src/fairplay/omg_hax.h src/fairplay/modified_md5_c.c 2>&1)", "Edit(E:/Projects/rust-airplay/build.rs)", "Bash(cd \"E:/Projects/rust-airplay\" && grep \"decrypt_message: mode\" src/fairplay/omghax.rs)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo build 2>&1 | grep -E \"Compiling|Finished|error\" | head -5)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo test 2>&1 | grep -E \"^test |^test result|^running\")", "Bash(cd \"E:/Projects/rust-airplay\" && echo \"=== C files ===\" && ls src/fairplay/*.c 2>&1 && echo \"=== extern C ===\" && grep -c \"extern \\\"C\\\"\" src/fairplay/*.rs 2>&1 && echo \"=== build.rs ===\" && grep \"\\.file\" build.rs)", "Bash(cd \"E:/Projects/rust-airplay\" && ls src/fairplay/*.c 2>&1 && echo \"---\" && grep -c \"extern \\\"C\\\"\" src/fairplay/*.rs 2>&1 && echo \"---\" && cargo build 2>&1 | tail -1)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo test 2>&1 | grep \"test result\" && ls src/fairplay/*.c && grep -c \"extern \\\"C\\\"\" src/fairplay/*.rs && cargo build 2>&1 | tail -1)", "Bash(cd \"E:/Projects/rust-airplay\" && cargo build 2>&1 | tail -1 && cargo test 2>&1 | grep \"test result\")", "Bash(cd \"E:/Projects/rust-airplay\" && grep -n \"pub.*initialized\\|fn init\\|pub struct\" src/fairplay/audio_decrypt.rs)", "Bash(cd \"E:/Projects/rust-airplay\" && grep -n \"TEARDOWN\" src/rtsp/handler.rs)", "Bash(cd \"E:/Projects/rust-airplay\" && grep -n \"Auto-retry\\|full.*reset\\|Session::new\\|needs_retry\\|reset()\" src/rtsp/handler.rs)", "remember"]
+# ask = ["Edit(src/**)"]   # force a prompt even if otherwise allowed
+
+[sandbox]
+# Confine tool blast radius. File-writers (write_file/edit_file/multi_edit)
+# may only write under workspace_root (empty = current dir) + allow_write.
+# bash = "enforce" (default) jails each command in an OS sandbox (macOS now;
+# graceful fallback elsewhere); "off" disables it. network allows egress.
+# workspace_root = ""            # default: current working directory
+# allow_write = ["/tmp"]          # extra dirs writers may also modify
+bash    = "enforce"
+network = true
+
+[statusline]
+# A custom status line: a command whose first stdout line replaces the built-in
+# data row. It receives {"model","contextUsed","contextWindow","cwd"} as JSON on stdin.
+# command = "my-statusline.sh"
+
+# External MCP servers. type: "stdio" (default, a subprocess) | "http" | "sse".
+# ${VAR} / ${VAR:-default} are expanded from the environment in command/args/env/url/headers.
+# [[plugins]]
+# name    = "example"
+# command = "reasonix-plugin-example"
+# [[plugins]]                                  # a remote server over Streamable HTTP
+# name    = "stripe"
+# type    = "http"
+# url     = "https://mcp.stripe.com"
+# headers = { Authorization = "Bearer ${STRIPE_KEY}" }

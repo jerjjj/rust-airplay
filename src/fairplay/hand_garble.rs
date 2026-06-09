@@ -1,25 +1,50 @@
 //! Pure Rust implementation of HandGarble (garble function).
-//! Translated from UxPlay's hand_garble.c.
+//! Translated from UxPlay's hand_garble.c — byte-level verified.
 
+/// Standard 8-bit rotate-left, returns u8 (masked to 8 bits).
+/// C: `unsigned char rol8(unsigned char input, int count)` in sap_hash.c
+fn rol8(input: u8, count: u32) -> u32 {
+    let c = count & 7;
+    if c == 0 { return input as u32; }
+    let val = input as u32;
+    (((val << c) & 0xff) | (val >> (8 - c))) as u32
+}
+
+/// Unmasked rotate-left, returns u32 with upper bits NOT masked.
+/// C: `uint32_t rol8x(unsigned char input, int count)` in sap_hash.c
+/// Key difference: left shift is NOT masked with & 0xff!
+fn rol8x(input: u8, count: u32) -> u32 {
+    let c = count & 7;
+    if c == 0 { return input as u32; }
+    let val = input as u32;
+    (val << c) | (val >> (8 - c))
+}
+
+/// Weird rotate-right: returns 0 if count==0, otherwise standard ror masked to u32.
+/// C: `weird_ror8` in hand_garble.c
 fn weird_ror8(input: u8, count: u32) -> u32 {
-    if count == 0 {
-        return 0;
-    }
-    ((input >> count) as u32 & 0xff) | ((input as u32) << (8 - count))
+    if count == 0 { return 0; }
+    let val = input as u32;
+    let c = count & 7;
+    ((val >> c) & 0xff) | ((val & 0xff) << (8 - c))
 }
 
+/// Weird rotate-left: returns 0 if count==0, otherwise standard rol masked to u32.
+/// C: `weird_rol8` in hand_garble.c
 fn weird_rol8(input: u8, count: u32) -> u32 {
-    if count == 0 {
-        return 0;
-    }
-    ((input as u32) << count) | ((input as u32) >> (8 - count))
+    if count == 0 { return 0; }
+    let val = input as u32;
+    let c = count & 7;
+    ((val << c) & 0xff) | (val >> (8 - c))
 }
 
+/// Weird rotate-left-32: returns 0 if count==0, uses XOR for combining halves.
+/// C: `weird_rol32` in hand_garble.c
 fn weird_rol32(input: u8, count: u32) -> u32 {
-    if count == 0 {
-        return 0;
-    }
-    ((input as u32) << count) ^ ((input as u32) >> (8 - count))
+    if count == 0 { return 0; }
+    let val = input as u32;
+    let c = count & 7;
+    (val << c) ^ (val >> (8 - c))
 }
 
 pub fn garble(
@@ -54,7 +79,7 @@ pub fn garble(
     let mut z: u32;
 
     // buffer2[12] = 0x14 + (((buffer1[64] & 92) | ((buffer1[99] / 3) & 35)) & buffer4[rol8x(buffer4[(buffer1[206] % 21)],4) % 21]);
-    let rol8x_val = weird_rol8(buffer4[(buffer1[206] % 21) as usize], 4);
+    let rol8x_val = rol8x(buffer4[(buffer1[206] % 21) as usize], 4);
     buffer2[12] = 0x14 + (((buffer1[64] & 92) | ((buffer1[99] / 3) & 35)) & buffer4[(rol8x_val % 21) as usize]);
 
     // buffer1[4] = (buffer1[99] / 5) * (buffer1[99] / 5) * 2;
@@ -140,7 +165,7 @@ pub fn garble(
     // buffer1[124] = rol8x((((74 & buffer1[138]) | ((74 | buffer1[138]) & buffer0[15])) & buffer0[buffer1[43] % 20]) | (((74 & buffer1[138]) | ((74 | buffer1[138]) & buffer0[15]) | buffer0[buffer1[43] % 20]) & 95), 4);
     let inner = (74 & buffer1[138]) | ((74 | buffer1[138]) & buffer0[15]);
     let outer = (inner & buffer0[(buffer1[43] % 20) as usize]) | ((inner | buffer0[(buffer1[43] % 20) as usize]) & 95);
-    buffer1[124] = weird_rol8(outer, 4) as u8;
+    buffer1[124] = rol8x(outer, 4) as u8;
 
     // buffer3[8] = ((((buffer0[buffer3[4] % 20] & 95)) & ((buffer4[buffer1[68] % 21] & 46) << 1)) | 16) ^ 92;
     buffer3[8] = (((buffer0[(buffer3[4] % 20) as usize] & 95) & ((buffer4[(buffer1[68] % 21) as usize] & 46) << 1)) | 16) ^ 92;
@@ -223,7 +248,7 @@ pub fn garble(
     buffer1[47] ^= (buffer2[(buffer1[89] % 35) as usize] as u32 + c) as u8;
 
     // buffer3[36] = ((rol8((tmp & 179) + 68, 2) & buffer0[3]) | (tmp2 & ~buffer0[3])) - 15;
-    let rol8_val = weird_rol8(((tmp & 179) + 68) as u8, 2);
+    let rol8_val = rol8(((tmp & 179) + 68) as u8, 2);
     buffer3[36] = (((rol8_val & buffer0[3] as u32) | (tmp2 & !buffer0[3] as u32)).wrapping_sub(15)) as u8;
 
     // buffer1[123] ^= 221;

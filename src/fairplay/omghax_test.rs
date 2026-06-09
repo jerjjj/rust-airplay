@@ -1,5 +1,5 @@
-//! Test with known values from java-airplay.
-//! This tests our OmgHax implementation against a verified reference.
+//! Test OmgHax Rust implementation with known test vectors.
+//! Pure Rust — no C FFI.
 
 #[cfg(test)]
 mod tests {
@@ -30,28 +30,23 @@ mod tests {
             0xd5,0x03,0x11,0xe9,0x26,0x79,0xa3,0xe3,
         ];
 
-        // Test Rust implementation
+        // Expected AES key from known-good session
+        let expected: [u8; 16] = [
+            0x65,0x5a,0x5f,0xfc,0x27,0x20,0xea,0x6d,
+            0x97,0x30,0xf1,0x6e,0xb1,0x7f,0x58,0xe2,
+        ];
+
+        // Test pure Rust implementation
         let rust_key = crate::fairplay::omghax::decrypt_aes_key(&key_msg, &ekey);
         println!("Rust key: {:02x?}", &rust_key[..]);
+        println!("Expected: {:02x?}", &expected[..]);
 
-        // Test C implementation (via FFI)
-        let mut c_key = [0u8; 16];
-        unsafe {
-            crate::fairplay::playfair_ffi::playfair_decrypt(
-                key_msg.as_ptr(),
-                ekey.as_ptr(),
-                c_key.as_mut_ptr(),
-            );
-        }
-        println!("C key:    {:02x?}", &c_key[..]);
-
-        // Both implementations should produce the same result
-        assert_eq!(rust_key, c_key, "Rust and C implementations disagree!");
-        
         // Verify the key is deterministic (not all zeros or garbage)
         assert_ne!(rust_key, [0u8; 16], "Key should not be all zeros");
         assert_ne!(rust_key, [0xFFu8; 16], "Key should not be all 0xFF");
         
-        println!("Both implementations agree: {:02x?}", &rust_key[..]);
+        // Check against expected
+        assert_eq!(rust_key, expected, "AES key mismatch against Java test vector!");
+        println!("Rust OmgHax produces correct AES key!");
     }
 }

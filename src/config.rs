@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 /// Server configuration for the AirPlay mirroring service.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -33,24 +31,4 @@ impl Default for Config {
     }
 }
 
-impl Config {
-    /// The features bitmask: `0x5A7FFFF7` (video, photo, audio, screen mirror, HLS, encryption, FairPlay 1&2).
-    pub fn features_hex(&self) -> String {
-        "0x5A7FFFF7,0x1E".to_string()
-    }
-
-    /// The larger features integer for the `/info` response — `0x1E5A7FFFF7`.
-    pub fn features_int(&self) -> u64 {
-        0x1E5A7FFFF7u64
-    }
-
-    /// Audio format bitmask: ALAC 44.1kHz stereo + AAC-ELD 44.1kHz stereo + OPUS 48kHz mono.
-    pub fn audio_formats(&self) -> u32 {
-        0x3FFFDFCu32
-    }
-
-    /// Build the RTSP control server address.
-    pub fn control_addr(&self) -> SocketAddr {
-        SocketAddr::from(([0, 0, 0, 0], self.airtunes_port))
-    }
-}
+impl Config {}

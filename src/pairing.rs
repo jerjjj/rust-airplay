@@ -7,7 +7,6 @@
 
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-pub use aes::cipher::KeyIvInit as _;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
 use sha2::{Sha512, Digest};
@@ -59,8 +58,6 @@ impl PairVerifySession {
     pub fn round1(
         keys: &PairingKeys,
         client_ecdh_public: &[u8; 32],
-        _client_ed25519_public: &[u8; 32],
-        _client_curve25519_public: &[u8; 32],
     ) -> Round1Result {
         let ecdh_private = X25519Secret::random_from_rng(OsRng);
         let ecdh_public = X25519Public::from(&ecdh_private);
@@ -176,19 +173,4 @@ pub fn kdf_16(prefix: &[u8], secret: &[u8]) -> [u8; 16] {
     out
 }
 
-/// SHA-512 KDF: digest(prefix_string || secret), return first 16 bytes.
-#[allow(dead_code)]
-pub fn kdf_16_str(prefix: &str, secret: &[u8]) -> [u8; 16] {
-    kdf_16(prefix.as_bytes(), secret)
-}
 
-/// SHA-512 KDF: digest(aes_key || shared_secret), return first 16 bytes.
-pub fn kdf_aes_shared(aes_key: &[u8; 16], shared_secret: &[u8; 32]) -> [u8; 16] {
-    let mut hasher = Sha512::new();
-    hasher.update(aes_key);
-    hasher.update(shared_secret);
-    let result = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&result[..16]);
-    out
-}

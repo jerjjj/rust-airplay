@@ -17,62 +17,44 @@ use super::omghax_const;
 /// `ekey`: ekey data from RTSP SETUP (at least 72 bytes).
 ///
 /// Returns the 16-byte AES key.
+/// Pure Rust implementation — exactly matches java-airplay OmgHax.decryptAesKey().
 pub fn decrypt_aes_key(key_msg: &[u8], ekey: &[u8]) -> [u8; 16] {
     // Java: chunk1 = Arrays.copyOfRange(cipherText, 16, cipherText.length)
     // Java: chunk2 = Arrays.copyOfRange(cipherText, 56, cipherText.length)
-    let chunk1 = &ekey[16..];
-    let chunk2 = &ekey[56..];
+    let mut chunk1 = [0u8; 16];
+    let mut chunk2 = [0u8; 16];
+    chunk1.copy_from_slice(&ekey[16..32]);
+    chunk2.copy_from_slice(&ekey[56..72]);
 
     let mut block_in = [0u8; 16];
     let mut sap_key = [0u8; 16];
     let mut key_schedule = [[0u32; 4]; 11];
 
-    // Use C generate_session_key
-    unsafe {
-        extern "C" {
-            fn generate_session_key(oldSap: *const u8, messageIn: *const u8, sessionKey: *mut u8);
-        }
-        generate_session_key(omghax_const::DEFAULT_SAP.as_ptr(), key_msg.as_ptr(), sap_key.as_mut_ptr());
+    // Pure Rust generate_session_key
+    generate_session_key(&omghax_const::DEFAULT_SAP, key_msg, &mut sap_key);
+
+    // Pure Rust generate_key_schedule
+    generate_key_schedule(&sap_key, &mut key_schedule);
+
+    // z_xor(chunk2, block_in)
+    z_xor(&chunk2, &mut block_in);
+
+    // cycle(block_in, key_schedule)
+    cycle(&mut block_in, &key_schedule);
+
+    // key_out[i] = block_in[i] ^ chunk1[i]
+    let mut key_out = [0u8; 16];
+    for i in 0..16 {
+        key_out[i] = block_in[i] ^ chunk1[i];
     }
 
-    // Use C generate_key_schedule
-    unsafe {
-        extern "C" {
-            fn generate_key_schedule(key_material: *const u8, key_schedule: *mut u32);
-        }
-        generate_key_schedule(sap_key.as_ptr(), key_schedule.as_mut_ptr() as *mut u32);
-    }
+    // x_xor(key_out)
+    x_xor_inplace(&mut key_out);
 
-    // Use C z_xor, cycle, x_xor, z_xor
-    unsafe {
-        extern "C" {
-            fn z_xor(in_ptr: *const u8, out_ptr: *mut u8, blocks: i32);
-            fn cycle(block: *mut u8, key_schedule: *mut u32);
-            fn x_xor(in_ptr: *const u8, out_ptr: *mut u8, blocks: i32);
-        }
-        
-        z_xor(chunk2.as_ptr(), block_in.as_mut_ptr(), 1);
-        println!("after z_xor: {:02x?}", block_in);
-        
-        cycle(block_in.as_mut_ptr(), key_schedule.as_mut_ptr() as *mut u32);
-        println!("after cycle: {:02x?}", block_in);
-        
-        let mut key_out = [0u8; 16];
-        for i in 0..16 {
-            key_out[i] = block_in[i] ^ chunk1[i];
-        }
-        println!("after xor chunk1: {:02x?}", key_out);
-        println!("x_key: {:02x?}", omghax_const::X_KEY);
-        
-        x_xor(key_out.as_ptr(), key_out.as_mut_ptr(), 1);
-        println!("after x_xor: {:02x?}", key_out);
-        println!("z_key: {:02x?}", omghax_const::Z_KEY);
-        
-        z_xor(key_out.as_ptr(), key_out.as_mut_ptr(), 1);
-        println!("after z_xor: {:02x?}", key_out);
-        
-        key_out
-    }
+    // z_xor(key_out)
+    z_xor(&key_out.clone(), &mut key_out);
+
+    key_out
 }
 
 fn get_chunk(data: &[u8], offset: usize) -> [u8; 16] {
@@ -393,6 +375,7 @@ pub fn decrypt_message(message_in: &[u8], decrypted_message: &mut [u8; 128]) {
     } else {
         0
     };
+    tracing::debug!("decrypt_message: mode={}, input_len={}", mode, message_in.len());
 
     let mut buffer = [0u8; 16];
 

@@ -68,16 +68,13 @@ impl AudioReorderBuffer {
     }
 }
 
-/// Run the UDP audio server on the given port.
+/// Run the UDP audio server on the given socket.
 pub async fn run_audio_server(
-    data_port: u16,
-    _control_port: u16,
+    socket: UdpSocket,
     decryptor: Arc<Mutex<AudioDecryptor>>,
 ) -> anyhow::Result<()> {
-    let addr4 = format!("0.0.0.0:{}", data_port);
-    let socket = UdpSocket::bind(&addr4).await?;
     let mut audio_file = std::fs::OpenOptions::new().create(true).append(true).open("audio.alac").ok();
-    tracing::info!("Audio server listening on {}", addr4);
+    tracing::info!("Audio server listening on {}", socket.local_addr()?);
 
     let mut buf = vec![0u8; 65536];
     let mut reorder = AudioReorderBuffer::new();
@@ -106,11 +103,9 @@ pub async fn run_audio_server(
     }
 }
 
-/// Run the UDP audio control server on the given port (lightweight).
-pub async fn run_audio_control_server(port: u16) -> anyhow::Result<()> {
-    let addr4 = format!("0.0.0.0:{}", port);
-    let socket = UdpSocket::bind(&addr4).await?;
-    tracing::info!("Audio control server listening on {}", addr4);
+/// Run the UDP audio control server on the given socket.
+pub async fn run_audio_control_server(socket: UdpSocket) -> anyhow::Result<()> {
+    tracing::info!("Audio control server listening on {}", socket.local_addr()?);
 
     let mut buf = vec![0u8; 2048];
     loop {
