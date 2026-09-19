@@ -34,6 +34,17 @@ pub fn derive_pair_setup_keys(session_key: &[u8]) -> PairVerifyKeys {
     }
 }
 
+/// Returns the Pair-Setup GCM nonce used by the `/fp-setup` confirmation.
+///
+/// UxPlay derives the base IV from the label and increments its final
+/// byte for the first GCM operation. Keeping that step explicit avoids
+/// applying the undocumented nonce adjustment to unrelated callers.
+pub fn pair_setup_gcm_iv(session_key: &[u8]) -> [u8; 16] {
+    let mut iv = derive_pair_setup_keys(session_key).iv;
+    iv[15] = iv[15].wrapping_add(1);
+    iv
+}
+
 pub fn derive_stream_material(
     audio_key: &[u8; 16],
     stream_connection_id: u64,
@@ -128,6 +139,14 @@ mod tests {
         assert_eq!((key_a, iv_a), (key_b, iv_b));
         assert_ne!((key_a, iv_a), derive_stream_material(&[1; 16], 43));
     }
+    #[test]
+    fn pair_setup_nonce_applies_protocol_increment() {
+        let base = derive_pair_setup_keys(&[9u8; 40]).iv;
+        let adjusted = pair_setup_gcm_iv(&[9u8; 40]);
+        assert_eq!(adjusted[..15], base[..15]);
+        assert_eq!(adjusted[15], base[15].wrapping_add(1));
+    }
+
     #[test]
     fn digest_auth_matches_rfc_example() {
         let response = digest_auth_response(
