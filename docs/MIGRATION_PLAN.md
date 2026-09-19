@@ -8,8 +8,8 @@
 
 | 阶段 | 内容 | 退出标准 | 状态 |
 |---|---|---|---|
-| S0 | 仓库、许可、workspace、CI、上游来源记录 | 本地 fmt/test/clippy 通过，来源和阶段清晰 | 进行中 |
-| S1 | 有界协议基础：镜像帧、NAL、RTP、NTP 表示、HTTP/RTSP 消息 | 拆包/粘包、混合字节序、截断、超限、错误输入测试通过 | 未开始 |
+| S0 | 仓库、许可、workspace、CI、上游来源记录 | 本地 fmt/test/clippy 通过，来源和阶段清晰 | 已完成 |
+| S1 | 有界协议基础：镜像帧、NAL、RTP、NTP 表示、HTTP/RTSP 消息 | 拆包/粘包、混合字节序、截断、超限、错误输入测试通过 | 已完成 |
 | S2 | 原版运行基线、密码原语、密钥派生、Apple SRP、PlayFair Rust 移植 | 受控 C oracle 差分、合法向量、重新配对/换流测试通过 | 未开始 |
 | S3 | 发现、网络控制服务、plist、会话生命周期和访问控制 | 可发现；真实配对/SETUP/RECORD/FLUSH/TEARDOWN；错误连接有界 | 未开始 |
 | S4 | 镜像 TCP、音频 UDP、重传、NTP 同步、GStreamer backend | 指定设备 H.264+AAC-ELD、ALAC、长时播放、断线恢复 | 未开始 |
