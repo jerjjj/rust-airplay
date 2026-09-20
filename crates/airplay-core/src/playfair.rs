@@ -156,7 +156,7 @@ fn sap_scramble(input: &[u8; 64]) -> [u8; 210] {
                 .unwrap(),
         );
         let shift = (3 - (index % 4)) * 8;
-        buffer[index] = ((word >> shift) & 0xff) as u8;
+        *slot = ((word >> shift) & 0xff) as u8;
     }
     for index in 0..840 {
         let x = buffer[(index as u32).wrapping_sub(155) as usize % 210];
