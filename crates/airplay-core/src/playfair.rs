@@ -148,7 +148,7 @@ pub(crate) fn modified_md5(block: &[u8; 64], key: &[u8; 16]) -> [u8; 16] {
 
 fn sap_scramble(input: &[u8; 64]) -> [u8; 210] {
     let mut buffer = [0u8; 210];
-    for index in 0..210 {
+    for (index, slot) in buffer.iter_mut().enumerate() {
         let word_index = (index % 64) / 4;
         let word = u32::from_le_bytes(
             input[word_index * 4..word_index * 4 + 4]
