@@ -2,9 +2,12 @@
 //! Protocol primitives for an UxPlay-compatible AirPlay receiver.
 
 pub mod crypto;
+pub mod fairplay;
+mod fairplay_tables;
 pub mod mirror;
 pub mod ntp;
 pub mod pairing;
+mod playfair_tables;
 pub mod rtp;
 pub mod srp;
 pub mod wire;
