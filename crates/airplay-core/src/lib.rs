@@ -7,6 +7,7 @@ mod fairplay_tables;
 pub mod mirror;
 pub mod ntp;
 pub mod pairing;
+mod playfair;
 mod playfair_tables;
 pub mod rtp;
 pub mod srp;

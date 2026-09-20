@@ -4,7 +4,7 @@ This project targets behavior of [FDH2/UxPlay](https://github.com/FDH2/UxPlay) a
 
 The Rust migration is licensed under GPL-3.0-or-later. UxPlay incorporates sources with GPL, LGPL and MIT notices. This document does not relicense those components. Retain original copyright and license notices whenever translating or incorporating their implementation/data. Before each such migration, record the exact source files and notices here.
 
-At bootstrap, UxPlay implementation and PlayFair tables are not copied into the Rust crates. Protocol layouts are documented with pinned upstream source references. Test vectors constructed in this project are synthetic and are not device captures.
+The FairPlay framing constants are translated from `upstream/UxPlay/lib/fairplay_playfair.c`; PlayFair table assets are translated from `upstream/UxPlay/lib/playfair/omg_hax.h`; and the modified MD5 primitive is translated from `upstream/UxPlay/lib/playfair/modified_md5.c`. These files are retained locally for provenance and each Rust translation keeps the applicable upstream SPDX notice. Test vectors constructed in this project are synthetic and are not device captures.
 
 The analysis in `research/` includes third-party README snapshots for evidence, not runtime code. Their upstream URLs and retrieval times are in `research/evidence/documents.json`; original links and attribution remain in those snapshots. `crates.json` records the queried package metadata. They do not establish a claim of tested integration or change any upstream license.
 
