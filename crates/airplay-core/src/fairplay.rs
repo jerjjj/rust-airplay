@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! FairPlay /fp-setup request/response state handling.
 //!
-//! The fixed setup replies and handshake echo are protocol framing. The
-//! PlayFair key derivation and 72-byte decrypt path are intentionally kept in
-//! a separate implementation step so this state machine cannot report a
-//! decrypted key before that transform is ported.
+//! The state machine validates framing and delegates the complete PlayFair transform.
 
 #![allow(missing_docs)]
 
@@ -23,7 +20,6 @@ pub enum FairPlayError {
     UnsupportedVersion(u8),
     InvalidMode(u8),
     HandshakeRequired,
-    PlayFairUnavailable,
 }
 
 impl std::fmt::Display for FairPlayError {
@@ -40,7 +36,6 @@ impl std::fmt::Display for FairPlayError {
             }
             Self::InvalidMode(mode) => write!(f, "invalid FairPlay setup mode {mode}"),
             Self::HandshakeRequired => f.write_str("FairPlay handshake has not completed"),
-            Self::PlayFairUnavailable => f.write_str("PlayFair transform is not ported yet"),
         }
     }
 }
@@ -91,10 +86,12 @@ impl FairPlaySession {
 
     pub fn decrypt(&self, encrypted_key: &[u8]) -> Result<[u8; DECRYPTED_KEY_LEN], FairPlayError> {
         require_len(encrypted_key, ENCRYPTED_KEY_LEN)?;
-        if self.key_message.is_none() {
-            return Err(FairPlayError::HandshakeRequired);
-        }
-        Err(FairPlayError::PlayFairUnavailable)
+        let message = self
+            .key_message
+            .as_ref()
+            .ok_or(FairPlayError::HandshakeRequired)?;
+        let cipher: &[u8; ENCRYPTED_KEY_LEN] = encrypted_key.try_into().unwrap();
+        Ok(crate::playfair::playfair_decrypt(message, cipher))
     }
 
     pub fn handshake_complete(&self) -> bool {
@@ -153,6 +150,27 @@ mod tests {
         assert_eq!(&response[..12], &FP_HEADER);
         assert_eq!(&response[12..], &request[144..]);
         assert!(session.handshake_complete());
+    }
+
+    #[test]
+    fn decrypts_key_after_handshake() {
+        let mut session = FairPlaySession::new();
+        let mut handshake = std::array::from_fn::<_, HANDSHAKE_REQUEST_LEN, _>(|index| {
+            (index as u8).wrapping_mul(23).wrapping_add(9)
+        });
+        handshake[4] = 0x03;
+        handshake[12] = 0;
+        session.handshake(&handshake).unwrap();
+        let cipher = std::array::from_fn::<_, ENCRYPTED_KEY_LEN, _>(|index| {
+            (index as u8).wrapping_mul(31).wrapping_add(5)
+        });
+        assert_eq!(
+            session.decrypt(&cipher).unwrap(),
+            [
+                0xb3, 0xa7, 0xf0, 0xcd, 0xaa, 0xc2, 0xfb, 0xeb, 0x9d, 0x67, 0x5a, 0x2e, 0xdc, 0x37,
+                0xf1, 0xf1,
+            ]
+        );
     }
 
     #[test]
