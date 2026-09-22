@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+mod hand_garble_generated;
+
 const SHIFT: [u32; 64] = [
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
     14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
@@ -146,6 +148,73 @@ pub(crate) fn modified_md5(block: &[u8; 64], key: &[u8; 16]) -> [u8; 16] {
     output
 }
 
+fn rol8(input: u8, count: u32) -> u8 {
+    input.rotate_left(count)
+}
+
+/// Computes the SAP hash used by FairPlay key derivation.
+///
+/// The transform intentionally follows UxPlay's byte-level ordering and
+/// in-place reverse scramble. All additions and XORs are performed on the
+/// 16-byte result after the garbling stage.
+pub(crate) fn sap_hash(block: &[u8; 64]) -> [u8; 16] {
+    const BUFFER0: [u8; 20] = [
+        0x96, 0x5f, 0xc6, 0x53, 0xf8, 0x46, 0xcc, 0x18, 0xdf, 0xbe, 0xb2, 0xf8, 0x38, 0xd7, 0xec,
+        0x22, 0x03, 0xd1, 0x20, 0x8f,
+    ];
+    const BUFFER2: [u8; 35] = [
+        0x43, 0x54, 0x62, 0x7a, 0x18, 0xc3, 0xd6, 0xb3, 0x9a, 0x56, 0xf6, 0x1c, 0x14, 0x3f, 0x0c,
+        0x1d, 0x3b, 0x36, 0x83, 0xb1, 0x39, 0x51, 0x4a, 0xaa, 0x09, 0x3e, 0xfe, 0x44, 0xaf, 0xde,
+        0xc3, 0x20, 0x9d, 0x42, 0x3a,
+    ];
+    const BUFFER4: [u8; 21] = [
+        0xed, 0x25, 0xd1, 0xbb, 0xbc, 0x27, 0x9f, 0x02, 0xa2, 0xa9, 0x11, 0x00, 0x0c, 0xb3, 0x52,
+        0xc0, 0xbd, 0xe3, 0x1b, 0x49, 0xc7,
+    ];
+    const MIX_INDICES: [usize; 11] = [18, 22, 23, 0, 5, 19, 32, 31, 10, 21, 30];
+
+    let mut buffer0 = BUFFER0;
+    let mut buffer1 = sap_scramble(block);
+    let mut buffer2 = BUFFER2;
+    let mut buffer3 = [0u8; 132];
+    let mut buffer4 = BUFFER4;
+    hand_garble_generated::hand_garble_bytes(
+        &mut buffer0,
+        &mut buffer1,
+        &mut buffer2,
+        &mut buffer3,
+        &mut buffer4,
+    );
+
+    let mut key = [0xe1u8; 16];
+    for (index, &source) in MIX_INDICES.iter().enumerate() {
+        key[index] = if index == 3 {
+            0x3d
+        } else {
+            key[index].wrapping_add(buffer3[source * 4])
+        };
+    }
+    for (index, &value) in buffer0.iter().enumerate() {
+        key[index % 16] ^= value;
+    }
+    for (index, &value) in buffer2.iter().enumerate() {
+        key[index % 16] ^= value;
+    }
+    for (index, &value) in buffer1.iter().enumerate() {
+        key[index % 16] ^= value;
+    }
+    for _ in 0..16 {
+        for index in 0..16 {
+            let x = key[(index + 16 - 7) % 16];
+            let y = key[index];
+            let z = key[(index + 16 - 37 % 16) % 16];
+            let w = key[(index + 16 - 177 % 16) % 16];
+            key[index] = rol8(x, 1) ^ y ^ rol8(z, 6) ^ rol8(w, 5);
+        }
+    }
+    key
+}
+
 fn sap_scramble(input: &[u8; 64]) -> [u8; 210] {
     let mut buffer = [0u8; 210];
     for (index, slot) in buffer.iter_mut().enumerate() {
@@ -202,6 +271,18 @@ mod tests {
     }
 
     #[test]
+    fn sap_hash_matches_upstream_vector() {
+        let input = std::array::from_fn::<_, 64, _>(|index| {
+            (index as u8).wrapping_mul(37).wrapping_add(11)
+        });
+        assert_eq!(
+            sap_hash(&input),
+            [
+                0xf5, 0xb3, 0xed, 0x59, 0xb3, 0x96, 0x84, 0x18, 0x77, 0x56, 0xc5, 0xfd, 0xc9, 0x71,
+                0x0c, 0x27,
+            ]
+        );
+    }
     fn modified_md5_matches_upstream_vector() {
         let block = std::array::from_fn::<_, 64, _>(|index| {
             (index as u8).wrapping_mul(37).wrapping_add(11)
