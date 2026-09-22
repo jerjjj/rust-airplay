@@ -215,6 +215,139 @@ pub(crate) fn sap_hash(block: &[u8; 64]) -> [u8; 16] {
     key
 }
 
+fn table_s1(round: usize) -> &'static [u8] {
+    let offset = ((31 * round) % 40) * 256;
+    &crate::playfair_tables::TABLE_S1[offset..offset + 256]
+}
+
+fn table_s4(round: usize) -> &'static [u8] {
+    let offset = ((71 * round) % 144) * 256;
+    &crate::playfair_tables::TABLE_S4[offset..offset + 256]
+}
+
+fn permute_block_1(block: &mut [u8; 16]) {
+    let table = crate::playfair_tables::TABLE_S3;
+    block[0] = table[usize::from(block[0])];
+    block[4] = table[0x400 + usize::from(block[4])];
+    block[8] = table[0x800 + usize::from(block[8])];
+    block[12] = table[0xc00 + usize::from(block[12])];
+    let tmp = block[13];
+    block[13] = table[0x100 + usize::from(block[9])];
+    block[9] = table[0xd00 + usize::from(block[5])];
+    block[5] = table[0x900 + usize::from(block[1])];
+    block[1] = table[0x500 + usize::from(tmp)];
+    let tmp = block[2];
+    block[2] = table[0xa00 + usize::from(block[10])];
+    block[10] = table[0x200 + usize::from(tmp)];
+    let tmp = block[6];
+    block[6] = table[0xe00 + usize::from(block[14])];
+    block[14] = table[0x600 + usize::from(tmp)];
+    let tmp = block[3];
+    block[3] = table[0xf00 + usize::from(block[7])];
+    block[7] = table[0x300 + usize::from(block[11])];
+    block[11] = table[0x700 + usize::from(block[15])];
+    block[15] = table[0xb00 + usize::from(tmp)];
+}
+
+fn permute_block_2(block: &mut [u8; 16], round: usize) {
+    let table = |index: usize| table_s4(round * 16 + index);
+    block[0] = table(0)[usize::from(block[0])];
+    block[4] = table(4)[usize::from(block[4])];
+    block[8] = table(8)[usize::from(block[8])];
+    block[12] = table(12)[usize::from(block[12])];
+    let tmp = block[13];
+    block[13] = table(13)[usize::from(block[9])];
+    block[9] = table(9)[usize::from(block[5])];
+    block[5] = table(5)[usize::from(block[1])];
+    block[1] = table(1)[usize::from(tmp)];
+    let tmp = block[2];
+    block[2] = table(2)[usize::from(block[10])];
+    block[10] = table(10)[usize::from(tmp)];
+    let tmp = block[6];
+    block[6] = table(6)[usize::from(block[14])];
+    block[14] = table(14)[usize::from(tmp)];
+    let tmp = block[3];
+    block[3] = table(3)[usize::from(block[7])];
+    block[7] = table(7)[usize::from(block[11])];
+    block[11] = table(11)[usize::from(block[15])];
+    block[15] = table(15)[usize::from(tmp)];
+}
+
+pub(crate) fn generate_key_schedule(key_material: &[u8; 16]) -> [[u32; 4]; 11] {
+    let mut key_data = [0u32; 4];
+    let mut bytes = [0u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = key_material[index] ^ crate::playfair_tables::T_KEY[index];
+    }
+    for (word, chunk) in key_data.iter_mut().zip(bytes.chunks_exact(4)) {
+        *word = u32::from_le_bytes(chunk.try_into().unwrap());
+    }
+    let index_mangle = [1u8, 2, 4, 8, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36, 0x6c];
+    let mut schedule = [[0u32; 4]; 11];
+    for round in 0..11 {
+        schedule[round][0] = key_data[0];
+        let tables = [
+            table_s1(round * 4),
+            table_s1(round * 4 + 1),
+            table_s1(round * 4 + 2),
+            table_s1(round * 4 + 3),
+        ];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(key_data) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        let old = bytes;
+        bytes[0] ^= tables[0][usize::from(old[13])] ^ index_mangle[round];
+        bytes[1] ^= tables[1][usize::from(old[14])];
+        bytes[2] ^= tables[2][usize::from(old[15])];
+        bytes[3] ^= tables[3][usize::from(old[12])];
+        key_data[0] = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        schedule[round][1] = key_data[1];
+        key_data[1] ^= key_data[0];
+        schedule[round][2] = key_data[2];
+        key_data[2] ^= key_data[1];
+        schedule[round][3] = key_data[3];
+        key_data[3] ^= key_data[2];
+    }
+    schedule
+}
+
+pub(crate) fn cycle(mut block: [u8; 16], schedule: &[[u32; 4]; 11]) -> [u8; 16] {
+    for (chunk, word) in block.chunks_exact_mut(4).zip(schedule[10]) {
+        let value = u32::from_le_bytes(chunk.try_into().unwrap()) ^ word;
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    permute_block_1(&mut block);
+    for round in 0..9 {
+        let key = schedule[9 - round].map(u32::to_le_bytes);
+        let word0 = crate::playfair_tables::TABLE_S5[usize::from(block[3] ^ key[0][3])]
+            ^ crate::playfair_tables::TABLE_S6[usize::from(block[2] ^ key[0][2])]
+            ^ crate::playfair_tables::TABLE_S8[usize::from(block[0] ^ key[0][0])]
+            ^ crate::playfair_tables::TABLE_S7[usize::from(block[1] ^ key[0][1])];
+        block[0..4].copy_from_slice(&word0.to_le_bytes());
+        let word1 = crate::playfair_tables::TABLE_S5[usize::from(block[7] ^ key[1][3])]
+            ^ crate::playfair_tables::TABLE_S6[usize::from(block[6] ^ key[1][2])]
+            ^ crate::playfair_tables::TABLE_S7[usize::from(block[5] ^ key[1][1])]
+            ^ crate::playfair_tables::TABLE_S8[usize::from(block[4] ^ key[1][0])];
+        block[4..8].copy_from_slice(&word1.to_le_bytes());
+        let word2 = crate::playfair_tables::TABLE_S5[usize::from(block[11] ^ key[2][3])]
+            ^ crate::playfair_tables::TABLE_S6[usize::from(block[10] ^ key[2][2])]
+            ^ crate::playfair_tables::TABLE_S7[usize::from(block[9] ^ key[2][1])]
+            ^ crate::playfair_tables::TABLE_S8[usize::from(block[8] ^ key[2][0])];
+        block[8..12].copy_from_slice(&word2.to_le_bytes());
+        let word3 = crate::playfair_tables::TABLE_S5[usize::from(block[15] ^ key[3][3])]
+            ^ crate::playfair_tables::TABLE_S6[usize::from(block[14] ^ key[3][2])]
+            ^ crate::playfair_tables::TABLE_S7[usize::from(block[13] ^ key[3][1])]
+            ^ crate::playfair_tables::TABLE_S8[usize::from(block[12] ^ key[3][0])];
+        block[12..16].copy_from_slice(&word3.to_le_bytes());
+        permute_block_2(&mut block, 8 - round);
+    }
+    for (chunk, word) in block.chunks_exact_mut(4).zip(schedule[0]) {
+        let value = u32::from_le_bytes(chunk.try_into().unwrap()) ^ word;
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    block
+}
+
 const STATIC_SOURCE_1: [u8; 17] = [
     0xfa, 0x9c, 0xad, 0x4d, 0x4b, 0x68, 0x26, 0x8c, 0x7f, 0xf3, 0x88, 0x99, 0xde, 0x92, 0x2e, 0x95,
     0x1e,
@@ -319,6 +452,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn key_schedule_and_cycle_match_upstream() {
+        let key = std::array::from_fn::<_, 16, _>(|index| {
+            (index as u8).wrapping_mul(37).wrapping_add(11)
+        });
+        let block =
+            std::array::from_fn::<_, 16, _>(|index| (index as u8).wrapping_mul(19).wrapping_add(7));
+        let schedule = generate_key_schedule(&key);
+        assert_eq!(
+            schedule,
+            [
+                [0x1bfc34db, 0x89e960f4, 0xb722d35b, 0x9fc8d9d2],
+                [0xa7d0d3bf, 0x2e39b34b, 0x991b6010, 0x06d3b9c2],
+                [0xbf6fec8f, 0x91565fc4, 0x084d3fd4, 0x0e9e8616],
+                [0x5c2961e6, 0xcd7f3e22, 0xc53201f6, 0xcbac87e0],
+                [0x1081f866, 0xddfec644, 0x18ccc7b2, 0xd3604052],
+                [0x90ea2c51, 0x4d14ea15, 0x55d82da7, 0x86b86df5],
+                [0x8d3e0183, 0xc02aeb96, 0x95f2c631, 0x134aabc4],
+                [0x411fec7d, 0x813507eb, 0x14c7c1da, 0x078d6a1e],
+                [0x8963186e, 0x08561f85, 0x1c91de5f, 0x1b1cb441],
+                [0x7a6dedd0, 0x723bf255, 0x6eaa2c0a, 0x75b6984b],
+                [0x622572f7, 0x101e80a2, 0x7eb4aca8, 0x0b0234e3],
+            ]
+        );
+        assert_eq!(
+            cycle(block, &schedule),
+            [
+                0xc0, 0x95, 0x66, 0x6c, 0x5d, 0x9f, 0xf6, 0xd3, 0x85, 0xd4, 0x01, 0x92, 0xc8, 0x0a,
+                0x65, 0x02
+            ]
+        );
+    }
     #[test]
     fn session_key_matches_upstream_vector() {
         let old_sap = std::array::from_fn::<_, 256, _>(|index| {
