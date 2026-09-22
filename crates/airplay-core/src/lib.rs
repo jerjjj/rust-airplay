@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Protocol primitives for an UxPlay-compatible AirPlay receiver.
 
+pub mod control;
 pub mod crypto;
 pub mod fairplay;
 mod fairplay_tables;
