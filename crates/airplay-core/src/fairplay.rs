@@ -91,7 +91,8 @@ impl FairPlaySession {
             .as_ref()
             .ok_or(FairPlayError::HandshakeRequired)?;
         let cipher: &[u8; ENCRYPTED_KEY_LEN] = encrypted_key.try_into().unwrap();
-        Ok(crate::playfair::playfair_decrypt(message, cipher))
+        crate::playfair::playfair_decrypt(message, cipher)
+            .ok_or(FairPlayError::InvalidMode(message[12]))
     }
 
     pub fn handshake_complete(&self) -> bool {

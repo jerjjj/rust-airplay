@@ -486,10 +486,9 @@ const DEFAULT_SAP: [u8; 256] = [
     0xe4, 0x2d, 0x44, 0x26, 0xc8, 0x35, 0xa7, 0xa5, 0xf6, 0xc8, 0x42, 0x1c, 0x0d, 0xa3, 0xf1, 0xc7,
 ];
 
-pub(crate) fn playfair_decrypt(message: &[u8; 164], cipher_text: &[u8; 72]) -> [u8; 16] {
+pub(crate) fn playfair_decrypt(message: &[u8; 164], cipher_text: &[u8; 72]) -> Option<[u8; 16]> {
     let message_body: &[u8; 144] = message[..144].try_into().unwrap();
-    let decrypted_message =
-        decrypt_message(message_body).expect("message mode validated by decrypt_message");
+    let decrypted_message = decrypt_message(message_body)?;
     let session_key = generate_session_key(&DEFAULT_SAP, &decrypted_message);
     let schedule = generate_key_schedule(&session_key);
     let mut block = [0u8; 16];
@@ -506,7 +505,7 @@ pub(crate) fn playfair_decrypt(message: &[u8; 164], cipher_text: &[u8; 72]) -> [
         *byte ^= crate::playfair_tables::X_KEY[index];
         *byte ^= crate::playfair_tables::Z_KEY[index];
     }
-    block
+    Some(block)
 }
 
 const STATIC_SOURCE_1: [u8; 17] = [
@@ -623,10 +622,10 @@ mod tests {
             std::array::from_fn::<_, 72, _>(|index| (index as u8).wrapping_mul(31).wrapping_add(5));
         assert_eq!(
             playfair_decrypt(&message, &cipher),
-            [
+            Some([
                 0xb3, 0xa7, 0xf0, 0xcd, 0xaa, 0xc2, 0xfb, 0xeb, 0x9d, 0x67, 0x5a, 0x2e, 0xdc, 0x37,
                 0xf1, 0xf1,
-            ]
+            ])
         );
     }
 
