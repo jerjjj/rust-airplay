@@ -10,8 +10,8 @@
 |---|---|---|---|
 | S0 | 仓库、许可、workspace、CI、上游来源记录 | 本地 fmt/test/clippy 通过，来源和阶段清晰 | 已完成 |
 | S1 | 有界协议基础：镜像帧、NAL、RTP、NTP 表示、HTTP/RTSP 消息 | 拆包/粘包、混合字节序、截断、超限、错误输入测试通过 | 已完成 |
-| S2 | 原版运行基线、密码原语、密钥派生、Apple SRP、PlayFair Rust 移植 | 受控 C oracle 差分、合法向量、重新配对/换流测试通过 | 进行中 |
-| S3 | 发现、网络控制服务、plist、会话生命周期和访问控制 | 可发现；真实配对/SETUP/RECORD/FLUSH/TEARDOWN；错误连接有界 | 未开始 |
+| S2 | 原版运行基线、密码原语、密钥派生、Apple SRP、PlayFair Rust 移植 | 受控 C oracle 差分、合法向量、重新配对/换流测试通过 | 已完成（离线） |
+| S3 | 发现、网络控制服务、plist、会话生命周期和访问控制 | 可发现；真实配对/SETUP/RECORD/FLUSH/TEARDOWN；错误连接有界 | 进行中 |
 | S4 | 镜像 TCP、音频 UDP、重传、NTP 同步、GStreamer backend | 指定设备 H.264+AAC-ELD、ALAC、长时播放、断线恢复 | 未开始 |
 | S5 | H.265、HLS/FCUP/URL 播放、语言/字幕、模式切换 | 与基线逐场景对照，正确控制播放和媒体切换 | 未开始 |
 | S6 | MP4、RTP 转发、封面/元数据、CLI/配置完整兼容 | 选项与行为矩阵完成，录制/导出可用 | 未开始 |
@@ -48,4 +48,5 @@ S0/S1 是本次启动工作的交付范围。S2 当前已完成标准密码原�
 - 检测到 MSYS2 UCRT64 的 GStreamer 1.28.3 与 `avdec_aac`；只验证工具和插件可查询，未验证 AirPlay AAC-ELD 样本。
 - 默认 Rust 与当前 GStreamer SDK 来源不同；S4 前选择一致 ABI 并验证链接，不能仅凭 pkg-config 成功就认为媒体 backend 可构建。
 - 本机未提供真实设备会话或抓包。需要实机时记录明确的待测步骤，不伪造成功结果。
+
 
