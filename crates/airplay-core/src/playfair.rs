@@ -215,6 +215,55 @@ pub(crate) fn sap_hash(block: &[u8; 64]) -> [u8; 16] {
     key
 }
 
+const STATIC_SOURCE_1: [u8; 17] = [
+    0xfa, 0x9c, 0xad, 0x4d, 0x4b, 0x68, 0x26, 0x8c, 0x7f, 0xf3, 0x88, 0x99, 0xde, 0x92, 0x2e, 0x95,
+    0x1e,
+];
+const STATIC_SOURCE_2: [u8; 47] = [
+    0xec, 0x4e, 0x27, 0x5e, 0xfd, 0xf2, 0xe8, 0x30, 0x97, 0xae, 0x70, 0xfb, 0xe0, 0x00, 0x3f, 0x1c,
+    0x39, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const INITIAL_SESSION_KEY: [u8; 16] = [
+    0xdc, 0xdc, 0xf3, 0xb9, 0x0b, 0x74, 0xdc, 0xfb, 0x86, 0x7f, 0xf7, 0x60, 0x16, 0x72, 0x90, 0x51,
+];
+
+/// Derive a FairPlay session key once the eight message blocks are decrypted.
+///
+/// `old_sap` is the 256-byte decrypted SAP payload and `decrypted_message` is
+/// the 128-byte message body produced by the PlayFair message transform.
+pub(crate) fn generate_session_key(old_sap: &[u8; 256], decrypted_message: &[u8; 128]) -> [u8; 16] {
+    let mut new_sap = [0u8; 320];
+    new_sap[..17].copy_from_slice(&STATIC_SOURCE_1);
+    new_sap[17..145].copy_from_slice(decrypted_message);
+    new_sap[145..273].copy_from_slice(&old_sap[128..]);
+    new_sap[273..320].copy_from_slice(&STATIC_SOURCE_2);
+    let mut session_key = INITIAL_SESSION_KEY;
+
+    for round in 0..5 {
+        let base: &[u8; 64] = new_sap[round * 64..round * 64 + 64]
+            .try_into()
+            .expect("round slice has fixed size");
+        let md5 = modified_md5(base, &session_key);
+        session_key = sap_hash(base);
+        for word in 0..4 {
+            let offset = word * 4;
+            let sum = u32::from_le_bytes(session_key[offset..offset + 4].try_into().unwrap())
+                .wrapping_add(u32::from_le_bytes(
+                    md5[offset..offset + 4].try_into().unwrap(),
+                ));
+            session_key[offset..offset + 4].copy_from_slice(&sum.to_le_bytes());
+        }
+    }
+    for chunk in session_key.chunks_exact_mut(4) {
+        chunk.reverse();
+    }
+    for byte in &mut session_key {
+        *byte ^= 0x79;
+    }
+    session_key
+}
+
 fn sap_scramble(input: &[u8; 64]) -> [u8; 210] {
     let mut buffer = [0u8; 210];
     for (index, slot) in buffer.iter_mut().enumerate() {
@@ -271,6 +320,22 @@ mod tests {
     }
 
     #[test]
+    fn session_key_matches_upstream_vector() {
+        let old_sap = std::array::from_fn::<_, 256, _>(|index| {
+            (index as u8).wrapping_mul(17).wrapping_add(5)
+        });
+        let message = std::array::from_fn::<_, 128, _>(|index| {
+            (index as u8).wrapping_mul(29).wrapping_add(3)
+        });
+        assert_eq!(
+            generate_session_key(&old_sap, &message),
+            [
+                0xf7, 0x17, 0x2d, 0x3e, 0xab, 0x16, 0xd2, 0x7c, 0xa5, 0xfa, 0x4c, 0x8f, 0xe6, 0xb9,
+                0xe0, 0x2c,
+            ]
+        );
+    }
+
     fn sap_hash_matches_upstream_vector() {
         let input = std::array::from_fn::<_, 64, _>(|index| {
             (index as u8).wrapping_mul(37).wrapping_add(11)
