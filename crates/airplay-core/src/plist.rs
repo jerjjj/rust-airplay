@@ -17,6 +17,16 @@
 
 use std::io::Cursor;
 
+/// Property-list value the accessors of this module work with.
+///
+/// Re-exported so a caller that builds a response, such as the control service
+/// handlers, needs only [`crate::plist`] rather than the backing implementation
+/// crate.
+pub use plist::Value;
+
+/// Dictionary value of a property list, re-exported with [`Value`].
+pub use plist::Dictionary;
+
 /// Largest accepted plist payload. Matches the control-plane body bound in
 /// [`crate::control`]; real AirPlay plists are a few kilobytes at most.
 pub const MAX_PLIST_BYTES: usize = 64 * 1024;

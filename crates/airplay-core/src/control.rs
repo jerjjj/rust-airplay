@@ -435,6 +435,113 @@ impl ControlResponse {
     }
 }
 
+/// One routed request as a [`RouteHandler`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteRequest<'a> {
+    /// Parsed request head, including its headers and target.
+    pub head: &'a MessageHead,
+    /// Complete request body, empty when the request declared no body.
+    pub body: &'a [u8],
+}
+
+/// Reply a [`RouteHandler`] produces for a route it serves.
+///
+/// The control plane wraps it into a [`ControlResponse`]: it echoes the request
+/// protocol and prepends `Audio-Jack-Status` the way
+/// `upstream/UxPlay/lib/raop.c:338-340` does, appends `Server` and `CSeq`
+/// afterwards (`raop.c:488-492`), and leaves the status code, reason phrase,
+/// body and handler headers to the handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteReply {
+    /// Numeric status code.
+    pub status: u16,
+    /// Reason phrase sent after the status code.
+    pub reason: &'static str,
+    /// Headers this handler contributes, in the order they must be written.
+    pub headers: Vec<(String, String)>,
+    /// Response body, empty for a header-only response.
+    pub body: Vec<u8>,
+}
+
+impl RouteReply {
+    /// `200 OK` with no headers and no body, upstream's default response
+    /// (`upstream/UxPlay/lib/raop.c:334-335`).
+    pub fn ok() -> Self {
+        Self::new(200, "OK")
+    }
+
+    /// `501 Not Implemented`.
+    ///
+    /// Upstream answers this for an unknown RTSP method
+    /// (`upstream/UxPlay/lib/raop.c:442-444`) and for an unsupported FairPlay
+    /// setup challenge (`raop_handlers.h:558`). This port also uses it for every
+    /// route upstream serves that it has not implemented yet, so an unimplemented
+    /// handler can never be mistaken for the upstream `200 OK`.
+    pub fn not_implemented() -> Self {
+        Self::new(501, "Not Implemented")
+    }
+
+    /// Reply with the given status code and reason phrase.
+    pub fn new(status: u16, reason: &'static str) -> Self {
+        Self {
+            status,
+            reason,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// Adds one header.
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Value of the first `name` header, ignoring case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Sets the response body.
+    pub fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self
+    }
+}
+
+/// Serves the routes that upstream implements but this control layer does not.
+///
+/// The trait exists so that the routing table, the request preconditions
+/// (unusable `CSeq`, HLS and Bluetooth LE handling) and the response header
+/// order live in exactly one place: [`ControlSession::handle_with`], a direct
+/// port of `upstream/UxPlay/lib/raop.c:232-494`. A handler therefore contributes
+/// only the status, reason, body and the headers its upstream handler adds.
+///
+/// One handler instance serves one connection, so it may hold per-connection
+/// protocol state such as a FairPlay or pairing session.
+pub trait RouteHandler {
+    /// Handles `route`, or returns `None` when this handler does not serve it.
+    ///
+    /// `None` makes the control plane answer `501 Not Implemented`.
+    fn handle(&mut self, route: Route, request: &RouteRequest<'_>) -> Option<RouteReply>;
+}
+
+/// A [`RouteHandler`] that implements no route.
+///
+/// Every route upstream serves but the port has not implemented answers
+/// `501 Not Implemented`; this is what [`ControlSession::handle`] uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoHandler;
+
+impl RouteHandler for NoHandler {
+    fn handle(&mut self, _route: Route, _request: &RouteRequest<'_>) -> Option<RouteReply> {
+        None
+    }
+}
+
 /// A request the control plane cannot act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
@@ -610,12 +717,32 @@ impl ControlSession {
     /// Returns [`ControlError`] when the request cannot be acted on; the caller
     /// answers with [`ControlError::to_response`], whose status code comes from
     /// [`ControlError::status`].
+    ///
+    /// This is [`ControlSession::handle_with`] with a [`NoHandler`], so every
+    /// route upstream serves that the port has not implemented answers
+    /// `501 Not Implemented`.
     pub fn handle(&mut self, input: &[u8]) -> Result<ControlOutcome, ControlError> {
+        self.handle_with(input, &mut NoHandler)
+    }
+
+    /// Handles one complete request, letting `handler` serve the routes this
+    /// layer does not implement itself.
+    ///
+    /// The network service passes its per-connection [`RouteHandler`] here.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ControlSession::handle`].
+    pub fn handle_with(
+        &mut self,
+        input: &[u8],
+        handler: &mut dyn RouteHandler,
+    ) -> Result<ControlOutcome, ControlError> {
         let head = parse_request_head_with_maximum(input, DEFAULT_MAX_HEAD).map_err(head_error)?;
         let length = head.content_length(MAX_CONTROL_BODY).map_err(body_error)?;
-        // The body must be complete before the request is routed. Its contents
-        // describe media sessions and belong to the network service work (W5).
-        let _body = split_body(&input[head.consumed..], length)?;
+        // The body must be complete before the request is routed, and a route
+        // handler describing a media session receives it.
+        let body = split_body(&input[head.consumed..], length)?;
         let facts = RequestFacts::from_head(&head);
 
         let cseq = match head.header("cseq") {
@@ -643,19 +770,21 @@ impl ControlSession {
             }
         }
 
-        let dispatch = dispatch(&facts);
-        let (status, reason, ported) = match dispatch {
+        let reply = match dispatch(&facts) {
             Dispatch::Ported(route) => {
                 self.observe(route);
-                (200, "OK", Some(route))
+                ported_reply(route, self.audio_delay_micros)
             }
-            Dispatch::NotImplemented(_) | Dispatch::UnknownRtspMethod => {
-                (501, "Not Implemented", None)
-            }
-            Dispatch::Unhandled => (200, "OK", None),
+            // Upstream serves the route; a handler that has not implemented it
+            // answers 501 rather than pretending to succeed.
+            Dispatch::NotImplemented(route) => handler
+                .handle(route, &RouteRequest { head: &head, body })
+                .unwrap_or_else(RouteReply::not_implemented),
+            Dispatch::UnknownRtspMethod => RouteReply::not_implemented(),
+            Dispatch::Unhandled => RouteReply::ok(),
         };
 
-        let mut response = ControlResponse::new(&head.version, status, reason);
+        let mut response = ControlResponse::new(&head.version, reply.status, reply.reason);
         // `raop.c:338-340`: added before the handler runs, for every RTSP
         // request that carries a CSeq except RECORD.
         if cseq.is_some() && head.method != "RECORD" {
@@ -663,28 +792,7 @@ impl ControlSession {
                 .headers
                 .push(("Audio-Jack-Status".to_owned(), AUDIO_JACK_STATUS.to_owned()));
         }
-        // Handler headers (`raop_handlers.h:596`, `:1225-1226`, `:1284`).
-        match ported {
-            Some(Route::Options) => response
-                .headers
-                .push(("Public".to_owned(), PUBLIC_METHODS.to_owned())),
-            Some(Route::Record) => {
-                response.headers.push((
-                    "Audio-Latency".to_owned(),
-                    audio_latency_samples(self.audio_delay_micros).to_string(),
-                ));
-                response.headers.push((
-                    "Audio-Jack-Status".to_owned(),
-                    AUDIO_JACK_STATUS_RECORD.to_owned(),
-                ));
-            }
-            Some(Route::Teardown) => {
-                response
-                    .headers
-                    .push(("Connection".to_owned(), "close".to_owned()));
-            }
-            _ => {}
-        }
+        response.headers.extend(reply.headers);
         // `raop.c:488-492`: `Server` and `CSeq` come last, and an HLS request
         // gets neither.
         if !facts.is_hls_request() {
@@ -695,6 +803,7 @@ impl ControlSession {
                 response.headers.push(("CSeq".to_owned(), cseq.to_string()));
             }
         }
+        response.body = reply.body;
         Ok(ControlOutcome::Respond(response))
     }
 
@@ -720,6 +829,55 @@ impl ControlSession {
             Route::Teardown => ControlState::Closed,
             _ => self.state,
         };
+    }
+}
+
+/// Reply for a route this control layer implements itself.
+///
+/// `OPTIONS` and `RECORD` contribute the headers their upstream handlers add
+/// (`upstream/UxPlay/lib/raop_handlers.h:596`, `:1225-1226`), and `TEARDOWN`
+/// asks the peer to close the connection (`raop_handlers.h:1284`).
+fn ported_reply(route: Route, audio_delay_micros: u32) -> RouteReply {
+    match route {
+        Route::Options => RouteReply::ok().with_header("Public", PUBLIC_METHODS),
+        Route::Record => {
+            let latency = audio_latency_samples(audio_delay_micros).to_string();
+            RouteReply::ok()
+                .with_header("Audio-Latency", &latency)
+                .with_header("Audio-Jack-Status", AUDIO_JACK_STATUS_RECORD)
+        }
+        Route::Teardown => RouteReply::ok().with_header("Connection", "close"),
+        _ => RouteReply::ok(),
+    }
+}
+
+/// Length in bytes of the first request in `input`, or `None` while that
+/// request is still incomplete.
+///
+/// A network service uses this to frame a byte stream: the length covers the
+/// request head plus the body its `Content-Length` declares and stops before
+/// the next request, so a caller can pass exactly one request to
+/// [`ControlSession::handle_with`] and keep the remaining bytes buffered.
+///
+/// An incomplete request is not an error, so [`ParseError::Incomplete`] is
+/// reported as `Ok(None)` here.
+///
+/// # Errors
+///
+/// Returns the failures [`ControlSession::handle_with`] reports: a malformed
+/// head or body length (`400`), a head past [`crate::wire::DEFAULT_MAX_HEAD`]
+/// (`431`) or a body past [`MAX_CONTROL_BODY`] (`400`).
+pub fn request_length(input: &[u8]) -> Result<Option<usize>, ControlError> {
+    let head = match parse_request_head_with_maximum(input, DEFAULT_MAX_HEAD) {
+        Ok(head) => head,
+        Err(ParseError::Incomplete) => return Ok(None),
+        Err(error) => return Err(head_error(error)),
+    };
+    let length = head.content_length(MAX_CONTROL_BODY).map_err(body_error)?;
+    match split_body(&input[head.consumed..], length) {
+        Ok(_) => Ok(Some(head.consumed + length)),
+        Err(ParseError::Incomplete) => Ok(None),
+        Err(error) => Err(ControlError::Parse(error)),
     }
 }
 

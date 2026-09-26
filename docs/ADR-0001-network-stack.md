@@ -59,6 +59,6 @@ MSRV 记录：workspace `rust-version = "1.85"`（本地工具链 1.98.1）。�
 ## 待办
 
 - [x] W4 落地 `plist` 时，在 THIRD_PARTY_NOTICES.md 记录版本与许可：`plist 1.8.0`（MIT），同时记录传递依赖 `quick-xml 0.38.4`、`indexmap 2.14.2`、`hashbrown 0.17.1`、`time 0.3.45`、`base64ct 1.8.3` 等（见 `Cargo.lock`）。
-- [ ] W5 落地 `tokio` 时，记录实际启用的 feature 集合。
+- [x] W5 落地 `tokio` 时，记录实际启用的 feature 集合：`tokio 1.53.1`（MIT），features 为 `rt-multi-thread`、`net`、`time`、`sync`、`io-util`、`macros`（`default-features = false`）；传递依赖为 `bytes 1.12.1`、`mio 1.2.3`、`pin-project-lite 0.2.17`、`socket2 0.6.5`、`tokio-macros 2.7.2`、`windows-link 0.2.1`、`windows-sys 0.61.2`，已记入 THIRD_PARTY_NOTICES.md。
 - [ ] W6 落地 `mdns-sd` 时，确认 TXT 记录构造能力覆盖上游 `dnssd.c` 的字段。
 - [ ] S4 前完成 FFmpeg 决策并单独记录。

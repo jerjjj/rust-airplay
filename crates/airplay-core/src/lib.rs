@@ -12,5 +12,6 @@ mod playfair;
 mod playfair_tables;
 pub mod plist;
 pub mod rtp;
+pub mod server;
 pub mod srp;
 pub mod wire;
