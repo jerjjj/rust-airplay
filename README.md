@@ -6,6 +6,7 @@
 
 - [分阶段计划与验收](docs/MIGRATION_PLAN.md)
 - [S3 工作计划与缺陷修复批次](docs/S3_WORK_PLAN.md)
+- [ADR-0001：S3 网络、plist 与 DNS-SD 选型](docs/ADR-0001-network-stack.md)
 - [架构与代码约定](docs/ARCHITECTURE.md)
 - [源码可行性研究](research/uxplay-rust-feasibility.zh-CN.md)
 - [上游基线及归属](THIRD_PARTY_NOTICES.md)

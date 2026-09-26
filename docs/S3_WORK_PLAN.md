@@ -16,7 +16,7 @@
   cargo clippy --workspace --all-targets -- -D warnings
   $env:RUSTDOCFLAGS='-D warnings'; cargo doc --workspace --no-deps
   ```
-- 本轮（缺陷批次）完成后的实测：fmt / clippy / doc 通过，`cargo test --workspace --all-targets` = **43 passed / 0 failed**（缺陷批次前为 30）。
+- 实测：fmt / clippy / doc 通过；`cargo test --workspace --all-targets` = **46 passed / 0 failed**，另有 `tests/control_spec.rs` 的 **7 passed**（缺陷批次前只有 30 个内联单元测试，没有集成测试）。
 
 ## 2. 约束（继承，不得绕过）
 
@@ -40,9 +40,9 @@
 | D6 | `MirrorDecoder` 超限后不定位、错误可重复触发；每包 `drain` 造成 O(n²) | 增加显式 fatal（`poisoned`）语义与 `reset()`，改用偏移游标 + 每次 push 一次 drain；补粘包/半包/超限用例 | 已完成 |
 | D7 | `AppleSrpServer::respond` 不校验客户端公钥长度 | 空值或超过 2048 位返回 `SrpError::InvalidLength`；补用例（零值仍为 `InvalidValue`） | 已完成 |
 | D8 | `FairPlaySession::decrypt` 把 PlayFair 变换失败映射为 `InvalidMode(message[12])` | 新增 `FairPlayError::DecryptionFailed`，区分“变换拒绝握手消息”与“setup 模式非法”；补用例 | 已完成 |
-| D9 | 测试覆盖缺口（GCM/X25519/sha512_derive、mirror 粘包、wire 边界） | 上述用例已补；**仍缺** `pairing.rs` 签名加解密往返与 `verify_pair_signature`、`control.rs` 的 `MAX_CONTROL_BODY` 超限/缺 Session 头/`to_bytes` 断言 | 部分完成 |
+| D9 | 测试覆盖缺口（GCM/X25519/sha512_derive、mirror 粘包、wire 边界、control 边界） | 上述用例已补；`control.rs` 的 `MAX_CONTROL_BODY` 超限、默认 200/501、`Public` 与响应头集合已由 `tests/control_spec.rs` 覆盖；**仍缺** `pairing.rs` 签名加解密往返与 `verify_pair_signature`、`ControlResponse::to_bytes` 断言 | 部分完成 |
 | D10 | `missing_docs = "warn"` 被 9 个模块的 `#![allow(missing_docs)]` 关闭 | 逐模块删除 allow 并补齐公共 API 文档 | 待做 |
-| D11 | `control.rs` 与上游 wire 行为不一致（写死 `SESSION_ID`、`Public` 头、缺 `Audio-Jack-Status`/`Server`、无 501） | 并入 W3，因为要先实现方法集合才能正确声明能力 | 待做（W3） |
+| D11 | `control.rs` 与上游 wire 行为不一致（写死 `SESSION_ID`、`Public` 头、缺 `Audio-Jack-Status`/`Server`、无 501） | `Public`（上游原串）、`Server: AirTunes/220.68`、`Audio-Jack-Status`（含 `RECORD` 的 analog 变体）、501 与上游默认 200 已随 W1 落地；`X-Apple-Session-ID`、`CSeq` 可选、免 `ANNOUNCE`、协议回显仍归 W3 | 部分完成（W1 + W3） |
 | D12 | 无 `tests/` 集成层、无上游差分 harness、无 fuzz/benches | 并入 W7 | 待做 |
 | D13 | FFmpeg 是否作为新增外部原生依赖 | 需要用户决策（影响 S4 backend 边界） | 待决策 |
 | D14 | 无远程仓库，CI 从未真正运行 | 需要用户决策：配置远程，或在文档中持续标注“仅本地验证” | 待决策 |
@@ -59,6 +59,8 @@
   - 会话标识：`raop.c:268`、`raop.c:297` 读取并保存客户端 `X-Apple-Session-ID`，`raop.c:400-402` 校验一致性。
 - 出口：新增表驱动测试（`crates/airplay-core/tests/control_spec.rs`），逐条覆盖上述路由，未实现者必须产生显式的「未实现」结果（不能静默忽略或落到错误分支）；测试同时固定 `Public` 串与响应头集合。
 - 依赖：无。写作用域：`crates/airplay-core/tests/`、`crates/airplay-core/src/control.rs`。
+- 状态：**已完成**（`c07cb2b`）。交付：`control.rs` 新增 `Route`/`RequestFacts`/`Dispatch`/`dispatch()`（逐条对应上游路由，含 `raop.c:270` 的 HLS 规则）与 `SERVER_HEADER_VALUE`/`AUDIO_JACK_STATUS`/`AUDIO_JACK_STATUS_RECORD`/`PUBLIC_METHODS`；未移植路由与未知 RTSP 方法返回 501，未匹配 URL 返回上游默认的 200 空响应；`tests/control_spec.rs` 用 7 个用例固定 40 余条路由判定与响应头契约。
+- 核对后新增的上游事实：`GLOBAL_VERSION` 是 `220.68`（`upstream/UxPlay/lib/global.h:22`），所以 `Server` 头保持该 wire 身份；上游**没有** ANNOUNCE 路由（整个 `lib/` 无匹配），因此 `ANNOUNCE` 是本移植的扩展且不进 `Public`；`RECORD` 用 `connected; type=analog` 并附 `Audio-Latency`（`raop_handlers.h:1225-1226`，后者依赖尚未建模的音频延迟）；`ControlResponse::to_bytes` 目前写死 `RTSP/1.0`，而上游回显请求协议。
 
 ### W2 依赖与网络运行时选型（阻塞 W3 及以后）
 
@@ -69,16 +71,19 @@
   3. **网络运行时**：**建议** `tokio`（`rt-multi-thread` + `net`），因为 S3/S4 同时存在 TCP 控制连接、镜像 TCP、音频 UDP 与 NTP 定时器；按「单会话所有权 + 有界队列」用 `mpsc`（有界）+ task 落所有权。备选方案是 `std::net` + 自管非阻塞/事件循环 + `socket2`（需要 `SO_REUSEADDR`、`TCP_NODELAY` 等上游设置）。
   4. 依赖许可必须与 GPL-3.0-or-later 兼容，并在 THIRD_PARTY_NOTICES.md 记录。
 - 出口：`docs/ADR-0001-network-stack.md` 记录选型、被否方案与理由、MSRV/许可核对结果；`Cargo.toml` 依赖落地（或明确不引入）；任何新依赖都要有实际用途，不得为未来功能预置。
+- 状态：**已完成**（[ADR-0001](ADR-0001-network-stack.md)）。决策：tokio（`rt-multi-thread`/`net`/`time`/`sync`/`io-util`/`macros`）+ `plist` + `mdns-sd`；依赖在首个使用它的工作包落地（W4 `plist`、W5 `tokio`、W6 `mdns-sd`），不提前写入 `Cargo.toml`；FFmpeg 推迟到 S4 前单独决策。证据：tokio 1.53.1 / MIT / MSRV 1.71；plist 1.8.0 / MIT / MSRV 1.81（1.10.1 要 1.88，`resolver = "3"` 的 MSRV 感知解析自动回退）；mdns-sd 0.21.4 / Apache-2.0 OR MIT / MSRV 1.71；socket2 0.6.5 作为降级路径。
 
 ### W3 控制面重构：无状态路由 + 有状态会话
 
 - 目的：把 `control.rs` 从「状态键控的 `advance()`」改成「无状态 URL 路由 + 有状态会话对象」，否则接入 `/info`、`/pair-setup` 时必须重写。
-- 内容：
-  - `head.target` 参与路由（当前 `wire.rs` 已解析但从未使用）。
-  - 方法集合与 `Public` 头按 W1 的期望值修正；`GET_PARAMETER`/`SET_PARAMETER` 有明确行为。
-  - `X-Apple-Session-ID` 取代写死的 `Session` 常量。
-  - 定义 `ControlError`/`RouteError` → HTTP 状态码的映射（未实现方法 501，畸形请求 400，未知 URL 404），并写入文档与测试。
-  - 每条 RTSP 响应补 `Audio-Jack-Status` 与 `Server` 头（按 W1 的例外规则）。
+- 内容（W1 已完成：路由判定、`Public`、`Server`、`Audio-Jack-Status`、501 与上游默认 200）：
+  - `X-Apple-Session-ID` 取代写死的 `Session` 常量（`upstream/UxPlay/lib/raop.c:268-297`）。
+  - `CSeq` 改为可选：缺省时不回 `CSeq`/`Audio-Jack-Status`（`raop.c:338`、`raop.c:490-492`），并按 `raop.c:263-270` 处理「无 CSeq 且未启用 HLS」的请求。
+  - 新连接可直接 `SETUP`，取消对 `ANNOUNCE` 的依赖（上游没有该路由）；`OPTIONS` 不再因状态被拒。
+  - `ControlResponse` 保存请求协议并原样回显（HTTP/1.1 对端目前会收到 `RTSP/1.0`）。
+  - `GET_PARAMETER`/`SET_PARAMETER` 有明确行为；`RECORD` 补 `Audio-Latency`（依赖音频延迟配置）。
+  - 明确 `ControlError` → 状态码映射（未实现方法 501，畸形请求 400，未知 URL 404；证据 `http_handlers.h:657`/`:891`/`:910`/`:926`/`:974`）。
+  - `tests/control_spec.rs` 顶部列出的「已知分歧」必须在 W3 结束后逐条改成正向断言。
 - 出口：W1 的规格化测试全绿；状态迁移语义与上游一致（OPTIONS 不因状态被拒）；`Err`→状态码映射有测试。
 - 依赖：W1。写作用域：`crates/airplay-core/src/control.rs`（独占）。
 
@@ -117,7 +122,7 @@
 | 波次 | 内容 | 说明 |
 |---|---|---|
 | 1 | D1–D8 | 本次完成，独立于 S3 设计决策 |
-| 2 | D9 剩余、D10、W1、W2 | 互相独立，可并行 |
+| 2 | D9 剩余、D10、W4、W6、W7 | W1/W2 已完成；D10 与 W4/W6/W7 互相独立，可并行 |
 | 3 | W3 → W4 → W5 | 严格顺序：W5 需要路由与 plist |
 | 4 | W6、W7、W8 | W6/W7 可并行，W8 收尾 |
 
@@ -125,15 +130,17 @@
 
 ## 6. 需要用户决策
 
-1. **FFmpeg**：是否接受它作为新增外部原生依赖（影响 S4 播放后端边界，见 `research/ffmpeg-output-feasibility.zh-CN.md`）。
-2. **新依赖**：是否接受 `plist` + `mdns-sd`，以及网络层选 `tokio` 还是 `std` + `socket2`（W2 会给出 ADR，但最终取舍需要你确认）。
-3. **远程仓库**：是否配置远程让 CI 真正运行；否则继续标注「仅本地验证」。
-4. **真机**：是否有可用 iPhone/iPad 用于 S3 配对验收；没有的话 S3 只能声明「本机可达」，不能声明互操作成功。
+1. ~~**FFmpeg**~~：**已定（2026-09-20）：推迟到 S4 开始前单独决策**，S3 不引入 FFmpeg。
+2. ~~**新依赖**~~：**已定（2026-09-20）：接受 tokio + `plist` + `mdns-sd`**，见 [ADR-0001](ADR-0001-network-stack.md)；依赖按工作包逐个落地，不提前写入。
+3. **远程仓库**：是否配置远程让 CI 真正运行；否则继续标注「仅本地验证」。**仍待你决策。**
+4. **真机**：是否有可用 iPhone/iPad 用于 S3 配对验收；没有的话 S3 只能声明「本机可达」，不能声明互操作成功。**仍待你决策。**
 
 ## 7. 进度记录
 
 | 日期 | 工作包 | 提交 | 说明 |
 |---|---|---|---|
 | 2026-09-20 | D1–D8 | `3fc20c0` `95fbf37` `c9467ca` `323ce83` `7888a64` `5a97d8b` | 测试 30 → 43，fmt/test/clippy/doc 全绿 |
+| 2026-09-20 | W1 | `c07cb2b` | 上游路由表 + 响应头契约 + `tests/control_spec.rs`（46 单元 + 7 集成） |
+| 2026-09-20 | W2 | 本次提交 | [ADR-0001](ADR-0001-network-stack.md)：tokio + plist + mdns-sd；FFmpeg 推迟到 S4 前 |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。
