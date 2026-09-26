@@ -5,6 +5,10 @@
 use std::fmt;
 
 pub const DEFAULT_MAX_BODY: usize = 8 * 1024 * 1024;
+/// Largest accepted request head: start line plus headers, including the
+/// terminating CRLF CRLF. Callers accumulate the head before parsing it, so it
+/// needs its own bound even though bodies already have one.
+pub const DEFAULT_MAX_HEAD: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -59,9 +63,36 @@ impl MessageHead {
     }
 }
 
+/// Parses one request head bounded by [`DEFAULT_MAX_HEAD`].
 pub fn parse_request_head(input: &[u8]) -> Result<MessageHead, ParseError> {
-    let Some(end) = input.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return Err(ParseError::Incomplete);
+    parse_request_head_with_maximum(input, DEFAULT_MAX_HEAD)
+}
+
+/// Parses one request head, rejecting a header block larger than `maximum`.
+///
+/// Returns [`ParseError::Incomplete`] while the terminating CRLF CRLF is still
+/// missing and the accumulated input is within `maximum`, and
+/// [`ParseError::TooLarge`] once a head without terminator outgrows the bound or
+/// the terminator itself sits past it.
+pub fn parse_request_head_with_maximum(
+    input: &[u8],
+    maximum: usize,
+) -> Result<MessageHead, ParseError> {
+    let end = match input.windows(4).position(|window| window == b"\r\n\r\n") {
+        Some(end) if end + 4 <= maximum => end,
+        Some(end) => {
+            return Err(ParseError::TooLarge {
+                declared: end + 4,
+                maximum,
+            });
+        }
+        None if input.len() > maximum => {
+            return Err(ParseError::TooLarge {
+                declared: input.len(),
+                maximum,
+            });
+        }
+        None => return Err(ParseError::Incomplete),
     };
     let text = std::str::from_utf8(&input[..end]).map_err(|_| ParseError::Invalid("headers"))?;
     let mut lines = text.split("\r\n");
@@ -119,5 +150,65 @@ mod tests {
                 maximum: 10
             })
         );
+    }
+
+    #[test]
+    fn reports_incomplete_and_oversized_heads() {
+        assert_eq!(
+            parse_request_head(b"SETUP /stream RTSP/1.0\r\nCSeq: 7\r\n"),
+            Err(ParseError::Incomplete)
+        );
+        assert_eq!(
+            parse_request_head_with_maximum(&[b'X'; 100], 16),
+            Err(ParseError::TooLarge {
+                declared: 100,
+                maximum: 16
+            })
+        );
+        let mut oversized = vec![b'A'; 40];
+        oversized.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(
+            parse_request_head_with_maximum(&oversized, 16),
+            Err(ParseError::TooLarge {
+                declared: 44,
+                maximum: 16
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_start_lines_and_header_encoding() {
+        assert_eq!(
+            parse_request_head(b"GET /\r\n\r\n"),
+            Err(ParseError::Invalid("version"))
+        );
+        assert_eq!(
+            parse_request_head(b"GET / HTTP/1.1 extra\r\n\r\n"),
+            Err(ParseError::Invalid("start line"))
+        );
+        assert_eq!(
+            parse_request_head(b"GET / FTP/1.0\r\n\r\n"),
+            Err(ParseError::Invalid("start line"))
+        );
+        assert_eq!(
+            parse_request_head(b"GET / HTTP/1.1\r\nX: \xff\r\n\r\n"),
+            Err(ParseError::Invalid("headers"))
+        );
+        assert_eq!(
+            parse_request_head(b"GET / HTTP/1.1\r\nBad Header: 1\r\n\r\n"),
+            Err(ParseError::Invalid("header name"))
+        );
+    }
+
+    #[test]
+    fn leaves_pipelined_requests_to_the_caller() {
+        let input = b"POST /x HTTP/1.1\r\nCSeq: 1\r\nContent-Length: 4\r\n\r\ndataOPTIONS * RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+        let first = parse_request_head(input).unwrap();
+        assert_eq!(first.content_length(64), Ok(4));
+        assert_eq!(split_body(&input[first.consumed..], 4).unwrap(), b"data");
+        let rest = &input[first.consumed + 4..];
+        let second = parse_request_head(rest).unwrap();
+        assert_eq!(second.header("cseq"), Some("2"));
+        assert_eq!(second.consumed, rest.len());
     }
 }
