@@ -16,10 +16,17 @@ pub struct MirrorPacket {
     pub payload: Vec<u8>,
 }
 
+/// Incremental decoder for the 128-byte mirror TCP framing.
+///
+/// A payload that exceeds the configured maximum is a fatal framing error: the
+/// next frame boundary is unknown, so later [`MirrorDecoder::push`] calls keep
+/// reporting the same error until [`MirrorDecoder::reset`] discards the stream.
 #[derive(Debug)]
 pub struct MirrorDecoder {
     buffer: Vec<u8>,
+    start: usize,
     maximum_payload: usize,
+    poisoned: Option<ParseError>,
 }
 
 impl Default for MirrorDecoder {
@@ -34,52 +41,80 @@ impl MirrorDecoder {
     pub fn with_maximum_payload(maximum_payload: usize) -> Self {
         Self {
             buffer: Vec::new(),
+            start: 0,
             maximum_payload,
+            poisoned: None,
         }
     }
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<MirrorPacket>, ParseError> {
+        if let Some(error) = &self.poisoned {
+            return Err(error.clone());
+        }
         self.buffer.extend_from_slice(bytes);
         let mut packets = Vec::new();
         loop {
-            if self.buffer.len() < MIRROR_HEADER_LEN {
+            let available = self.buffer.len() - self.start;
+            if available < MIRROR_HEADER_LEN {
                 break;
             }
-            let payload_len = u32::from_le_bytes(
-                self.buffer[..4]
-                    .try_into()
-                    .map_err(|_| ParseError::Invalid("payload length"))?,
-            ) as usize;
+            let (payload_len, packet_type, option, timestamp) = {
+                let header = &self.buffer[self.start..self.start + MIRROR_HEADER_LEN];
+                (
+                    u32::from_le_bytes(
+                        header[..4]
+                            .try_into()
+                            .map_err(|_| ParseError::Invalid("payload length"))?,
+                    ) as usize,
+                    [header[4], header[5]],
+                    [header[6], header[7]],
+                    u64::from_le_bytes(
+                        header[8..16]
+                            .try_into()
+                            .map_err(|_| ParseError::Invalid("timestamp"))?,
+                    ),
+                )
+            };
             if payload_len > self.maximum_payload {
-                return Err(ParseError::TooLarge {
+                let error = ParseError::TooLarge {
                     declared: payload_len,
                     maximum: self.maximum_payload,
-                });
+                };
+                self.buffer.clear();
+                self.start = 0;
+                self.poisoned = Some(error.clone());
+                return Err(error);
             }
             let total = MIRROR_HEADER_LEN
                 .checked_add(payload_len)
                 .ok_or(ParseError::Invalid("packet size"))?;
-            if self.buffer.len() < total {
+            if available < total {
                 break;
             }
-            let header = &self.buffer[..MIRROR_HEADER_LEN];
-            let packet = MirrorPacket {
+            let payload_start = self.start + MIRROR_HEADER_LEN;
+            packets.push(MirrorPacket {
                 payload_len,
-                packet_type: [header[4], header[5]],
-                option: [header[6], header[7]],
-                timestamp: u64::from_le_bytes(
-                    header[8..16]
-                        .try_into()
-                        .map_err(|_| ParseError::Invalid("timestamp"))?,
-                ),
-                payload: self.buffer[MIRROR_HEADER_LEN..total].to_vec(),
-            };
-            self.buffer.drain(..total);
-            packets.push(packet);
+                packet_type,
+                option,
+                timestamp,
+                payload: self.buffer[payload_start..payload_start + payload_len].to_vec(),
+            });
+            self.start += total;
+        }
+        if self.start > 0 {
+            self.buffer.drain(..self.start);
+            self.start = 0;
         }
         Ok(packets)
     }
+    /// Bytes of a frame that is still incomplete.
     pub fn buffered_len(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - self.start
+    }
+    /// Discards buffered bytes and clears a fatal framing error.
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.start = 0;
+        self.poisoned = None;
     }
 }
 
@@ -131,6 +166,41 @@ mod tests {
         let packets = decoder.push(&bytes[31..]).unwrap();
         assert_eq!(packets[0].payload, b"video");
         assert_eq!(packets[0].timestamp, 0x1122_3344_5566_7788);
+    }
+    #[test]
+    fn accepts_coalesced_packets_in_one_push() {
+        let mut bytes = packet(b"first");
+        bytes.extend_from_slice(&packet(b"second"));
+        let mut decoder = MirrorDecoder::new();
+        let packets = decoder.push(&bytes).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].payload, b"first");
+        assert_eq!(packets[1].payload, b"second");
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+    #[test]
+    fn keeps_partial_header_and_payload_buffered() {
+        let bytes = packet(b"frame");
+        let mut decoder = MirrorDecoder::new();
+        assert!(decoder.push(&bytes[..10]).unwrap().is_empty());
+        assert_eq!(decoder.buffered_len(), 10);
+        let packets = decoder.push(&bytes[10..]).unwrap();
+        assert_eq!(packets[0].payload, b"frame");
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+    #[test]
+    fn oversized_payload_poisons_until_reset() {
+        let mut decoder = MirrorDecoder::with_maximum_payload(4);
+        let error = ParseError::TooLarge {
+            declared: 5,
+            maximum: 4,
+        };
+        assert_eq!(decoder.push(&packet(b"12345")), Err(error.clone()));
+        assert_eq!(decoder.buffered_len(), 0);
+        assert_eq!(decoder.push(&packet(b"ok")), Err(error));
+        decoder.reset();
+        let packets = decoder.push(&packet(b"ok")).unwrap();
+        assert_eq!(packets[0].payload, b"ok");
     }
     #[test]
     fn converts_nals_and_rejects_truncation() {
