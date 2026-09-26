@@ -1,7 +1,13 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //! FairPlay PlayFair helper primitives.
 //!
 //! The implementation follows UxPlay's table and byte-order conventions while
 //! keeping all memory access bounded and explicit in Rust.
+//!
+//! Translated from `upstream/UxPlay/lib/playfair/omg_hax.{c,h}`,
+//! `modified_md5.c`, `playfair.c` and `sap_hash.c`; those upstream files carry
+//! no per-file header, so they keep the same LGPL-2.1-or-later notice as the
+//! FairPlay framing translation. See `THIRD_PARTY_NOTICES.md`.
 
 #![allow(dead_code)]
 
@@ -88,11 +94,12 @@ const K: [u32; 64] = [
 pub(crate) fn modified_md5(block: &[u8; 64], key: &[u8; 16]) -> [u8; 16] {
     let mut words = [0u32; 16];
     for (word, chunk) in words.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
 
     let key_words = std::array::from_fn::<_, 4, _>(|index| {
-        u32::from_le_bytes(key[index * 4..index * 4 + 4].try_into().unwrap())
+        let base = index * 4;
+        u32::from_le_bytes([key[base], key[base + 1], key[base + 2], key[base + 3]])
     });
     let mut a = key_words[0];
     let mut b = key_words[1];
@@ -280,7 +287,7 @@ pub(crate) fn generate_key_schedule(key_material: &[u8; 16]) -> [[u32; 4]; 11] {
         *byte = key_material[index] ^ crate::playfair_tables::T_KEY[index];
     }
     for (word, chunk) in key_data.iter_mut().zip(bytes.chunks_exact(4)) {
-        *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
     let index_mangle = [1u8, 2, 4, 8, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36, 0x6c];
     let mut schedule = [[0u32; 4]; 11];
@@ -300,7 +307,7 @@ pub(crate) fn generate_key_schedule(key_material: &[u8; 16]) -> [[u32; 4]; 11] {
         bytes[1] ^= tables[1][usize::from(old[14])];
         bytes[2] ^= tables[2][usize::from(old[15])];
         bytes[3] ^= tables[3][usize::from(old[12])];
-        key_data[0] = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        key_data[0] = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         schedule[round][1] = key_data[1];
         key_data[1] ^= key_data[0];
         schedule[round][2] = key_data[2];
@@ -313,7 +320,7 @@ pub(crate) fn generate_key_schedule(key_material: &[u8; 16]) -> [[u32; 4]; 11] {
 
 pub(crate) fn cycle(mut block: [u8; 16], schedule: &[[u32; 4]; 11]) -> [u8; 16] {
     for (chunk, word) in block.chunks_exact_mut(4).zip(schedule[10]) {
-        let value = u32::from_le_bytes(chunk.try_into().unwrap()) ^ word;
+        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ word;
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     permute_block_1(&mut block);
@@ -342,7 +349,7 @@ pub(crate) fn cycle(mut block: [u8; 16], schedule: &[[u32; 4]; 11]) -> [u8; 16] 
         permute_block_2(&mut block, 8 - round);
     }
     for (chunk, word) in block.chunks_exact_mut(4).zip(schedule[0]) {
-        let value = u32::from_le_bytes(chunk.try_into().unwrap()) ^ word;
+        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ word;
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     block
@@ -487,7 +494,7 @@ const DEFAULT_SAP: [u8; 256] = [
 ];
 
 pub(crate) fn playfair_decrypt(message: &[u8; 164], cipher_text: &[u8; 72]) -> Option<[u8; 16]> {
-    let message_body: &[u8; 144] = message[..144].try_into().unwrap();
+    let message_body: &[u8; 144] = message[..144].try_into().ok()?;
     let decrypted_message = decrypt_message(message_body)?;
     let session_key = generate_session_key(&DEFAULT_SAP, &decrypted_message);
     let schedule = generate_key_schedule(&session_key);
@@ -534,17 +541,26 @@ pub(crate) fn generate_session_key(old_sap: &[u8; 256], decrypted_message: &[u8;
     let mut session_key = INITIAL_SESSION_KEY;
 
     for round in 0..5 {
-        let base: &[u8; 64] = new_sap[round * 64..round * 64 + 64]
-            .try_into()
-            .expect("round slice has fixed size");
-        let md5 = modified_md5(base, &session_key);
-        session_key = sap_hash(base);
+        let start = round * 64;
+        let mut base = [0u8; 64];
+        base.copy_from_slice(&new_sap[start..start + 64]);
+        let md5 = modified_md5(&base, &session_key);
+        session_key = sap_hash(&base);
         for word in 0..4 {
             let offset = word * 4;
-            let sum = u32::from_le_bytes(session_key[offset..offset + 4].try_into().unwrap())
-                .wrapping_add(u32::from_le_bytes(
-                    md5[offset..offset + 4].try_into().unwrap(),
-                ));
+            let current = u32::from_le_bytes([
+                session_key[offset],
+                session_key[offset + 1],
+                session_key[offset + 2],
+                session_key[offset + 3],
+            ]);
+            let digest = u32::from_le_bytes([
+                md5[offset],
+                md5[offset + 1],
+                md5[offset + 2],
+                md5[offset + 3],
+            ]);
+            let sum = current.wrapping_add(digest);
             session_key[offset..offset + 4].copy_from_slice(&sum.to_le_bytes());
         }
     }
@@ -561,11 +577,13 @@ fn sap_scramble(input: &[u8; 64]) -> [u8; 210] {
     let mut buffer = [0u8; 210];
     for (index, slot) in buffer.iter_mut().enumerate() {
         let word_index = (index % 64) / 4;
-        let word = u32::from_le_bytes(
-            input[word_index * 4..word_index * 4 + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let base = word_index * 4;
+        let word = u32::from_le_bytes([
+            input[base],
+            input[base + 1],
+            input[base + 2],
+            input[base + 3],
+        ]);
         let shift = (3 - (index % 4)) * 8;
         *slot = ((word >> shift) & 0xff) as u8;
     }

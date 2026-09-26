@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //! Translation of UxPlay's FairPlay hand garbling transform.
 //!
 //! Buffers use `i128` slots to model C's integer promotions; each write is
