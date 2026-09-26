@@ -16,7 +16,7 @@
   cargo clippy --workspace --all-targets -- -D warnings
   $env:RUSTDOCFLAGS='-D warnings'; cargo doc --workspace --no-deps
   ```
-- 实测：fmt / clippy / doc 通过；`cargo test --workspace --all-targets` = **46 passed / 0 failed**，另有 `tests/control_spec.rs` 的 **7 passed**（缺陷批次前只有 30 个内联单元测试，没有集成测试）。
+- 实测：fmt / clippy / doc 通过；`cargo test --workspace --all-targets` = **58 passed / 0 failed**，另有 `tests/control_spec.rs` 的 **15 passed** 与 `tests/plist_spec.rs` 的 **5 passed**（缺陷批次前只有 30 个内联单元测试，没有集成测试）。
 
 ## 2. 约束（继承，不得绕过）
 
@@ -40,9 +40,9 @@
 | D6 | `MirrorDecoder` 超限后不定位、错误可重复触发；每包 `drain` 造成 O(n²) | 增加显式 fatal（`poisoned`）语义与 `reset()`，改用偏移游标 + 每次 push 一次 drain；补粘包/半包/超限用例 | 已完成 |
 | D7 | `AppleSrpServer::respond` 不校验客户端公钥长度 | 空值或超过 2048 位返回 `SrpError::InvalidLength`；补用例（零值仍为 `InvalidValue`） | 已完成 |
 | D8 | `FairPlaySession::decrypt` 把 PlayFair 变换失败映射为 `InvalidMode(message[12])` | 新增 `FairPlayError::DecryptionFailed`，区分“变换拒绝握手消息”与“setup 模式非法”；补用例 | 已完成 |
-| D9 | 测试覆盖缺口（GCM/X25519/sha512_derive、mirror 粘包、wire 边界、control 边界） | 上述用例已补；`control.rs` 的 `MAX_CONTROL_BODY` 超限、默认 200/501、`Public` 与响应头集合已由 `tests/control_spec.rs` 覆盖；**仍缺** `pairing.rs` 签名加解密往返与 `verify_pair_signature`、`ControlResponse::to_bytes` 断言 | 部分完成 |
-| D10 | `missing_docs = "warn"` 被 9 个模块的 `#![allow(missing_docs)]` 关闭 | 逐模块删除 allow 并补齐公共 API 文档 | 待做 |
-| D11 | `control.rs` 与上游 wire 行为不一致（写死 `SESSION_ID`、`Public` 头、缺 `Audio-Jack-Status`/`Server`、无 501） | `Public`（上游原串）、`Server: AirTunes/220.68`、`Audio-Jack-Status`（含 `RECORD` 的 analog 变体）、501 与上游默认 200 已随 W1 落地；`X-Apple-Session-ID`、`CSeq` 可选、免 `ANNOUNCE`、协议回显仍归 W3 | 部分完成（W1 + W3） |
+| D9 | 测试覆盖缺口（GCM/X25519/sha512_derive、mirror 粘包、wire 边界、control 边界） | 上述用例已补；`control.rs` 的头部/体上限、`Ignored` 语义、默认 200/501/431、`Public` 与响应头集合、`to_bytes` 的 `Content-Length` 规则已由单元测试与 `tests/control_spec.rs` 覆盖；**仍缺** `pairing.rs` 签名加解密往返与 `verify_pair_signature` | 部分完成 |
+| D10 | `missing_docs = "warn"` 被 9 个模块的 `#![allow(missing_docs)]` 关闭 | `control.rs` 已随 W3 去掉 allow 并补齐全部公共 API 文档；其余 8 个模块（`crypto.rs`、`fairplay.rs`、`mirror.rs`、`pairing.rs`、`ntp.rs`、`wire.rs`、`srp.rs`、`rtp.rs`）待逐模块删除 allow 并补齐文档 | 部分完成 |
+| D11 | `control.rs` 与上游 wire 行为不一致（写死 `SESSION_ID`、`Public` 头、缺 `Audio-Jack-Status`/`Server`、无 501） | 全部闭合：`Public`/`Server`/`Audio-Jack-Status`/501/上游默认 200 随 W1 落地；`X-Apple-Session-ID`、可选 `CSeq`、免 `ANNOUNCE`、协议回显、`Audio-Latency`、`Connection: close` 随 W3 落地；固定 `SESSION_ID` 已删除 | 已完成 |
 | D12 | 无 `tests/` 集成层、无上游差分 harness、无 fuzz/benches | 并入 W7 | 待做 |
 | D13 | FFmpeg 是否作为新增外部原生依赖 | 需要用户决策（影响 S4 backend 边界） | 待决策 |
 | D14 | 无远程仓库，CI 从未真正运行 | 需要用户决策：配置远程，或在文档中持续标注“仅本地验证” | 待决策 |
@@ -60,7 +60,7 @@
 - 出口：新增表驱动测试（`crates/airplay-core/tests/control_spec.rs`），逐条覆盖上述路由，未实现者必须产生显式的「未实现」结果（不能静默忽略或落到错误分支）；测试同时固定 `Public` 串与响应头集合。
 - 依赖：无。写作用域：`crates/airplay-core/tests/`、`crates/airplay-core/src/control.rs`。
 - 状态：**已完成**（`c07cb2b`）。交付：`control.rs` 新增 `Route`/`RequestFacts`/`Dispatch`/`dispatch()`（逐条对应上游路由，含 `raop.c:270` 的 HLS 规则）与 `SERVER_HEADER_VALUE`/`AUDIO_JACK_STATUS`/`AUDIO_JACK_STATUS_RECORD`/`PUBLIC_METHODS`；未移植路由与未知 RTSP 方法返回 501，未匹配 URL 返回上游默认的 200 空响应；`tests/control_spec.rs` 用 7 个用例固定 40 余条路由判定与响应头契约。
-- 核对后新增的上游事实：`GLOBAL_VERSION` 是 `220.68`（`upstream/UxPlay/lib/global.h:22`），所以 `Server` 头保持该 wire 身份；上游**没有** ANNOUNCE 路由（整个 `lib/` 无匹配），因此 `ANNOUNCE` 是本移植的扩展且不进 `Public`；`RECORD` 用 `connected; type=analog` 并附 `Audio-Latency`（`raop_handlers.h:1225-1226`，后者依赖尚未建模的音频延迟）；`ControlResponse::to_bytes` 目前写死 `RTSP/1.0`，而上游回显请求协议。
+- 核对后新增的上游事实：`GLOBAL_VERSION` 是 `220.68`（`upstream/UxPlay/lib/global.h:22`），所以 `Server` 头保持该 wire 身份；上游**没有** ANNOUNCE 路由（整个 `lib/` 无匹配），因此 `ANNOUNCE` 是本移植的扩展且不进 `Public`；`RECORD` 用 `connected; type=analog` 并附 `Audio-Latency`（`raop_handlers.h:1225-1226`，`Audio-Latency` 的计算与默认值随 W3 落地）；`ControlResponse::to_bytes` 当时写死 `RTSP/1.0`（W3 已改为回显请求协议）。
 
 ### W2 依赖与网络运行时选型（阻塞 W3 及以后）
 
@@ -86,6 +86,15 @@
   - `tests/control_spec.rs` 顶部列出的「已知分歧」必须在 W3 结束后逐条改成正向断言。
 - 出口：W1 的规格化测试全绿；状态迁移语义与上游一致（OPTIONS 不因状态被拒）；`Err`→状态码映射有测试。
 - 依赖：W1。写作用域：`crates/airplay-core/src/control.rs`（独占）。
+- 状态：**已完成**（本次提交）。交付与决策：
+  - `ControlSession::handle(&mut self, input) -> Result<ControlOutcome, ControlError>`，`ControlOutcome::{Respond, Ignored}` 显式表达上游「什么都不发」的两条路径（`raop.c:247-250` 不可用的 `CSeq`、`raop.c:263-266` 无 `CSeq` 且未启用 HLS 且不是 BLE 信标响应）；`raop.c:257-260` 的 BLE 规则与 `raop.c:270` 的 HLS 规则分别是 `RequestFacts::is_ble_beacon_response` 与 `is_hls_request`。
+  - 固定 `SESSION_ID` 与 `Session` 头已删除（上游从不发送也不读取该头）；连接在首次见到 `X-Apple-Session-ID` 时绑定，之后不同值返回 `ControlError::SessionMismatch`（上游 `raop.c:400-402` 用 `assert`，会 abort，移植改为 400）。
+  - `CSeq` 改为可选且按上游归一化（非负整数，回写十进制）；缺省时不回 `CSeq`/`Audio-Jack-Status`。
+  - `ControlResponse` 新增 `protocol` 字段并原样回显请求协议（`http_response.c:71-91`）；`to_bytes` 逐字移植 `http_response.c:131-170`：有 body 才写 `Content-Length`，无 body 但有 `Content-Type` 时写 `Content-Length: 0`，否则完全不写。
+  - 状态改为单向宽松的 `observe()`：`ControlState` 仅供参考，任何请求都不会因状态被拒（上游路由层无状态门）；`ANNOUNCE` 仍是扩展。新增 `AUDIO_SAMPLE_RATE`/`DEFAULT_AUDIO_DELAY_MICROS`/`MAX_AUDIO_DELAY_MICROS`/`audio_latency_samples()`，`RECORD` 附 `Audio-Latency`（默认 250 ms → `11025`）与 analog 状态，`TEARDOWN` 附 `Connection: close`。
+  - `ControlError` → 状态码：头部超限 431（裸响应，`raop.c:232-238`）、`Parse`/`BodyTooLarge`/`SessionMismatch` 400；所有拒绝都是裸状态行，不回显任何请求字段。
+  - 分歧说明：`GET_PARAMETER`/`SET_PARAMETER`（上游 451/200+`text/parameters`）与其余未移植路由仍答 501；未匹配 URL 仍回上游默认 200 空响应（上游只在具体 handler 内返回 404，如 `http_handlers.h:910`/`:926`/`:974`）；`SETUP`/`RECORD`/`FLUSH`/`TEARDOWN` 只实现 RTSP 信封，plist/密钥/RTP 端口处理归 W5。
+  - `tests/control_spec.rs` 重写为 15 个正向断言（路由表 40 余条、无 `CSeq` 的静默丢弃、BLE/HLS 分支、会话绑定与不匹配、协议回显、`Content-Length` 规则、`Audio-Latency`、`Connection: close`、431/400 裸响应），顶部「已知分歧」清单已删除；`control.rs` 的 `#![allow(missing_docs)]` 同时去掉（D10 的第一个模块），本次测试 58 单元 + 15 + 5 集成。
 
 ### W4 plist 编解码
 
@@ -123,8 +132,8 @@
 | 波次 | 内容 | 说明 |
 |---|---|---|
 | 1 | D1–D8 | 本次完成，独立于 S3 设计决策 |
-| 2 | D9 剩余、D10、W4、W6、W7 | W1/W2/W4 已完成；D10 与 W6/W7 互相独立，可并行 |
-| 3 | W3 → W4 → W5 | 严格顺序：W5 需要路由与 plist |
+| 2 | D9 剩余、D10、W4、W6、W7 | W1/W2/W4/W3 已完成；D10 与 W6/W7 互相独立，可并行 |
+| 3 | ~~W3~~ → W5 | W3 已完成，W5 待做：W5 需要路由（W3）与 plist（W4） |
 | 4 | W6、W7、W8 | W6/W7 可并行，W8 收尾 |
 
 写作用域互不重叠：W3 独占 `control.rs`，W4 新建 `plist.rs`，W5 新建 `server/`，W6 新建 `discovery.rs`，W7 只碰 `tests/` 与 fuzz 目标。
@@ -143,6 +152,7 @@
 | 2026-09-20 | D1–D8 | `3fc20c0` `95fbf37` `c9467ca` `323ce83` `7888a64` `5a97d8b` | 测试 30 → 43，fmt/test/clippy/doc 全绿 |
 | 2026-09-20 | W1 | `c07cb2b` | 上游路由表 + 响应头契约 + `tests/control_spec.rs`（46 单元 + 7 集成） |
 | 2026-09-20 | W2 | `f203204` | [ADR-0001](ADR-0001-network-stack.md)：tokio + plist + mdns-sd；FFmpeg 推迟到 S4 前 |
-| 2026-09-20 | W4 | 本次提交 | `plist.rs` + `plistlib` 双向夹具（`tests/plist_spec.rs`、`tools/plist_fixtures.py`）；51 单元 + 7 + 5 集成；`plist 1.8.0` 落地 |
+| 2026-09-20 | W4 | `8e72227` | `plist.rs` + `plistlib` 双向夹具（`tests/plist_spec.rs`、`tools/plist_fixtures.py`）；51 单元 + 7 + 5 集成；`plist 1.8.0` 落地 |
+| 2026-09-20 | W3 | 本次提交 | `control.rs` 无状态路由 + 有状态会话：`ControlOutcome`、`X-Apple-Session-ID` 绑定、可选 `CSeq`、协议回显、`Audio-Latency`、`Connection: close`、431/400 映射；`tests/control_spec.rs` 改 15 个正向断言；58 单元 + 15 + 5 集成 |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。
