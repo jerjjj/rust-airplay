@@ -114,19 +114,26 @@ pub fn aes128_cbc_decrypt(key: &[u8], iv: &[u8], input: &[u8]) -> Result<Vec<u8>
     Ok(decrypted.to_vec())
 }
 
+/// Decrypts one AES-128-GCM-16 record with an empty associated-data field.
+///
+/// UxPlay pairing uses a 16-byte nonce, so a key, IV or tag of any other length
+/// is rejected with [`CryptoError::InvalidLength`] instead of panicking.
 pub fn aes128_gcm16_decrypt(
     key: &[u8],
     iv: &[u8],
     ciphertext: &[u8],
     tag: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let key = aes_gcm::Key::<Aes128Gcm16>::from_slice(key);
-    let cipher = Aes128Gcm16::new(key);
-    let nonce = Nonce::<cipher::consts::U16>::from_slice(iv);
-    let tag = Tag::<cipher::consts::U16>::from_slice(tag);
+    let key = aes_gcm::Key::<Aes128Gcm16>::from_exact_iter(key.iter().copied())
+        .ok_or(CryptoError::InvalidLength("AES-128 key"))?;
+    let nonce = Nonce::<cipher::consts::U16>::from_exact_iter(iv.iter().copied())
+        .ok_or(CryptoError::InvalidLength("AES-GCM IV"))?;
+    let tag = Tag::<cipher::consts::U16>::from_exact_iter(tag.iter().copied())
+        .ok_or(CryptoError::InvalidLength("AES-GCM tag"))?;
+    let cipher = Aes128Gcm16::new(&key);
     let mut plaintext = ciphertext.to_vec();
     cipher
-        .decrypt_in_place_detached(nonce, b"", &mut plaintext, tag)
+        .decrypt_in_place_detached(&nonce, b"", &mut plaintext, &tag)
         .map_err(|_| CryptoError::AuthenticationFailed)?;
     Ok(plaintext)
 }
@@ -241,5 +248,98 @@ mod tests {
         let signature = ed25519_sign(&private, b"airplay");
         assert!(ed25519_verify(&public, b"airplay", &signature));
         assert!(!ed25519_verify(&public, b"tampered", &signature));
+    }
+
+    fn fixed_array<const N: usize>(hex: &str) -> [u8; N] {
+        let mut output = [0u8; N];
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        output
+    }
+
+    #[test]
+    fn gcm_rejects_wrong_key_iv_or_tag_length() {
+        assert_eq!(
+            aes128_gcm16_decrypt(&[0; 15], &[0; 16], b"", &[0; 16]),
+            Err(CryptoError::InvalidLength("AES-128 key"))
+        );
+        assert_eq!(
+            aes128_gcm16_decrypt(&[0; 16], &[0; 15], b"", &[0; 16]),
+            Err(CryptoError::InvalidLength("AES-GCM IV"))
+        );
+        assert_eq!(
+            aes128_gcm16_decrypt(&[0; 16], &[0; 16], b"", &[0; 15]),
+            Err(CryptoError::InvalidLength("AES-GCM tag"))
+        );
+    }
+
+    #[test]
+    fn gcm_round_trip_and_tamper_detection() {
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let cipher = Aes128Gcm16::new(&aes_gcm::Key::<Aes128Gcm16>::from_exact_iter(key).unwrap());
+        let mut buffer = b"airplay pairing payload".to_vec();
+        let tag = cipher
+            .encrypt_in_place_detached(
+                &Nonce::<cipher::consts::U16>::from_exact_iter(iv).unwrap(),
+                b"",
+                &mut buffer,
+            )
+            .unwrap();
+
+        assert_eq!(
+            aes128_gcm16_decrypt(&key, &iv, &buffer, &tag).unwrap(),
+            b"airplay pairing payload"
+        );
+
+        let mut tampered = buffer.clone();
+        tampered[0] ^= 1;
+        assert_eq!(
+            aes128_gcm16_decrypt(&key, &iv, &tampered, &tag),
+            Err(CryptoError::AuthenticationFailed)
+        );
+
+        let mut wrong_tag = tag;
+        wrong_tag[0] ^= 1;
+        assert_eq!(
+            aes128_gcm16_decrypt(&key, &iv, &buffer, &wrong_tag),
+            Err(CryptoError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn x25519_matches_rfc7748_vectors() {
+        let alice_private: [u8; 32] =
+            fixed_array("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let bob_private: [u8; 32] =
+            fixed_array("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+        let alice_public: [u8; 32] =
+            fixed_array("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        let bob_public: [u8; 32] =
+            fixed_array("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+        let shared: [u8; 32] =
+            fixed_array("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+
+        assert_eq!(x25519_public(&alice_private), alice_public);
+        assert_eq!(x25519_public(&bob_private), bob_public);
+        assert_eq!(x25519_shared(&alice_private, &bob_public), shared);
+        assert_eq!(x25519_shared(&bob_private, &alice_public), shared);
+    }
+
+    #[test]
+    fn sha512_derive_returns_prefixes_and_rejects_overlong_output() {
+        assert_eq!(
+            sha512_derive(&[b"abc"], 16).unwrap(),
+            vec![
+                0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba, 0xcc, 0x41, 0x73, 0x49, 0xae, 0x20,
+                0x41, 0x31
+            ]
+        );
+        assert_eq!(sha512_derive(&[b"abc"], 64).unwrap().len(), 64);
+        assert_eq!(
+            sha512_derive(&[b"abc"], 65),
+            Err(CryptoError::InvalidLength("SHA-512 output"))
+        );
     }
 }
