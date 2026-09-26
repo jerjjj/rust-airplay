@@ -109,6 +109,9 @@
 - 内容：TCP 监听与连接上限；RTSP/HTTP 请求循环（复用 `wire.rs` 的 `consumed` 语义处理流水线与半包）；`/info`、`/fp-setup`、`/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify`、`POST /feedback`；错误连接有界（请求头/体上限、空闲超时、连接数上限）。
 - 出口：本机可用 `curl`/测试客户端走通 `OPTIONS` → `/info` → `/fp-setup` → `/pair-setup` 的部分流程；超限请求被拒绝且进程不 panic。
 - 依赖：W3 + W4。写作用域：`crates/airplay-core/src/server/`（新建）。
+- 状态：**拆分为 W5a（已完成）与 W5b（待做）**。
+  - **W5a 已完成**（`322e01b`）：`crates/airplay-core/src/server/` 三个模块——`mod.rs`（`ServerConfig`/`Server::bind`/`Server::run`，accept 前先取连接许可，满了就在 backlog 等待，对应 `httpd.c:389-402`）、`connection.rs`（按 `control::request_length` 分帧的连接循环，未完成请求不能刷新空闲超时，无法成帧的请求答一次后关闭）、`handlers.rs`（`DeviceIdentity` + 上游默认值，`/feedback`、`/info`、`/fp-setup` 三个路由）。同时 `control.rs` 增加 `RouteHandler`/`RouteReply`/`RouteRequest`/`NoHandler` 与 `ControlSession::handle_with`（信封与前置条件仍集中在一处），`request_length` 负责帧长。`tests/server_spec.rs` 用 9 个真实 socket 用例覆盖 /info 往返、同一次写入的两个请求（**该用例发现并修掉了「缓冲区里已有完整请求却仍阻塞在 read」的真实缺陷**）、分片请求、80 KiB 头的 431、畸形请求的 400、TEARDOWN 的 `Connection: close`、feedback 回调与 `max_connections=1` 的连接上限。验收：67 单元 + 15 + 5 + 9 集成全绿，fmt/clippy/doc 全绿。
+  - **W5b 待做**：`/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify` 四条配对路由。它们需要**接收端共享的 PIN 与长期身份密钥**（上游存在 `raop->pin` 与 `pairing_init_generate` 生成的 Ed25519 密钥文件里，`upstream/UxPlay/lib/raop.c:659`），而当前 `RouteHandlers` 是按连接创建的；因此在动手前要先决定身份密钥从哪来（持久化文件 vs 由调用方注入），并把 PIN 放进可在连接间共享的状态。这四条路由现在按「未移植」答 501（显式失败，不假装成功）。
 
 ### W6 DNS-SD 广告与访问控制
 
@@ -133,7 +136,7 @@
 |---|---|---|
 | 1 | D1–D8 | 本次完成，独立于 S3 设计决策 |
 | 2 | D9 剩余、D10、W4、W6、W7 | W1/W2/W4/W3 已完成；D10 与 W6/W7 互相独立，可并行 |
-| 3 | ~~W3~~ → W5 | W3 已完成，W5 待做：W5 需要路由（W3）与 plist（W4） |
+| 3 | ~~W3~~ → ~~W5a~~ → W5b | W3 与 W5a 已完成；W5b（配对路由）需要先定身份密钥来源 |
 | 4 | W6、W7、W8 | W6/W7 可并行，W8 收尾 |
 
 写作用域互不重叠：W3 独占 `control.rs`，W4 新建 `plist.rs`，W5 新建 `server/`，W6 新建 `discovery.rs`，W7 只碰 `tests/` 与 fuzz 目标。
@@ -144,6 +147,7 @@
 2. ~~**新依赖**~~：**已定（2026-09-20）：接受 tokio + `plist` + `mdns-sd`**，见 [ADR-0001](ADR-0001-network-stack.md)；依赖按工作包逐个落地，不提前写入。
 3. **远程仓库**：是否配置远程让 CI 真正运行；否则继续标注「仅本地验证」。**仍待你决策。**
 4. **真机**：是否有可用 iPhone/iPad 用于 S3 配对验收；没有的话 S3 只能声明「本机可达」，不能声明互操作成功。**仍待你决策。**
+5. **配对身份密钥从哪来（W5b 前必须定）**：上游把 Ed25519 长期密钥生成并保存到文件（`upstream/UxPlay/lib/raop.c:659` 的 `pairing_init_generate(device_id, keyfile, …)`），PIN 存在接收端共享状态里。选项：(a) 由调用方注入密钥与 PIN，库本身不落盘；(b) 库按上游做法读写密钥文件（需要新增文件路径配置与权限/原子写考虑）；(c) 先用进程内临时密钥（每次重启都要重新配对）。**待你决策。**
 
 ## 7. 进度记录
 
@@ -153,6 +157,8 @@
 | 2026-09-20 | W1 | `c07cb2b` | 上游路由表 + 响应头契约 + `tests/control_spec.rs`（46 单元 + 7 集成） |
 | 2026-09-20 | W2 | `f203204` | [ADR-0001](ADR-0001-network-stack.md)：tokio + plist + mdns-sd；FFmpeg 推迟到 S4 前 |
 | 2026-09-20 | W4 | `8e72227` | `plist.rs` + `plistlib` 双向夹具（`tests/plist_spec.rs`、`tools/plist_fixtures.py`）；51 单元 + 7 + 5 集成；`plist 1.8.0` 落地 |
-| 2026-09-20 | W3 | 本次提交 | `control.rs` 无状态路由 + 有状态会话：`ControlOutcome`、`X-Apple-Session-ID` 绑定、可选 `CSeq`、协议回显、`Audio-Latency`、`Connection: close`、431/400 映射；`tests/control_spec.rs` 改 15 个正向断言；58 单元 + 15 + 5 集成 |
+| 2026-09-20 | W3 | `833d8c4` | `control.rs` 无状态路由 + 有状态会话：`ControlOutcome`、`X-Apple-Session-ID` 绑定、可选 `CSeq`、协议回显、`Audio-Latency`、`Connection: close`、431/400 映射；`tests/control_spec.rs` 改 15 个正向断言；58 单元 + 15 + 5 集成 |
+| 2026-09-20 | W5a | `322e01b` | `server/` 三层 + `RouteHandler` 委派 + `request_length`；`/info`、`/feedback`、`/fp-setup`；`tests/server_spec.rs` 9 个真实 socket 用例（含修掉「缓冲区已有完整请求仍阻塞 read」的缺陷）；67 单元 + 15 + 5 + 9 集成 |
+| 2026-09-20 | W5b | 待做 | 配对路由 `/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify`；当前答 501；需先定身份密钥来源（见第 6 节第 5 条） |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。
