@@ -17,7 +17,7 @@ S3 需要发现、网络控制服务、plist 编解码、会话生命周期和�
 ## 决策
 
 1. **网络运行时：tokio**，实际使用 `rt-multi-thread`、`net`、`time`、`sync`、`io-util`、`macros`。
-2. **plist：`plist` crate**（默认 `serde` feature 不需要时关闭，先只用其 `Value` API）。
+2. **plist：`plist` crate**（落地时写 `default-features = false`，只用其 `Value` API；可选 `serde` 不进依赖图，`cargo tree -i serde` 无输出）。
 3. **DNS-SD：`mdns-sd`**，纯 Rust 实现，不绑定系统 Bonjour/Avahi。
 4. **依赖在首个使用它的工作包落地**，不在 W2 提前加入 `Cargo.toml`，以满足 ARCHITECTURE.md「不为未来功能堆空 crate 或抽象」。落地点：W4 `plist`，W5 `tokio`，W6 `mdns-sd`。
 5. **FFmpeg 决策推迟**：不在 S3 引入 FFmpeg；是否作为新增外部原生依赖在 S4 开始前单独决策。
@@ -54,10 +54,11 @@ MSRV 记录：workspace `rust-version = "1.85"`（本地工具链 1.98.1）。�
 - `Cargo.lock` 将随 W4/W5/W6 明显增长（tokio 会带入 mio、socket2、bytes、pin-project-lite 等）；每个工作包提交后要重新跑三条验收命令，并在提交信息里记录新增依赖。
 - CI 的 MSRV 作业（1.85.0）必须在引入 `plist` 后仍通过；如果 `plist 1.8.0` 在 1.85 上失败，则改用自研子集（W4 的降级方案）。
 - 依赖升级不再只看 latest：`resolver = "3"` 的 MSRV 感知解析会静默选择旧版本，评审时要用 `cargo tree` 确认实际解析结果。
+- 2026-09-20 随 W4 用 `cargo metadata --locked` 审计了全部 71 个锁定包的 `rust-version`：没有任何包声明高于 1.85（恰好等于 1.85 的是 `base64ct 1.8.3`、`deranged 0.5.8`、`hashbrown 0.17.1`、`indexmap 2.14.2`、`zeroize 1.9.0`、`zeroize_derive 1.5.0`，以及本仓库两个 crate；其余 16 个包未声明）。本机只装了 stable/1.98.1，没有 1.85 工具链，因此 MSRV 的**编译**验证仍然只能由 CI 的 MSRV 作业完成。
 
 ## 待办
 
-- [ ] W4 落地 `plist` 时，在 THIRD_PARTY_NOTICES.md 记录版本与许可。
+- [x] W4 落地 `plist` 时，在 THIRD_PARTY_NOTICES.md 记录版本与许可：`plist 1.8.0`（MIT），同时记录传递依赖 `quick-xml 0.38.4`、`indexmap 2.14.2`、`hashbrown 0.17.1`、`time 0.3.45`、`base64ct 1.8.3` 等（见 `Cargo.lock`）。
 - [ ] W5 落地 `tokio` 时，记录实际启用的 feature 集合。
 - [ ] W6 落地 `mdns-sd` 时，确认 TXT 记录构造能力覆盖上游 `dnssd.c` 的字段。
 - [ ] S4 前完成 FFmpeg 决策并单独记录。

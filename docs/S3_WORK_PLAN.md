@@ -90,8 +90,9 @@
 ### W4 plist 编解码
 
 - 目的：解析上游客户端实际发送的二进制/XML plist，并构造 `/info`、SETUP 响应。
-- 出口：`/info` 请求与 SETUP 请求可解析；`/info` 响应可构造；往返测试；如能取得真实抓包则加样本（无抓包时明确标注为合成样本）。
-- 依赖：W2。写作用域：`crates/airplay-core/src/plist.rs`（新建）。
+- 内容：`crates/airplay-core/src/plist.rs` 提供 `Plist`（先查大小上限再解析、类型化读取返回 `PlistError` 而不是 panic、`encode_binary`/`encode_xml`）与 `dictionary()` 构造辅助；依赖 `plist 1.8.0`（`default-features = false`，可选 `serde` 不参与构建），已在 `lib.rs` 注册 `pub mod plist`。
+- 出口（已满足）：`/info` 请求（`qualifier` 字符串数组）、SETUP 请求（`ekey`/`eiv`/`deviceID`/`model`/`name`/`streams[type=96|110]`）与 SETUP 响应（`timingPort`/`eventPort`/`streams`）都有夹具验证。夹具由 `tools/plist_fixtures.py` 用 CPython `plistlib` 生成（`crates/airplay-core/tests/fixtures/*.bplist`），因此解码方向对的是**独立实现**；反向由 `cargo test -- --nocapture` 把本 crate 的编码结果写到 `$CARGO_TARGET_TMPDIR`，再用 `python tools/plist_fixtures.py --verify` 交给 `plistlib` 读回，两边值一致。**没有真实抓包，全部夹具是合成样本**；`streamConnectionID` 故意取 `> i64::MAX` 的值以固定无符号 64 位路径。
+- 依赖：W2。写作用域：`crates/airplay-core/src/plist.rs`（新建）、`crates/airplay-core/tests/plist_spec.rs` + `tests/fixtures/`、`tools/plist_fixtures.py`。
 
 ### W5 网络控制服务
 
@@ -122,7 +123,7 @@
 | 波次 | 内容 | 说明 |
 |---|---|---|
 | 1 | D1–D8 | 本次完成，独立于 S3 设计决策 |
-| 2 | D9 剩余、D10、W4、W6、W7 | W1/W2 已完成；D10 与 W4/W6/W7 互相独立，可并行 |
+| 2 | D9 剩余、D10、W4、W6、W7 | W1/W2/W4 已完成；D10 与 W6/W7 互相独立，可并行 |
 | 3 | W3 → W4 → W5 | 严格顺序：W5 需要路由与 plist |
 | 4 | W6、W7、W8 | W6/W7 可并行，W8 收尾 |
 
@@ -141,6 +142,7 @@
 |---|---|---|---|
 | 2026-09-20 | D1–D8 | `3fc20c0` `95fbf37` `c9467ca` `323ce83` `7888a64` `5a97d8b` | 测试 30 → 43，fmt/test/clippy/doc 全绿 |
 | 2026-09-20 | W1 | `c07cb2b` | 上游路由表 + 响应头契约 + `tests/control_spec.rs`（46 单元 + 7 集成） |
-| 2026-09-20 | W2 | 本次提交 | [ADR-0001](ADR-0001-network-stack.md)：tokio + plist + mdns-sd；FFmpeg 推迟到 S4 前 |
+| 2026-09-20 | W2 | `f203204` | [ADR-0001](ADR-0001-network-stack.md)：tokio + plist + mdns-sd；FFmpeg 推迟到 S4 前 |
+| 2026-09-20 | W4 | 本次提交 | `plist.rs` + `plistlib` 双向夹具（`tests/plist_spec.rs`、`tools/plist_fixtures.py`）；51 单元 + 7 + 5 集成；`plist 1.8.0` 落地 |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。
