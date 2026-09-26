@@ -6,7 +6,15 @@ use crate::wire::ParseError;
 
 pub const NTP_UNIX_EPOCH_SECONDS: u64 = 2_208_988_800;
 pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// Length of one NTP era in seconds. Era 0 covers 1900-01-01 through
+/// 2036-02-07; the 32-bit wire field cannot express a later instant.
+pub const NTP_ERA_SECONDS: u64 = 1 << 32;
 
+/// Converts an 8-byte era-0 NTP timestamp into Unix nanoseconds.
+///
+/// Returns [`ParseError::Incomplete`] for fewer than eight bytes and
+/// [`ParseError::Invalid`] for a timestamp before the Unix epoch or one whose
+/// nanoseconds do not fit in `u64`.
 pub fn timestamp_to_unix_nanos(bytes: &[u8]) -> Result<u64, ParseError> {
     if bytes.len() < 8 {
         return Err(ParseError::Incomplete);
@@ -25,18 +33,34 @@ pub fn timestamp_to_unix_nanos(bytes: &[u8]) -> Result<u64, ParseError> {
         return Err(ParseError::Invalid("NTP timestamp before Unix epoch"));
     }
     let unix_seconds = seconds - NTP_UNIX_EPOCH_SECONDS;
-    Ok(unix_seconds
-        .saturating_mul(NANOS_PER_SECOND)
-        .saturating_add((fraction.saturating_mul(NANOS_PER_SECOND)) >> 32))
+    let whole = unix_seconds
+        .checked_mul(NANOS_PER_SECOND)
+        .ok_or(ParseError::Invalid("NTP timestamp overflow"))?;
+    // The fraction counts 2^32 seconds of a second, so scale it exactly without
+    // a floating point step; `fraction < 2^32` and `NANOS_PER_SECOND < 2^30`
+    // keep the product below `u64::MAX`.
+    let fraction_nanos = (fraction * NANOS_PER_SECOND) >> 32;
+    whole
+        .checked_add(fraction_nanos)
+        .ok_or(ParseError::Invalid("NTP timestamp overflow"))
 }
 
-pub fn unix_nanos_to_timestamp(nanos: u64) -> [u8; 8] {
+/// Encodes Unix nanoseconds as an era-0 NTP timestamp.
+///
+/// Returns [`ParseError::Invalid`] once the instant reaches the 2036-02-07 era
+/// boundary (Unix second 2_085_978_496) because the 32-bit wire field cannot
+/// hold it without wrapping; callers that need a later era must translate to it
+/// explicitly instead of relying on silent truncation.
+pub fn unix_nanos_to_timestamp(nanos: u64) -> Result<[u8; 8], ParseError> {
     let seconds = nanos / NANOS_PER_SECOND + NTP_UNIX_EPOCH_SECONDS;
+    if seconds >= NTP_ERA_SECONDS {
+        return Err(ParseError::Invalid("NTP timestamp outside era 0"));
+    }
     let fraction = ((nanos % NANOS_PER_SECOND) << 32) / NANOS_PER_SECOND;
     let mut output = [0; 8];
     output[..4].copy_from_slice(&(seconds as u32).to_be_bytes());
     output[4..].copy_from_slice(&(fraction as u32).to_be_bytes());
-    output
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -44,9 +68,25 @@ mod tests {
     use super::*;
     #[test]
     fn round_trips_ntp_epoch_conversion() {
-        let timestamp = unix_nanos_to_timestamp(1_700_000_000_123_456_789);
+        let timestamp = unix_nanos_to_timestamp(1_700_000_000_123_456_789).unwrap();
         let decoded = timestamp_to_unix_nanos(&timestamp).unwrap();
         assert!((decoded as i128 - 1_700_000_000_123_456_789i128).abs() < 2);
+    }
+    #[test]
+    fn accepts_the_last_era_zero_second_and_rejects_the_era_boundary() {
+        let last_second = NTP_ERA_SECONDS - NTP_UNIX_EPOCH_SECONDS - 1;
+        let last_nanos = last_second * NANOS_PER_SECOND;
+        let timestamp = unix_nanos_to_timestamp(last_nanos).unwrap();
+        assert_eq!(timestamp_to_unix_nanos(&timestamp).unwrap(), last_nanos);
+        // 2036-02-07T06:28:16Z is one second past the last representable value.
+        assert_eq!(
+            unix_nanos_to_timestamp(last_nanos + NANOS_PER_SECOND),
+            Err(ParseError::Invalid("NTP timestamp outside era 0"))
+        );
+        assert_eq!(
+            unix_nanos_to_timestamp(u64::MAX),
+            Err(ParseError::Invalid("NTP timestamp outside era 0"))
+        );
     }
     #[test]
     fn rejects_short_and_pre_epoch_values() {
