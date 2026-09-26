@@ -16,10 +16,16 @@ pub const DECRYPTED_KEY_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FairPlayError {
-    InvalidLength { expected: usize, actual: usize },
+    InvalidLength {
+        expected: usize,
+        actual: usize,
+    },
     UnsupportedVersion(u8),
     InvalidMode(u8),
     HandshakeRequired,
+    /// The stored handshake message did not pass the PlayFair transform, so the
+    /// encrypted key could not be decrypted.
+    DecryptionFailed,
 }
 
 impl std::fmt::Display for FairPlayError {
@@ -36,6 +42,7 @@ impl std::fmt::Display for FairPlayError {
             }
             Self::InvalidMode(mode) => write!(f, "invalid FairPlay setup mode {mode}"),
             Self::HandshakeRequired => f.write_str("FairPlay handshake has not completed"),
+            Self::DecryptionFailed => f.write_str("FairPlay key decryption failed"),
         }
     }
 }
@@ -90,9 +97,9 @@ impl FairPlaySession {
             .key_message
             .as_ref()
             .ok_or(FairPlayError::HandshakeRequired)?;
-        let cipher: &[u8; ENCRYPTED_KEY_LEN] = encrypted_key.try_into().unwrap();
-        crate::playfair::playfair_decrypt(message, cipher)
-            .ok_or(FairPlayError::InvalidMode(message[12]))
+        let mut cipher = [0u8; ENCRYPTED_KEY_LEN];
+        cipher.copy_from_slice(encrypted_key);
+        crate::playfair::playfair_decrypt(message, &cipher).ok_or(FairPlayError::DecryptionFailed)
     }
 
     pub fn handshake_complete(&self) -> bool {
@@ -171,6 +178,21 @@ mod tests {
                 0xb3, 0xa7, 0xf0, 0xcd, 0xaa, 0xc2, 0xfb, 0xeb, 0x9d, 0x67, 0x5a, 0x2e, 0xdc, 0x37,
                 0xf1, 0xf1,
             ]
+        );
+    }
+
+    #[test]
+    fn decrypt_reports_transform_failure_separately_from_bad_mode() {
+        let mut session = FairPlaySession::new();
+        let mut handshake = [0u8; HANDSHAKE_REQUEST_LEN];
+        handshake[4] = 0x03;
+        // Byte 12 selects the PlayFair message mode; 4 is outside the four modes
+        // UxPlay implements, so the transform must refuse the request.
+        handshake[12] = 4;
+        session.handshake(&handshake).unwrap();
+        assert_eq!(
+            session.decrypt(&[0u8; ENCRYPTED_KEY_LEN]),
+            Err(FairPlayError::DecryptionFailed)
         );
     }
 

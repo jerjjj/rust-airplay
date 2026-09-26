@@ -191,6 +191,11 @@ impl AppleSrpServer {
     }
 
     pub fn respond(&self, client_public_bytes: &[u8]) -> Result<AppleSrpResponse, SrpError> {
+        // Apple sends the client public key as one 2048-bit Data block; reject an
+        // empty or oversized value before it reaches the big-integer math.
+        if client_public_bytes.is_empty() || client_public_bytes.len() > APPLE_SRP_MODULUS_SIZE {
+            return Err(SrpError::InvalidLength("SRP client public key"));
+        }
         let n = modulus();
         let client_public = BigUint::from_bytes_be(client_public_bytes);
         if client_public.is_zero() || (&client_public % n).is_zero() {
@@ -247,6 +252,29 @@ mod tests {
         let key = apple_session_key(&[1, 2, 3]);
         assert_eq!(key.len(), APPLE_SESSION_KEY_SIZE);
         assert_ne!(&key[..20], &key[20..]);
+    }
+
+    #[test]
+    fn respond_rejects_missing_or_oversized_client_public_key() {
+        let server = AppleSrpServer::new(
+            b"AA:BB:CC:DD:EE:FF",
+            b"1234",
+            &[0; APPLE_SRP_SALT_SIZE],
+            &[0x02; 32],
+        )
+        .unwrap();
+        assert!(matches!(
+            server.respond(&[]),
+            Err(SrpError::InvalidLength("SRP client public key"))
+        ));
+        assert!(matches!(
+            server.respond(&[0x02; APPLE_SRP_MODULUS_SIZE + 1]),
+            Err(SrpError::InvalidLength("SRP client public key"))
+        ));
+        assert!(matches!(
+            server.respond(&[0; APPLE_SRP_MODULUS_SIZE]),
+            Err(SrpError::InvalidValue("SRP client public key"))
+        ));
     }
 
     #[test]
