@@ -20,6 +20,8 @@
 
 S0/S1 是本次启动工作的交付范围。S2 当前已完成标准密码原语、Apple 标签 KDF、Digest 认证、Apple session-key 扩展，以及 2048 位 SHA-1 Apple SRP 服务端 proof 计算；SRP 固定向量已与上游 C oracle 对齐。完整 PlayFair 数据表/变换、FairPlay `/fp-setup` 状态机、真实设备重新配对/换流仍未完成。S2 中原版基线验证必须先于声称协议互操作成功；S1/S2 的离线测试不等于实机验证。后续沿该计划继续，不需要反复确认已授权的代码修改与本地 Git 提交。提交远程、发布和新增能力单独按实际授权处理。
 
+S3 的执行工作包、缺陷修复批次与依赖决策点见 [S3_WORK_PLAN.md](S3_WORK_PLAN.md)。
+
 ## 测试策略
 
 1. 对确定性 wire primitives 使用手工构造的固定向量，覆盖边界与故障。

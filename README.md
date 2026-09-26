@@ -5,6 +5,7 @@
 **当前是分阶段开发中的协议核心，尚不能被 iPhone 连接或播放媒体。** 原版构建、密码链、实机互操作和媒体后端的完成状态以 [迁移计划](docs/MIGRATION_PLAN.md) 为准。
 
 - [分阶段计划与验收](docs/MIGRATION_PLAN.md)
+- [S3 工作计划与缺陷修复批次](docs/S3_WORK_PLAN.md)
 - [架构与代码约定](docs/ARCHITECTURE.md)
 - [源码可行性研究](research/uxplay-rust-feasibility.zh-CN.md)
 - [上游基线及归属](THIRD_PARTY_NOTICES.md)
