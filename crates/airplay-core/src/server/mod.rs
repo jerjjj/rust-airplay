@@ -128,12 +128,14 @@ impl Server {
     /// # Errors
     ///
     /// Returns the bind failure of the address, or [`ErrorKind::InvalidInput`]
-    /// when `config.max_connections` is zero.
+    /// when `config.max_connections` is outside the range the connection counter
+    /// can hold. A configuration value must not be able to panic the service,
+    /// which is what handing an oversized limit to the semaphore would do.
     pub async fn bind(config: ServerConfig) -> Result<Self> {
-        if config.max_connections == 0 {
+        if config.max_connections == 0 || config.max_connections > Semaphore::MAX_PERMITS {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
-                "max_connections must be at least 1",
+                "max_connections must be between 1 and the connection counter limit",
             ));
         }
         let listener = TcpListener::bind(config.bind).await?;
@@ -223,6 +225,17 @@ mod tests {
     async fn bind_rejects_a_useless_connection_limit() {
         let config = ServerConfig {
             max_connections: 0,
+            ..ServerConfig::default()
+        };
+        let error = Server::bind(config).await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_a_connection_limit_the_counter_cannot_hold() {
+        // Handing this limit to the semaphore would panic inside `bind`.
+        let config = ServerConfig {
+            max_connections: usize::MAX,
             ..ServerConfig::default()
         };
         let error = Server::bind(config).await.err().unwrap();
