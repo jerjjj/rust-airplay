@@ -31,6 +31,18 @@ pub use plist::Dictionary;
 /// [`crate::control`]; real AirPlay plists are a few kilobytes at most.
 pub const MAX_PLIST_BYTES: usize = 64 * 1024;
 
+/// Largest nesting depth a property list may use.
+///
+/// The backing parser descends recursively, so a deeply nested list that is far
+/// below the size bound would abort the process with a stack overflow instead of
+/// returning an error. Real AirPlay payloads nest three or four levels
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:600-1067`), so the bound is
+/// generous and still far away from the stack limit.
+pub const MAX_PLIST_DEPTH: usize = 32;
+
+/// Largest number of objects one property list may contain.
+pub const MAX_PLIST_OBJECTS: usize = 4096;
+
 /// Reasons a property list could not be read or written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlistError {
@@ -85,11 +97,13 @@ impl Plist {
     pub fn parse(bytes: &[u8]) -> Result<Self, PlistError> {
         Self::parse_with_maximum(bytes, MAX_PLIST_BYTES)
     }
-
     /// Parses a binary or XML property list with an explicit size bound.
     ///
     /// The bound is checked before the parser runs, so an oversized request
-    /// cannot drive the allocation of a large value tree.
+    /// cannot drive the allocation of a large value tree. The structure is
+    /// checked before that as well: a payload too deeply nested to be parsed
+    /// without exhausting the stack is rejected instead of being handed to the
+    /// recursive parser ([`MAX_PLIST_DEPTH`], [`MAX_PLIST_OBJECTS`]).
     pub fn parse_with_maximum(bytes: &[u8], maximum: usize) -> Result<Self, PlistError> {
         if bytes.len() > maximum {
             return Err(PlistError::TooLarge {
@@ -97,6 +111,7 @@ impl Plist {
                 maximum,
             });
         }
+        check_structure(bytes)?;
         let value = plist::Value::from_reader(Cursor::new(bytes))
             .map_err(|error| PlistError::Decode(error.to_string()))?;
         Ok(Self { value })
@@ -195,6 +210,184 @@ impl Plist {
     }
 }
 
+/// Rejects a property list whose structure is too deep or too large to parse.
+///
+/// The check is iterative on purpose: it exists because the parser behind this
+/// module descends recursively and a small payload can abort the process before
+/// any error can be reported. A payload this function accepts is still validated
+/// by the parser itself.
+fn check_structure(bytes: &[u8]) -> Result<(), PlistError> {
+    if bytes.starts_with(b"bplist") {
+        check_binary(bytes)
+    } else if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'<')
+    {
+        check_xml(bytes)
+    } else {
+        // Not one of the two formats this module knows; the parser reports it.
+        Ok(())
+    }
+}
+
+/// Rejects a binary property list that nests or counts beyond the bounds.
+fn check_binary(input: &[u8]) -> Result<(), PlistError> {
+    const TRAILER: usize = 32;
+    if input.len() < TRAILER {
+        return Err(PlistError::Decode("binary plist is too short".to_owned()));
+    }
+    let trailer = &input[input.len() - TRAILER..];
+    let offset_size = usize::from(trailer[6]);
+    let reference_size = usize::from(trailer[7]);
+    if !(1..=8).contains(&offset_size) || !(1..=8).contains(&reference_size) {
+        return Err(PlistError::Decode(
+            "binary plist declares an unusable object table".to_owned(),
+        ));
+    }
+    let objects = read_unsigned(&trailer[8..16])?;
+    let root = read_unsigned(&trailer[16..24])?;
+    let table = read_unsigned(&trailer[24..32])?;
+    if objects == 0 || objects > MAX_PLIST_OBJECTS {
+        return Err(PlistError::Decode(format!(
+            "binary plist declares {objects} objects"
+        )));
+    }
+    if root >= objects {
+        return Err(PlistError::Decode("binary plist has no root".to_owned()));
+    }
+    let table_end = table
+        .checked_add(objects * offset_size)
+        .ok_or_else(|| PlistError::Decode("binary plist object table overflows".to_owned()))?;
+    if table_end > input.len() {
+        return Err(PlistError::Decode(
+            "binary plist object table lies outside the payload".to_owned(),
+        ));
+    }
+
+    // One explicit work stack instead of recursion, so the walk itself cannot
+    // exhaust the stack; the step budget bounds a payload whose references form
+    // a cycle or a shared subtree.
+    let mut pending = vec![(root, 1usize)];
+    let mut steps = 0usize;
+    while let Some((index, depth)) = pending.pop() {
+        steps += 1;
+        if steps > MAX_PLIST_OBJECTS * 8 {
+            return Err(PlistError::Decode(
+                "binary plist structure is too large".to_owned(),
+            ));
+        }
+        if depth > MAX_PLIST_DEPTH {
+            return Err(PlistError::Decode(format!(
+                "binary plist nests deeper than {MAX_PLIST_DEPTH}"
+            )));
+        }
+        if index >= objects {
+            return Err(PlistError::Decode(
+                "binary plist references a missing object".to_owned(),
+            ));
+        }
+        let entry = table + index * offset_size;
+        let offset = read_unsigned(
+            input
+                .get(entry..entry + offset_size)
+                .ok_or_else(|| PlistError::Decode("truncated object table".to_owned()))?,
+        )?;
+        let marker = *input
+            .get(offset)
+            .ok_or_else(|| PlistError::Decode("object outside the payload".to_owned()))?;
+        let mut cursor = offset + 1;
+        let mut count = usize::from(marker & 0x0f);
+        if count == 0x0f {
+            let size_marker = *input
+                .get(cursor)
+                .ok_or_else(|| PlistError::Decode("truncated object count".to_owned()))?;
+            let bytes = 1usize << (size_marker & 0x0f);
+            if size_marker >> 4 != 0x1 || bytes > 8 {
+                return Err(PlistError::Decode("invalid object count".to_owned()));
+            }
+            cursor += 1;
+            count = read_unsigned(
+                input
+                    .get(cursor..cursor + bytes)
+                    .ok_or_else(|| PlistError::Decode("truncated object count".to_owned()))?,
+            )?;
+            cursor += bytes;
+        }
+        let references = match marker >> 4 {
+            // Array and set hold `count` references, a dictionary holds twice as
+            // many: one key and one value per entry.
+            0xa | 0xc => count,
+            0xd => count
+                .checked_mul(2)
+                .ok_or_else(|| PlistError::Decode("dictionary entry count overflows".to_owned()))?,
+            _ => 0,
+        };
+        for _ in 0..references {
+            let child = read_unsigned(
+                input
+                    .get(cursor..cursor + reference_size)
+                    .ok_or_else(|| PlistError::Decode("truncated object".to_owned()))?,
+            )?;
+            cursor += reference_size;
+            pending.push((child, depth + 1));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects an XML property list that nests or counts beyond the bounds.
+fn check_xml(input: &[u8]) -> Result<(), PlistError> {
+    let text = std::str::from_utf8(input)
+        .map_err(|_| PlistError::Decode("xml plist is not utf-8".to_owned()))?;
+    let mut depth = 0usize;
+    let mut containers = 0usize;
+    for tag in text.split('<').skip(1) {
+        let body = tag.split('>').next().unwrap_or(tag);
+        let closing = body.starts_with('/');
+        let name = body.trim_start_matches('/');
+        let container = name.starts_with("array") || name.starts_with("dict");
+        if !container {
+            continue;
+        }
+        if closing {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        // A self-closing tag opens and closes in one step.
+        if body.ends_with('/') {
+            containers += 1;
+            continue;
+        }
+        depth += 1;
+        containers += 1;
+        if depth > MAX_PLIST_DEPTH || containers > MAX_PLIST_OBJECTS {
+            return Err(PlistError::Decode(format!(
+                "xml plist nests deeper than {MAX_PLIST_DEPTH} or holds more than {MAX_PLIST_OBJECTS} containers"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reads one big-endian unsigned integer of up to eight bytes.
+fn read_unsigned(bytes: &[u8]) -> Result<usize, PlistError> {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return Err(PlistError::Decode(
+            "binary plist integer has an unusable size".to_owned(),
+        ));
+    }
+    let mut value = 0usize;
+    for byte in bytes {
+        value = value
+            .checked_mul(256)
+            .and_then(|value| value.checked_add(usize::from(*byte)))
+            .ok_or_else(|| PlistError::Decode("binary plist integer overflows".to_owned()))?;
+    }
+    Ok(value)
+}
+
 /// Builds a dictionary value from key/value pairs, preserving insertion order.
 pub fn dictionary<K: Into<String>>(
     entries: impl IntoIterator<Item = (K, plist::Value)>,
@@ -224,6 +417,89 @@ mod tests {
                 ])]),
             ),
         ])
+    }
+
+    /// Builds a binary plist whose containers nest `depth` levels deep.
+    ///
+    /// Written out by hand because the encoder of the backing crate is
+    /// recursive too, so it cannot produce the payload this bound exists for.
+    fn nested_binary_plist(depth: usize) -> Vec<u8> {
+        assert!(depth >= 1);
+        let objects = depth;
+        let offset_size = 2usize;
+        let ref_size = if objects > 255 { 2usize } else { 1 };
+        let mut bytes = b"bplist00".to_vec();
+        let mut offsets = Vec::with_capacity(objects);
+        for index in 0..objects {
+            offsets.push(bytes.len());
+            if index + 1 == objects {
+                bytes.push(0xa0); // the innermost array is empty
+            } else {
+                bytes.push(0xa1); // an array holding the next level
+                let reference = (index + 1).to_be_bytes();
+                bytes.extend_from_slice(&reference[8 - ref_size..]);
+            }
+        }
+        let table = bytes.len();
+        for offset in &offsets {
+            let encoded = offset.to_be_bytes();
+            bytes.extend_from_slice(&encoded[8 - offset_size..]);
+        }
+        let mut trailer = [0u8; 32];
+        trailer[6] = offset_size as u8;
+        trailer[7] = ref_size as u8;
+        trailer[8..16].copy_from_slice(&(objects as u64).to_be_bytes());
+        trailer[16..24].copy_from_slice(&0u64.to_be_bytes());
+        trailer[24..32].copy_from_slice(&(table as u64).to_be_bytes());
+        bytes.extend_from_slice(&trailer);
+        bytes
+    }
+
+    #[test]
+    fn rejects_a_payload_that_nests_deeper_than_the_parser_can_descend() {
+        // Without the bound in front of the parser this aborts the process with
+        // a stack overflow rather than returning an error.
+        for depth in [8, MAX_PLIST_DEPTH] {
+            let bytes = nested_binary_plist(depth);
+            assert!(
+                bytes.len() < MAX_PLIST_BYTES,
+                "the rejected payload has to fit the size bound"
+            );
+            assert!(Plist::parse(&bytes).is_ok(), "depth {depth} is accepted");
+        }
+        for depth in [MAX_PLIST_DEPTH + 1, 1_000, 5_000] {
+            let bytes = nested_binary_plist(depth);
+            let error = Plist::parse(&bytes).expect_err("deep nesting is refused");
+            assert!(
+                matches!(error, PlistError::Decode(_)),
+                "depth {depth}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "aborts the test process on purpose: it shows the stack overflow the bound prevents"]
+    fn the_parser_behind_this_module_overflows_on_deep_nesting() {
+        // Calls the backing parser directly, bypassing `check_structure`, so that
+        // the reason for [`MAX_PLIST_DEPTH`] stays verifiable on demand:
+        // `cargo test -p airplay-core --lib -- --ignored the_parser_behind`.
+        let bytes = nested_binary_plist(1_300);
+        let _ = plist::Value::from_reader(Cursor::new(&bytes));
+    }
+
+    #[test]
+    fn rejects_an_xml_payload_that_nests_too_deeply() {
+        let deep = format!(
+            "<?xml version=\"1.0\"?><plist version=\"1.0\">{}x{}</plist>",
+            "<array>".repeat(MAX_PLIST_DEPTH + 1),
+            "</array>".repeat(MAX_PLIST_DEPTH + 1)
+        );
+        assert!(matches!(
+            Plist::parse(deep.as_bytes()),
+            Err(PlistError::Decode(_))
+        ));
+        let shallow = "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>a</key><string>b</string></dict></plist>";
+        assert!(Plist::parse(shallow.as_bytes()).is_ok());
     }
 
     #[test]

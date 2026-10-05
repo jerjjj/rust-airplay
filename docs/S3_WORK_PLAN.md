@@ -139,6 +139,21 @@
   - 验收：**83 单元 + 15 control_spec + 5 plist_spec + 15 server_spec = 118 全绿**；fmt/clippy/doc 全绿。配对向量的独立性：`pairing.rs` 的 CTR/GCM 向量由验收角色用纯 Python 独立实现生成，主理人再用 Node `crypto` 复算一致后才写入测试（仓库代码不参与生成）；`/pair-verify` 第二步的偏移错误由此可被测试报红。真机项（客户端是否带 `CSeq`、三阶段 plist 真实形状、`+1/+2` nonce 与 64 字节偏移是否被真实 iOS 接受、重启换钥后的表现）**全部未验证**，已列入 S3 验收的未测试清单。
   - W5b 遗留的未验证/待定项（不得在 S3 验收中当作已通过）：① SRP 服务端公钥 `B` 用最小编码（与上游 `srp.c:730` 一致），若真实客户端按 RFC5054 左填充到 256 字节，则约 1/256 的概率会因 `M` 不一致而失败——需要真机或抓包确认；② 一次性 PIN 在「配对成功才消费」的语义下，两个都知道 PIN 的对端可在第一个成功前的窗口内各自完成配对（已在模块文档记录，未加预留机制）；③ `plist` crate 对深嵌套 bplist 的递归深度未验证（< 64 KiB 的深嵌套输入是否会导致栈溢出需要单独测）；④ 空闲超时与「用户读 PIN 再输入」的交互：默认已按上游新加的 `timeout_limit = 60`（`upstream/UxPlay@3dbf7cee:lib/httpd.c:377`）对齐为 60 s，超时后需重新 `/pair-pin-start`（PIN 语义已保证不因此失效）；上游只在 socket 再次可读时才检查该年龄，本移植按硬超时执行（更强的同义实现）。
 
+### W5c SETUP 与会话密钥（待做，安全评审已给出开工前置）
+
+- 范围：SETUP 的 plist 流参数解析与会话建立——`streams[]`、`ekey`/`eiv` 解密、`timingPort`/`eventPort`、`ecdh_secret → aeskey = SHA256(aeskey16‖ecdh_secret32)[0..16]`（`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:826-860`）、密码 Digest 401（`:650-748`）、注册表落地、`SET_PARAMETER` 的新语义（`:1141-1168`）。
+- **开工前置（安全评审的阻断项，必须先满足再写处理器）**：
+  - **A. 会话材料交付**：只有完成 `/pair-verify` 第二步（`status == Finished`）的连接才允许把 ECDH 共享秘密/客户端身份交付给 SETUP；交付接口必须是消费型（`take_*`），重复交付失败；不得跨连接复用；**`/pair-verify` 成功不等于授权**（授权门是 SETUP 的 Digest 401）；交接面要有显式认证状态枚举（未认证 / 仅 legacy / PIN 已验证 / 已注册），SETUP 按它分支。
+  - **B. Digest 401**：**不照搬**上游 `pairing_session_make_nonce`（`pairing.c:199-215` 把 `ed_ours` **指针**当 32 字节密钥做 SHA-512，熵来自堆地址/URL/时间戳），改用 `OsRandom` 生成 32 字节并 hex；保留上游的 nonce 比对（`:714`）且 nonce 一次性；`Authorization` 缺失/畸形一律 401（上游 `:701-702` 在缺 `nonce="` 时是空指针算术 + 越界读）；口令比较常量时间、长度先校验；失败计数跨连接共享且有上限；认证状态按连接粘滞；**401 必须发生在解析 plist 之前**。
+  - **C. `ekey`/`eiv` 与流参数**：`ekey` 恰好 72 字节、`eiv` 恰好 16 字节，读前即验（上游 `:786`/`:798` 的 `memcpy` 不查来源长度）；复用 `fairplay.rs` 的 `Result` 且 `HandshakeRequired` fail-closed；`streams` ≤ 4、元素必须是 dict、`type` 仅接受 96/110；`timingPort` 必须 `1..=65535`（不复现上游的静默截断）；`eventPort` 只回接收端自己的值，绝不回显客户端提供的端口；响应中的端口必须是**实际绑定**的端口，未绑定则不声明该字段。
+  - **D. plist 攻击面**：深度与对象数上限已实现（[`MAX_PLIST_DEPTH`]＝32、`MAX_PLIST_OBJECTS`＝4096，见 `plist.rs`）；SETUP 必须走 `ControlSession::handle_with` 的 64 KiB 体上限，不得绕过；解析失败不得留下半初始化会话；重复键语义需文档化并有用例。
+- **安全评审的裁决记录**（2026-10-05，独立安全评审，本轮唯一一份）：
+  - 上游「第 3 步不校验第 2 步」的 Critical、以及无 PIN、长度不校验、注册谓词可绕过、全零共享密钥等偏离**全部成立**；本轮新增两项偏离：**一次连接只开一次 `/pair-verify` 密钥交换**（上游 `pairing.c:162-180` 只拒绝 FINISHED）、**每连接最多 `MAX_SETUP_PIN_ATTEMPTS` 个 SRP 上下文**（上游无界，每个 step 1 一次模幂）。
+  - **不采纳**「legacy `/pair-setup` 不得开启 `pair-verify`」：客户端就是先 `/pair-setup` 再 `/pair-verify`，禁掉会破坏 legacy 流程；改为在交付层强制 A1（未完成 verify 不交付材料），授权仍由 Digest 401 承担。
+  - **不成立**「`client_public_key` 一名两用（X25519/Ed25519）」：两处写入都是 Ed25519（step 3 的 PIN 证明密钥、M1 声明的密钥），X25519 在 `ecdh_client_public`。但 W5c 必须区分二者**信任级别**：M1 里声明的密钥未经验证，只有 step 3 的密钥经过了 PIN 证明。
+  - **接受为残余风险**：`num-bigint` 的模幂非常量时间（上游用 OpenSSL），以每连接 SRP 上限 + 连接上限 + 空闲超时缓解，本轮不更换 bignum；已做 `Drop` 尽力清零（身份种子、会话密钥、ECDH 共享秘密）。
+  - **W5c 硬性验收项**：密钥材料（PIN、会话密钥、`ecdh_secret`、混合后的 `aeskey`）**永不进日志/响应体/错误文本**——上游恰恰把这些打印出来（`raop_handlers.h:273`、`:803-812`、`:844-846`），本移植必须显式偏离。
+
 ### W6 DNS-SD 广告与访问控制
 
 - 目的：让服务可被发现（`_airplay._tcp`、`_raop._tcp`），并对 TXT 能力位与访问控制有明确实现。
@@ -153,6 +168,7 @@
 - 内容：`crates/airplay-core/tests/` 集成层；受控上游 C oracle harness（仅测试构建，不链接进产品）；`proptest` 或 `cargo-fuzz` 目标覆盖 wire/mirror/plist 解析；控制层多连接/乱序/重复请求场景（随机数与时间注入）。
 - 出口：oracle harness 可复现至少 SRP 与 PlayFair 的固定对照；fuzz 目标能跑满一轮无 panic。
 - 依赖：可与 W3–W6 并行，但 W5 之后应覆盖服务器路径。
+- 可行性更新（2026-10-05）：本机存在 `C:\msys64\ucrt64\bin\{gcc,clang,cmake,pkg-config}.exe`，上游 `CMakeLists.txt` 有 `if (WIN32)` 分支、`lib/` 的 POSIX 依赖很少，因此**C oracle 大概率可在本机构建**（待验证）。若成立，可一次结清：SRP `B` 最小编码的 255/256 分歧、PlayFair 差分、以及配对 CTR/GCM nonce 的上游对照——这些目前都只能靠"与独立实现一致"来支撑。plist 深度闸门（本轮新增）也应在此用 fuzz 覆盖。
 
 ### W8 S3 验收与文档
 

@@ -43,6 +43,12 @@
 //!   low-order point would let the peer derive the keystream without holding a
 //!   private key, and upstream's OpenSSL derive fails where the port has to
 //!   check for itself (`crypto.c:245-265`).
+//! * One connection starts one `/pair-verify` key exchange, and one connection
+//!   opens at most [`MAX_SETUP_PIN_ATTEMPTS`] SRP contexts. Upstream accepts a
+//!   repeat of either (`pairing.c:162-180` only refuses a finished session, and
+//!   nothing bounds the modular exponentiation of a setup step), but a repeat
+//!   either replaces the keys the connection already agreed on or spends work
+//!   for an unauthenticated peer.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -70,6 +76,18 @@ const GCM_TAG_SIZE: usize = 16;
 
 /// Random attempts to draw a PIN before the source is called broken.
 const MAX_PIN_ATTEMPTS: usize = 8;
+
+/// SRP contexts one connection may open.
+///
+/// Every `/pair-setup-pin` step 1 computes a fresh server public value, so an
+/// unauthenticated peer could otherwise spend a modular exponentiation per
+/// request for as long as it holds a connection slot. Upstream has no such
+/// bound; the port bounds the work per connection and relies on the connection
+/// limit and the idle deadline for the rest. The value is one above
+/// [`MAX_PIN_FAILURES`] so that the per-connection bound never hides the
+/// receiver-wide one: the last attempt that can still be counted as a wrong
+/// proof is always allowed to happen.
+const MAX_SETUP_PIN_ATTEMPTS: usize = MAX_PIN_FAILURES as usize + 1;
 
 /// Wrong proofs a receiver tolerates before it drops a one-time PIN.
 ///
@@ -311,6 +329,16 @@ impl fmt::Debug for PairingState {
     }
 }
 
+impl Drop for PairingState {
+    /// Overwrites the identity seed when the receiver goes away.
+    ///
+    /// Best effort by design: it clears the copy this value owns, not whatever a
+    /// crashing dump or a swapped-out page may still hold.
+    fn drop(&mut self) {
+        self.identity_seed.fill(0);
+    }
+}
+
 /// Four zero-padded decimal digits, `snprintf("%04u")` of the C code.
 fn digits(pin: u16) -> [u8; 4] {
     let pin = pin % 10_000;
@@ -447,6 +475,7 @@ pub(crate) struct PairingSession {
     ecdh_client_public: Option<[u8; X25519_KEY_SIZE]>,
     ecdh_shared: Option<[u8; X25519_KEY_SIZE]>,
     registration_refused: bool,
+    setup_pin_attempts: usize,
 }
 
 impl PairingSession {
@@ -462,6 +491,7 @@ impl PairingSession {
             ecdh_client_public: None,
             ecdh_shared: None,
             registration_refused: false,
+            setup_pin_attempts: 0,
         }
     }
 
@@ -516,6 +546,12 @@ impl PairingSession {
         if user.is_empty() || user.len() > MAX_USERNAME {
             return Err(PairingError::InvalidLength("pairing user name"));
         }
+        if self.setup_pin_attempts >= MAX_SETUP_PIN_ATTEMPTS {
+            // Each attempt costs this receiver a modular exponentiation, and
+            // nothing in the request is authenticated yet.
+            return Err(PairingError::AuthenticationFailed);
+        }
+        self.setup_pin_attempts += 1;
         let pin = self.shared.pin_for_setup()?;
         let mut salt = [0u8; APPLE_SRP_SALT_SIZE];
         self.shared.fill_random(&mut salt)?;
@@ -656,7 +692,15 @@ impl PairingSession {
             return Ok(PairingReply::Silence);
         }
         match body[0] {
-            1 => self.verify_handshake(body, register_check),
+            1 => {
+                if self.status != Status::Setup {
+                    // One key exchange per connection: a second one would quietly
+                    // replace the keys the first one agreed on, which is what the
+                    // connection's session material is derived from.
+                    return Ok(PairingReply::Silence);
+                }
+                self.verify_handshake(body, register_check)
+            }
             0 => self.verify_finish(body),
             _ => Ok(PairingReply::Silence),
         }
@@ -755,6 +799,22 @@ impl fmt::Debug for PairingSession {
     }
 }
 
+impl Drop for PairingSession {
+    /// Overwrites the secrets this connection agreed on.
+    ///
+    /// The same best-effort caveat as [`PairingState`] applies; the point is that
+    /// a closed connection does not leave its session key or shared secret in a
+    /// buffer that a later connection could reuse.
+    fn drop(&mut self) {
+        if let Some(key) = self.session_key.as_mut() {
+            key.fill(0);
+        }
+        if let Some(secret) = self.ecdh_shared.as_mut() {
+            secret.fill(0);
+        }
+    }
+}
+
 /// Fixed-size array from a slice of external input.
 fn array<const N: usize>(slice: &[u8], what: &'static str) -> Result<[u8; N], PairingError> {
     slice
@@ -825,6 +885,17 @@ mod tests {
 
     fn field(plist: &Plist, key: &'static str) -> Vec<u8> {
         plist.get_data(key).expect("data field").to_vec()
+    }
+
+    /// Body of the first `/pair-setup-pin` step for `username`.
+    fn step_one_request(username: &[u8]) -> Vec<u8> {
+        request(vec![
+            ("method", plist::Value::from("pin")),
+            (
+                "user",
+                plist::Value::from(String::from_utf8_lossy(username).into_owned()),
+            ),
+        ])
     }
 
     /// Runs steps 1 and 2 of `/pair-setup-pin` and returns the client exchange.
@@ -1360,6 +1431,43 @@ mod tests {
         let client = VerifyClient::new();
         let reply = session.verify(&client.handshake_body()).expect("handshake");
         assert_eq!(body_of(&reply).len(), 96);
+    }
+
+    #[test]
+    fn setup_pin_bounds_the_work_one_connection_can_cause() {
+        let shared = state(PinMode::Fixed(1234));
+        let mut session = PairingSession::new(Arc::clone(&shared));
+        let username = b"AA:BB:CC:DD:EE:FF";
+        for attempt in 0..MAX_SETUP_PIN_ATTEMPTS {
+            assert!(
+                session.setup_pin(&step_one_request(username)).is_ok(),
+                "attempt {attempt} opens an SRP context"
+            );
+        }
+        // Beyond the bound the receiver refuses instead of spending another
+        // modular exponentiation for an unauthenticated peer.
+        assert!(matches!(
+            session.setup_pin(&step_one_request(username)),
+            Err(PairingError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn pair_verify_starts_one_key_exchange_per_connection() {
+        let shared = state(PinMode::Fixed(1234));
+        let mut session = PairingSession::new(Arc::clone(&shared));
+        session.setup(&[0u8; 32]).expect("setup");
+        let client = VerifyClient::new();
+        let reply = session.verify(&client.handshake_body()).expect("handshake");
+        assert_eq!(body_of(&reply).len(), 96);
+
+        // A second key exchange would replace the keys this connection already
+        // agreed on, so it is refused.
+        assert!(matches!(
+            session.verify(&client.handshake_body()),
+            Ok(PairingReply::Silence)
+        ));
+        assert_eq!(session.status, Status::Handshake);
     }
 
     #[test]
