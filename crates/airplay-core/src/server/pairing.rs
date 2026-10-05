@@ -26,7 +26,9 @@
 //!   [`MAX_PIN_FAILURES`] wrong proofs drop it. Upstream clears the PIN on the
 //!   first step and regenerates it on every request (`raop_handlers.h:258-267`,
 //!   `:329-332`), so any peer can invalidate the PIN a user is reading and a
-//!   fixed PIN can be guessed without limit.
+//!   fixed PIN can be guessed without limit. The cost of consuming late is that
+//!   two peers who both know the PIN can each complete a pairing until the first
+//!   one succeeds; the failure bound keeps that window small.
 //! * A value whose length upstream does not check is validated before it is
 //!   used (`raop_handlers.h:366`, `:408-409`), and the steps whose missing state
 //!   upstream dereferences as a null pointer (`pairing.c:560`, `:603`) answer
