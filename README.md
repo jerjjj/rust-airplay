@@ -26,7 +26,7 @@ cargo run -p airplay-cli -- --name "Rust AirPlay Test" --port 47000
 dns-sd -B _raop._tcp local
 ```
 
-`--port 0` 会自动挑一个空闲端口，广告里用的是实际绑定端口。身份种子存放在 `%LOCALAPPDATA%\rust-airplay\identity.seed`，删除它等于换一个接收端身份，客户端需要重新配对。Windows 上若 `--port` 报 `os error 10013`，是 Hyper-V/WSL 保留了该端口段（`netsh int ipv4 show excludedportrange protocol=tcp` 可查），换一个端口即可。
+`--port 0` 会自动挑一个空闲端口，广告里用的是实际绑定端口。身份种子存放在 `%LOCALAPPDATA%\rust-airplay\identity.seed`，删除它等于换一个接收端身份，客户端需要重新配对；已验证过的客户端公钥记在 `%LOCALAPPDATA%\rust-airplay\clients`（每行一个，可手工清理以强制重新配对），两者都由 CLI 这一配置层持有——协议库本身不碰文件系统。Windows 上若 `--port` 报 `os error 10013`，是 Hyper-V/WSL 保留了该端口段（`netsh int ipv4 show excludedportrange protocol=tcp` 可查），换一个端口即可。
 
 所有里程碑以可审查 Git 提交交付；未通过实机测试的功能不会标注为“兼容完成”。当前尚未配置远程仓库，提交保存在本地。
 
