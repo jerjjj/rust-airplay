@@ -144,6 +144,8 @@
 - 目的：让服务可被发现（`_airplay._tcp`、`_raop._tcp`），并对 TXT 能力位与访问控制有明确实现。
 - 出口：本机 `dns-sd -B`/`avahi-browse` 可查询到实例；TXT 字段与上游 `dnssd.c` 对齐；访问控制（允许/拒绝、`Active-Remote`/`DACP-ID` 传递）有测试。
 - 依赖：W2。写作用域：`crates/airplay-core/src/discovery.rs`（新建）。
+- 契约约束（W5c/W6 必须一致，否则客户端会选错配对流程）：TXT 的 `pk` 必须等于 `PairingState::identity_public()`；`sf`/feature bit 27 必须与 `PinMode` 一致（配了 PIN 才声明现代配对可用）；`with_client_registered` 必须接到真实注册表（上游 `uxplay.cpp` 的 `registered_keys`/`-reg`），不能只留谓词。
+- 选型旁证（2026-10-05 上游核对）：上游给系统 Bonjour/Avahi 路径新增的 API 自述「必须由应用 service 其 socket，否则 daemon 侧队列无界增长」，且 Windows 需要哑回调才能链接；`mdns-sd` 不需要 fd 服务、不依赖系统 daemon、无平台回调泄漏 —— 这**支持** [ADR-0001](ADR-0001-network-stack.md) 的既有选择，W6 仍须在本机（含 Windows）记录 `mdns-sd` 的真实可用性。
 
 ### W7 测试基建：集成层、上游差分 oracle、fuzz
 
@@ -205,6 +207,7 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 | 2026-09-20 | W3 | `833d8c4` | `control.rs` 无状态路由 + 有状态会话：`ControlOutcome`、`X-Apple-Session-ID` 绑定、可选 `CSeq`、协议回显、`Audio-Latency`、`Connection: close`、431/400 映射；`tests/control_spec.rs` 改 15 个正向断言；58 单元 + 15 + 5 集成 |
 | 2026-09-20 | W5a | `322e01b` | `server/` 三层 + `RouteHandler` 委派 + `request_length`；`/info`、`/feedback`、`/fp-setup`；`tests/server_spec.rs` 9 个真实 socket 用例（含修掉「缓冲区已有完整请求仍阻塞 read」的缺陷）；67 单元 + 15 + 5 + 9 集成 |
 | 2026-09-20 | W5b | `7466e03` `53d9362` | 配对路由 `/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify`（`server/pairing.rs`）；修掉 `/pair-verify` 第二步 CTR 偏移、补 GCM 加密原语与 `AppleSrpServer::server_public()`、`RouteReply::closing`；拒绝上游「跳过 proof 校验即可完成配对的」Critical 缺陷；83 单元 + 15 + 5 + 15 集成 |
-| 2026-10-05 | 阶段性验收 | `f55e633` `5dad9a4` 本次提交 | 上游核对到 `3dbf7cee`（§0）＋空闲超时对齐 60 s（§7 性能基线）；评审团（架构/安全/验收）发现并修掉：`check_register` 谓词可被重发 `/pair-verify` 绕过（阻断，端到端复现）、缺上游三个头部上限（21 字段/65 字节字段名/1025 字节值应 431）、`Transfer-Encoding` 被忽略导致分帧错位、超长 protocol/version 被接受并回显、重复与带符号 `Content-Length` 被接受、`max_connections` 超上限时 `Server::bind` panic；**本次提交**含这些修复与 89 单元 + 15 + 5 + 18 集成（另 1 个默认忽略的性能测量用例） |
+| 2026-10-05 | 阶段性验收 | `f55e633` `5dad9a4` `a07da76` 本次提交 | 上游核对到 `3dbf7cee`（§0）＋空闲超时对齐 60 s（§7 性能基线）；评审团**架构与验收两个角色产出、安全角色本轮被中止无产出（覆盖缺口见下）**，发现并修掉：`check_register` 谓词可被重发 `/pair-verify` 绕过（阻断，端到端复现）、缺上游三个头部上限（21 字段/65 字节字段名/1025 字节值应 431）、`Transfer-Encoding` 被忽略导致分帧错位、超长 protocol/version 被接受并回显、重复与带符号 `Content-Length` 被接受、`max_connections` 超上限时 `Server::bind` panic；89 单元 + 15 + 5 + 18 集成（另 1 个默认忽略的性能测量用例） |
+| 2026-10-05 | 本轮覆盖缺口 | — | 安全角色（应用安全工程师）的验收分析未产出。它被交接的四项由主理人自行裁决并记入文档：注册拒绝改为粘滞（fail-closed）、分帧类偏离一律 fail-closed、`x25519_shared` 全零拒绝、W6 不复制系统 Bonjour 路径。**待办**：若要在 W5c（Digest 401、会话密钥接入）开工前补齐独立安全视角，需要重新召集该角色 |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。

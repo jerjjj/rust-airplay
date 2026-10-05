@@ -23,8 +23,10 @@
 //!   Upstream added the same limit later than the port started
 //!   (`timeout_limit = 60` at `upstream/UxPlay@3dbf7cee:lib/httpd.c:377`), but
 //!   enforces it only once the socket becomes readable again, so a client that
-//!   goes quiet keeps its slot. The port uses the same 60 seconds as a hard
-//!   deadline instead, which is the stronger reading of the same intent.
+//!   goes quiet keeps its slot, and it removes the connection without leaving
+//!   the loop, which leaks one request object per timeout. The port uses the same
+//!   60 seconds as a hard deadline instead, the stronger reading of the same
+//!   intent, and the connection task simply returns.
 //! * A request the service cannot frame is answered once
 //!   ([`crate::control::ControlError::to_response`]) and the connection is
 //!   closed, because the bytes after a rejected request cannot be trusted.
