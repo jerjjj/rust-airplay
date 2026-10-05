@@ -6,8 +6,9 @@
 //! see `docs/ADR-0002-pairing-identity.md`), picks the port, and drives
 //! discovery so a client can find the receiver.
 
+use std::collections::HashSet;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use airplay_core::crypto::sha512_concat;
@@ -89,7 +90,23 @@ async fn run() -> Result<(), String> {
         .clone()
         .unwrap_or_else(|| derived_device_id(&seed));
 
-    let mut state = PairingState::new(seed, options.pin);
+    // The registry lives here, not in the library: a receiver decides for itself
+    // how it remembers clients (`docs/ADR-0002-pairing-identity.md`). A client a
+    // previous run verified may start `/pair-verify` on a fresh connection; one
+    // that never completed a session is not known yet, which is the honest limit
+    // of remembering keys only once a session carries them.
+    let clients_path = clients_path()?;
+    let known = Arc::new(Mutex::new(load_clients(&clients_path)));
+    println!(
+        "clients   {} remembered, {}",
+        known.lock().expect("lock").len(),
+        clients_path.display()
+    );
+
+    let mut state = PairingState::new(seed, options.pin).with_client_registered({
+        let known = Arc::clone(&known);
+        move |key| known.lock().expect("lock").contains(key)
+    });
     if let Some(password) = options.password.as_deref() {
         state = state.with_password(password);
     }
@@ -164,6 +181,23 @@ async fn run() -> Result<(), String> {
         .run(move || {
             let mut handlers =
                 RouteHandlers::with_pairing(identity.clone(), Arc::clone(&handlers_state));
+            // A session that carries a verified client key is a client worth
+            // remembering, so the next run can answer for it.
+            {
+                let known = Arc::clone(&known);
+                let clients_path = clients_path.clone();
+                handlers.set_setup_callback(move |request| {
+                    let Some(client) = request.client_identity else {
+                        return;
+                    };
+                    if known.lock().expect("lock").insert(client) {
+                        println!("*** client {} is now remembered ***", hex(&client));
+                        if let Err(error) = record_client(&clients_path, &client) {
+                            eprintln!("rust-airplay: cannot record the client: {error}");
+                        }
+                    }
+                });
+            }
             // A trace names what a client asked and what it got, which is what
             // makes a device session readable; it never carries a body or key.
             handlers.set_trace_callback(|trace| {
@@ -311,6 +345,84 @@ fn derived_device_id(seed: &[u8; 32]) -> String {
         .join(":")
 }
 
+/// Path of the client registry.
+fn clients_path() -> Result<std::path::PathBuf, String> {
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "neither LOCALAPPDATA nor HOME is set".to_owned())?;
+    Ok(std::path::Path::new(&base)
+        .join("rust-airplay")
+        .join("clients"))
+}
+
+/// Reads the remembered client keys, one 64 character hex key per line.
+///
+/// A line that is not a key is skipped rather than failing the receiver: a file
+/// somebody edited by hand must not stop a receiver from starting.
+fn load_clients(path: &std::path::Path) -> HashSet<[u8; 32]> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    text.lines()
+        .filter_map(|line| parse_seed(line).ok())
+        .collect()
+}
+
+/// Appends a client key, creating the file if it is the first one.
+fn record_client(path: &std::path::Path, client: &[u8; 32]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    writeln!(file, "{}", hex(client))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rust-airplay-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn a_recorded_client_is_remembered() {
+        let path = temporary_path("registry");
+        let _ = std::fs::remove_file(&path);
+        let client = [0x2a; 32];
+        assert!(load_clients(&path).is_empty(), "nothing is known at first");
+        record_client(&path, &client).expect("record");
+        let known = load_clients(&path);
+        assert!(known.contains(&client));
+        assert_eq!(known.len(), 1);
+        // Recording the same client again does not fail, and does not duplicate.
+        record_client(&path, &client).expect("record again");
+        assert_eq!(load_clients(&path).len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_key_is_skipped() {
+        let path = temporary_path("registry-edited");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            format!("# a comment\n{}\nnot a key\n", "ab".repeat(32)),
+        )
+        .expect("write");
+        let known = load_clients(&path);
+        assert_eq!(known.len(), 1, "the hand-edited lines are ignored");
+        let _ = std::fs::remove_file(&path);
+    }
 }
