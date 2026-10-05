@@ -7,13 +7,16 @@
 //! control layer alone.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use airplay_core::plist::Plist;
+use airplay_core::fairplay::FairPlaySession;
+use airplay_core::plist::{self, Plist};
 use airplay_core::server::{DeviceIdentity, RouteHandlers, Server, ServerConfig};
-use airplay_core::server::{PairingState, PinMode, RandomError, RandomSource};
+use airplay_core::server::{
+    PairingState, PinMode, RandomError, RandomSource, SessionAuth, SetupPorts, SetupStream,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -426,6 +429,142 @@ async fn serves_no_more_than_the_configured_number_of_connections() {
         .await
         .expect("response once a slot is free");
     assert!(String::from_utf8_lossy(&response).starts_with("RTSP/1.0 200 OK\r\n"));
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn setup_derives_the_audio_key_and_answers_the_configured_ports() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let ports = SetupPorts {
+        timing_port: Some(7011),
+        event_port: Some(0),
+        data_port: Some(6000),
+        control_port: Some(6001),
+        mirror_data_port: Some(7100),
+    };
+    let server = TestServer::start_with(local_config(), {
+        let seen = Arc::clone(&seen);
+        move || {
+            let mut handlers = RouteHandlers::new(identity());
+            handlers.set_setup_ports(ports);
+            let seen = Arc::clone(&seen);
+            handlers.set_setup_callback(move |request| seen.lock().expect("lock").push(request));
+            handlers
+        }
+    })
+    .await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    // The key the receiver unwraps comes from its own FairPlay session, so the
+    // test establishes one over the socket and fingerprints it with a second,
+    // independent session fed the same messages.
+    let mut challenge = [0u8; 16];
+    challenge[4] = 0x03;
+    let mut handshake = [0u8; 164];
+    handshake[4] = 0x03;
+    for request in [&challenge[..], &handshake[..]] {
+        client
+            .write_all(&request_with_body("POST /fp-setup", "", request))
+            .await
+            .expect("write");
+        read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("fairplay response");
+    }
+    let mut reference = FairPlaySession::new();
+    reference.setup(&challenge).expect("reference setup");
+    reference
+        .handshake(&handshake)
+        .expect("reference handshake");
+    let ekey = vec![0x11u8; 72];
+    let expected_key = reference.decrypt(&ekey).expect("reference decrypt");
+
+    let body = binary_plist(vec![
+        ("ekey", plist::Value::Data(ekey)),
+        ("eiv", plist::Value::Data(vec![0x22; 16])),
+        (
+            "streams",
+            plist::Value::Array(vec![plist::dictionary([
+                ("type", plist::Value::from(96u64)),
+                ("controlPort", plist::Value::from(6000u64)),
+            ])]),
+        ),
+    ]);
+    client
+        .write_all(&request_with_body(
+            "SETUP /stream",
+            "Content-Type: application/x-apple-binary-plist\r\n",
+            &body,
+        ))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("setup response");
+    assert!(
+        response.starts_with(b"RTSP/1.0 200 OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let (head, body) = response_parts(&response);
+    assert_eq!(
+        header_value(head, "Content-Type"),
+        Some("application/x-apple-binary-plist")
+    );
+    let answer = Plist::parse(body).expect("binary plist");
+    assert_eq!(answer.get_unsigned("timingPort").expect("timingPort"), 7011);
+    assert_eq!(answer.get_unsigned("eventPort").expect("eventPort"), 0);
+    let streams = answer.get_array("streams").expect("streams");
+    assert_eq!(streams.len(), 1);
+    let stream = streams[0].as_dictionary().expect("stream");
+    assert_eq!(stream.get("type").unwrap().as_unsigned_integer(), Some(96));
+    assert_eq!(
+        stream.get("dataPort").unwrap().as_unsigned_integer(),
+        Some(6000)
+    );
+    assert_eq!(
+        stream.get("controlPort").unwrap().as_unsigned_integer(),
+        Some(6001)
+    );
+
+    // The session layer saw the unwrapped key, the IV, the requested stream and
+    // the level of pairing this connection reached (none here).
+    {
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].audio_key, Some(expected_key));
+        assert_eq!(seen[0].audio_iv, Some([0x22; 16]));
+        assert_eq!(seen[0].authentication, SessionAuth::None);
+        assert_eq!(
+            seen[0].streams,
+            vec![SetupStream {
+                kind: 96,
+                stream_connection_id: None
+            }]
+        );
+    }
+
+    // A key of the wrong length is refused instead of answered with a session
+    // nobody can use, and a request without a property list is refused too.
+    let short_key = binary_plist(vec![
+        ("ekey", plist::Value::Data(vec![0u8; 71])),
+        ("eiv", plist::Value::Data(vec![0u8; 16])),
+    ]);
+    for request in [
+        request_with_body("SETUP /stream", "", &short_key),
+        request_with_body("SETUP /stream", "", b"not a plist"),
+    ] {
+        client.write_all(&request).await.expect("write");
+        let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("rejection");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("RTSP/1.0 400 Bad Request\r\n"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
     server.shutdown();
 }
 

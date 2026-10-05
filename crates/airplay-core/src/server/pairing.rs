@@ -444,11 +444,8 @@ pub(crate) enum PairingReply {
 /// proves that the peer holds the keys it presented, so a caller that needs an
 /// access decision asks its own registry (see
 /// [`PairingState::with_client_registered`]) or the password gate of `SETUP`.
-// The SETUP handler is the only production consumer and lands in the next step
-// of W5c; this allow goes away with it (the tests already exercise both items).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionAuth {
+pub enum SessionAuth {
     /// The connection authenticated nothing.
     None,
     /// `/pair-setup` completed; that flow authenticates neither side
@@ -465,7 +462,6 @@ pub(crate) enum SessionAuth {
 /// A media session derives its stream keys from these values, so they are only
 /// produced for a connection that completed the exchange, and only once
 /// ([`PairingSession::take_session_keys`]).
-#[allow(dead_code)]
 pub(crate) struct SessionKeys {
     /// X25519 shared secret of the connection's key exchange.
     pub(crate) ecdh_secret: [u8; X25519_KEY_SIZE],
@@ -547,7 +543,6 @@ impl PairingSession {
     }
 
     /// What this connection established, for a caller that has to branch on it.
-    #[allow(dead_code)]
     pub(crate) fn authentication(&self) -> SessionAuth {
         if self.status == Status::Finished {
             return SessionAuth::Verified;
@@ -569,7 +564,6 @@ impl PairingSession {
     /// that started a handshake, which this port deliberately narrows). A caller
     /// that gets `None` has no verified session on this connection and must not
     /// derive stream keys.
-    #[allow(dead_code)]
     pub(crate) fn take_session_keys(&mut self) -> Option<SessionKeys> {
         if self.status != Status::Finished {
             return None;

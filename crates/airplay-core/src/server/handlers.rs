@@ -10,10 +10,75 @@
 use std::sync::Arc;
 
 use crate::control::{Route, RouteHandler, RouteReply, RouteRequest};
+use crate::crypto::sha512_concat;
 use crate::fairplay::{FairPlaySession, HANDSHAKE_REQUEST_LEN, SETUP_REQUEST_LEN};
 use crate::plist::{self, Plist};
 
-use super::pairing::{PairingError, PairingReply, PairingSession, PairingState};
+use super::pairing::{PairingError, PairingReply, PairingSession, PairingState, SessionAuth};
+
+/// Streams one `SETUP` request may ask for.
+///
+/// A real client asks for one audio stream and, while mirroring, one more; the
+/// bound keeps a request from making this receiver build an unbounded answer.
+const MAX_SETUP_STREAMS: usize = 4;
+
+/// Ports a `SETUP` response may advertise.
+///
+/// Upstream answers the ports it has bound by the time the request arrives
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:908`, `:935-936`, `:958`,
+/// `:985`). This port has no media or timing sockets yet, and a field it cannot
+/// honour is left out instead of being filled with a placeholder, so a client
+/// never believes it may send media somewhere nothing listens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetupPorts {
+    /// Port of the timing service, sent as `timingPort`.
+    pub timing_port: Option<u16>,
+    /// Port of the event channel, sent as `eventPort` (upstream sends `0`,
+    /// because neither audio nor mirror mode uses it).
+    pub event_port: Option<u16>,
+    /// Audio data port, sent in the `type: 96` stream entry.
+    pub data_port: Option<u16>,
+    /// Audio control port, sent in the `type: 96` stream entry.
+    pub control_port: Option<u16>,
+    /// Mirror data port, sent in the `type: 110` stream entry.
+    pub mirror_data_port: Option<u16>,
+}
+
+/// One stream a client asked for in `SETUP`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupStream {
+    /// Stream type: `96` is audio, `110` is mirroring
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:954-983`).
+    pub kind: u16,
+    /// `streamConnectionID`, which the mirror stream uses to derive its own
+    /// AES-CTR key (`raop_handlers.h:959-963`).
+    pub stream_connection_id: Option<u64>,
+}
+
+/// What one accepted `SETUP` request hands to the session layer.
+///
+/// The audio key is the FairPlay-decrypted `ekey`, hashed with the connection's
+/// verified pairing secret when there is one
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:848-854`). Nothing is derived
+/// from an unverified exchange: the session material of a connection is produced
+/// only after it finished `/pair-verify`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupRequest {
+    /// Audio key, present when the request carried `ekey` and `eiv`.
+    pub audio_key: Option<[u8; 16]>,
+    /// Audio IV, present together with [`SetupRequest::audio_key`].
+    pub audio_iv: Option<[u8; 16]>,
+    /// Streams the client asked for, in request order.
+    pub streams: Vec<SetupStream>,
+    /// Client key of the verified pairing exchange, when this connection had one.
+    pub client_identity: Option<[u8; 32]>,
+    /// How far the pairing exchange of this connection got.
+    ///
+    /// A session layer that needs an access decision reads this instead of
+    /// guessing from the presence of a key: `Verified` proves the peer holds its
+    /// private key, nothing more.
+    pub authentication: SessionAuth,
+}
 
 /// Model upstream advertises when the user does not override it
 /// (`upstream/UxPlay/lib/global.h:21`).
@@ -174,6 +239,8 @@ pub struct RouteHandlers {
     fairplay: FairPlaySession,
     feedback: Option<Box<dyn FnMut() + Send>>,
     pairing: Option<PairingSession>,
+    setup_ports: SetupPorts,
+    setup: Option<Box<dyn FnMut(SetupRequest) + Send>>,
 }
 
 impl RouteHandlers {
@@ -188,6 +255,8 @@ impl RouteHandlers {
             fairplay: FairPlaySession::new(),
             feedback: None,
             pairing: None,
+            setup_ports: SetupPorts::default(),
+            setup: None,
         }
     }
 
@@ -202,11 +271,24 @@ impl RouteHandlers {
         let mut identity = identity;
         identity.public_key = state.identity_public().to_vec();
         Self {
-            identity,
-            fairplay: FairPlaySession::new(),
-            feedback: None,
             pairing: Some(PairingSession::new(state)),
+            ..Self::new(identity)
         }
+    }
+
+    /// Sets the ports a `SETUP` response may advertise.
+    pub fn set_setup_ports(&mut self, ports: SetupPorts) {
+        self.setup_ports = ports;
+    }
+
+    /// Sets the callback that receives what a `SETUP` request established.
+    ///
+    /// Upstream passes the same values straight into its media sessions
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:926-929`); a receiver
+    /// without those sessions uses the callback to keep the key for whatever
+    /// plays the stream.
+    pub fn set_setup_callback(&mut self, callback: impl FnMut(SetupRequest) + Send + 'static) {
+        self.setup = Some(Box::new(callback));
     }
 
     /// The identity these handlers advertise.
@@ -241,6 +323,7 @@ impl RouteHandler for RouteHandlers {
                 let body = request.body;
                 Some(self.pairing_reply(|session| session.verify(body)))
             }
+            Route::Setup => Some(self.setup(request)),
             _ => None,
         }
     }
@@ -290,6 +373,152 @@ impl RouteHandlers {
 }
 
 impl RouteHandlers {
+    /// Port of `raop_handler_setup`
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:600-1067`).
+    ///
+    /// This step covers what an AirPlay 1 client sends: the encrypted audio key
+    /// with its IV, and the streams it wants. Later steps add the digest
+    /// password branch (`:650-748`) and the media and timing sessions the
+    /// handler starts (`:910-929`); a receiver without them answers the ports it
+    /// actually has.
+    fn setup(&mut self, request: &RouteRequest<'_>) -> RouteReply {
+        // Upstream reads the body with `plist_from_bin` and carries on with an
+        // empty request when that fails (`:601-644`); a malformed body is
+        // refused here instead, because the alternative is a `200 OK` that
+        // describes a session nobody can use.
+        if !request.body.starts_with(b"bplist00") {
+            return RouteReply::new(400, "Bad Request");
+        }
+        let Ok(body) = Plist::parse(request.body) else {
+            return RouteReply::new(400, "Bad Request");
+        };
+
+        // `raop_handlers.h:785-798`: both keys are read as fixed-size buffers
+        // there, without looking at the length the client sent.
+        let audio_iv = match body.get_data("eiv").ok() {
+            Some(iv) => match <[u8; 16]>::try_from(iv) {
+                Ok(iv) => Some(iv),
+                Err(_) => return RouteReply::new(400, "Bad Request"),
+            },
+            None => None,
+        };
+        let encrypted = body.get_data("ekey").ok();
+        let mut client_identity = None;
+        let (audio_key, audio_iv) = match (encrypted, audio_iv) {
+            // A mirror-only setup carries neither, `raop_handlers.h:633`.
+            (None, None) => (None, None),
+            (Some(encrypted), Some(iv)) => {
+                if encrypted.len() != 72 {
+                    return RouteReply::new(400, "Bad Request");
+                }
+                let mut key = match self.fairplay.decrypt(encrypted) {
+                    Ok(key) => key,
+                    // Upstream logs the failure and keeps going with whatever the
+                    // buffer held (`:807-813`).
+                    Err(_) => return RouteReply::new(400, "Bad Request"),
+                };
+                if let Some(session) = self.pairing.as_mut() {
+                    if let Some(keys) = session.take_session_keys() {
+                        // `raop_handlers.h:848-854`: the key is hashed with the
+                        // shared secret of a pairing session, which this port
+                        // only produces for a connection that verified the
+                        // client (`pairing.c:108-119` is what it narrows).
+                        let digest = sha512_concat(&[&key, &keys.ecdh_secret]);
+                        key.copy_from_slice(&digest[..16]);
+                        client_identity = keys.client_identity;
+                    }
+                }
+                (Some(key), Some(iv))
+            }
+            // Half a key pair is a request that cannot be answered.
+            _ => return RouteReply::new(400, "Bad Request"),
+        };
+
+        // `raop_handlers.h:942-1060`: every requested stream is answered with
+        // the port the receiver listens on, in request order.
+        let mut streams = Vec::new();
+        if let Ok(requested) = body.get_array("streams") {
+            if requested.len() > MAX_SETUP_STREAMS {
+                return RouteReply::new(400, "Bad Request");
+            }
+            for stream in requested {
+                let Some(stream) = stream.as_dictionary() else {
+                    return RouteReply::new(400, "Bad Request");
+                };
+                let Some(kind) = stream
+                    .get("type")
+                    .and_then(plist::Value::as_unsigned_integer)
+                    .and_then(|kind| u16::try_from(kind).ok())
+                else {
+                    return RouteReply::new(400, "Bad Request");
+                };
+                let connection_id = stream
+                    .get("streamConnectionID")
+                    .and_then(plist::Value::as_unsigned_integer);
+                // Upstream's `switch` has no default arm: an unknown type is
+                // simply not answered (`:954-1050`).
+                if !matches!(kind, 96 | 110) {
+                    continue;
+                }
+                streams.push(SetupStream {
+                    kind,
+                    stream_connection_id: connection_id,
+                });
+            }
+        }
+
+        let mut dictionary = plist::Dictionary::new();
+        if let Some(port) = self.setup_ports.timing_port {
+            dictionary.insert("timingPort".to_owned(), u64::from(port).into());
+        }
+        if let Some(port) = self.setup_ports.event_port {
+            dictionary.insert("eventPort".to_owned(), u64::from(port).into());
+        }
+        if !streams.is_empty() {
+            let answer = streams
+                .iter()
+                .map(|stream| {
+                    let mut entry = plist::Dictionary::new();
+                    let port = match stream.kind {
+                        110 => self.setup_ports.mirror_data_port,
+                        _ => self.setup_ports.data_port,
+                    };
+                    if let Some(port) = port {
+                        entry.insert("dataPort".to_owned(), u64::from(port).into());
+                    }
+                    if stream.kind == 96 {
+                        if let Some(port) = self.setup_ports.control_port {
+                            entry.insert("controlPort".to_owned(), u64::from(port).into());
+                        }
+                    }
+                    entry.insert("type".to_owned(), u64::from(stream.kind).into());
+                    plist::Value::Dictionary(entry)
+                })
+                .collect();
+            dictionary.insert("streams".to_owned(), plist::Value::Array(answer));
+        }
+        let authentication = self
+            .pairing
+            .as_ref()
+            .map(|session| session.authentication())
+            .unwrap_or(SessionAuth::None);
+        self.report_setup(SetupRequest {
+            audio_key,
+            audio_iv,
+            streams,
+            client_identity,
+            authentication,
+        });
+        binary_plist(plist::Value::Dictionary(dictionary))
+    }
+
+    /// Reports an accepted `SETUP` to the callback of this connection.
+    fn report_setup(&mut self, request: SetupRequest) {
+        if let Some(callback) = self.setup.as_mut() {
+            callback(request);
+        }
+    }
+
     /// Port of `raop_handler_feedback`
     /// (`upstream/UxPlay/lib/raop_handlers.h:1204-1213`).
     fn feedback_reply(&mut self) -> RouteReply {

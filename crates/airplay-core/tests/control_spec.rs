@@ -134,13 +134,14 @@ fn route_table_matches_upstream() {
         ("GET", "/info", "RTSP/1.0", NotImplemented(Route::Info)),
         ("GET", "/info?x=1", "RTSP/1.0", NotImplemented(Route::Info)),
         ("GET", "/other", "RTSP/1.0", Unhandled),
-        // RTSP/1.0 method-only handlers (raop.c:427-441).
+        // RTSP/1.0 method-only handlers (raop.c:427-441). SETUP carries the
+        // session's key material, so the control layer hands it to a handler.
         ("OPTIONS", "*", "RTSP/1.0", Ported(Route::Options)),
         (
             "SETUP",
             "rtsp://host/stream",
             "RTSP/1.0",
-            Ported(Route::Setup),
+            NotImplemented(Route::Setup),
         ),
         (
             "GET_PARAMETER",
@@ -308,8 +309,9 @@ fn options_response_pins_public_and_upstream_headers() {
 #[test]
 fn record_response_uses_the_analog_jack_status_and_reports_latency() {
     let mut session = ControlSession::new();
-    // No ANNOUNCE: upstream has no route for it, so SETUP must work on a fresh
-    // connection.
+    // No ANNOUNCE: upstream has no route for it, so SETUP may follow on a fresh
+    // connection. This session has no handler, and the server tests cover the
+    // route itself.
     respond(
         &mut session,
         &with_body("SETUP", "/stream", "RTSP/1.0", 2, b"tp"),
@@ -331,9 +333,8 @@ fn record_response_uses_the_analog_jack_status_and_reports_latency() {
             .iter()
             .any(|(_, value)| value == AUDIO_JACK_STATUS)
     );
-    assert_eq!(session.state(), ControlState::Recording);
+    assert_eq!(session.state(), ControlState::New);
 }
-
 #[test]
 fn options_and_setup_are_never_rejected_by_state() {
     let mut session = ControlSession::new();
@@ -347,9 +348,13 @@ fn options_and_setup_are_never_rejected_by_state() {
         ("OPTIONS", "*", 5),
     ] {
         let response = respond(&mut session, &request(method, target, "RTSP/1.0", cseq, ""));
-        assert_eq!(response.status, 200, "{method} #{cseq}");
+        // SETUP is served by a handler, and this session has none, so its answer
+        // is `501` rather than a rejection by state; the server tests cover the
+        // route itself.
+        let expected = if method == "SETUP" { 501 } else { 200 };
+        assert_eq!(response.status, expected, "{method} #{cseq}");
     }
-    assert_eq!(session.state(), ControlState::Setup);
+    assert_eq!(session.state(), ControlState::New);
 }
 
 #[test]

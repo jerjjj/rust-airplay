@@ -161,17 +161,14 @@ impl Route {
     ///
     /// An unported route answers `501 Not Implemented` rather than the upstream
     /// handler's `200 OK`, so an unimplemented handler can never be mistaken for
-    /// success. `SETUP`, `RECORD`, `FLUSH` and `TEARDOWN` are ported as the RTSP
-    /// envelope only; their plist and media handling lands with W5.
+    /// success. `RECORD`, `FLUSH` and `TEARDOWN` are ported as the RTSP envelope
+    /// only; their media handling lands with S4. `SETUP` is served by a
+    /// [`RouteHandler`] because it carries the session's key material and stream
+    /// requests, and a control layer without one answers `501` for it.
     pub fn is_ported(self) -> bool {
         matches!(
             self,
-            Self::Options
-                | Self::Setup
-                | Self::Record
-                | Self::Flush
-                | Self::Teardown
-                | Self::Announce
+            Self::Options | Self::Record | Self::Flush | Self::Teardown | Self::Announce
         )
     }
 }
@@ -793,10 +790,18 @@ impl ControlSession {
                 ported_reply(route, self.audio_delay_micros)
             }
             // Upstream serves the route; a handler that has not implemented it
-            // answers 501 rather than pretending to succeed.
-            Dispatch::NotImplemented(route) => handler
-                .handle(route, &RouteRequest { head: &head, body })
-                .unwrap_or_else(RouteReply::not_implemented),
+            // answers 501 rather than pretending to succeed. A handler that does
+            // serve it also gives the route its lifecycle meaning, which is why
+            // the state is observed here and not for a 501.
+            Dispatch::NotImplemented(route) => {
+                match handler.handle(route, &RouteRequest { head: &head, body }) {
+                    Some(reply) => {
+                        self.observe(route);
+                        reply
+                    }
+                    None => RouteReply::not_implemented(),
+                }
+            }
             Dispatch::UnknownRtspMethod => RouteReply::not_implemented(),
             Dispatch::Unhandled => RouteReply::ok(),
         };
@@ -943,6 +948,23 @@ mod tests {
         }
     }
 
+    /// Handler that serves `SETUP`, the one route the control layer delegates.
+    struct SetupHandler;
+
+    impl RouteHandler for SetupHandler {
+        fn handle(&mut self, route: Route, _request: &RouteRequest<'_>) -> Option<RouteReply> {
+            matches!(route, Route::Setup).then(RouteReply::ok)
+        }
+    }
+
+    #[track_caller]
+    fn setup_with_handler(session: &mut ControlSession, input: &[u8]) -> ControlResponse {
+        match session.handle_with(input, &mut SetupHandler).unwrap() {
+            ControlOutcome::Respond(response) => response,
+            ControlOutcome::Ignored => panic!("expected a response, got Ignored"),
+        }
+    }
+
     #[track_caller]
     fn assert_header(response: &ControlResponse, name: &str, value: &str) {
         assert_eq!(
@@ -963,8 +985,9 @@ mod tests {
         assert_header(&options, "Audio-Jack-Status", AUDIO_JACK_STATUS);
 
         // SETUP works on a fresh connection: no ANNOUNCE is required, because
-        // upstream has no ANNOUNCE route at all.
-        let setup = respond(
+        // upstream has no ANNOUNCE route at all. The control layer hands this
+        // route to a handler, so the session below needs one that serves it.
+        let setup = setup_with_handler(
             &mut session,
             &request("SETUP", "/stream", Some(2), "", b"plist"),
         );
@@ -986,7 +1009,7 @@ mod tests {
         // FLUSH and a repeated SETUP keep the recording state.
         respond(&mut session, &request("FLUSH", "/stream", Some(5), "", &[]));
         assert_eq!(session.state(), ControlState::Recording);
-        respond(
+        setup_with_handler(
             &mut session,
             &request("SETUP", "/stream", Some(6), "", b"plist"),
         );
