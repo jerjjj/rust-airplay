@@ -138,12 +138,49 @@ pub fn aes128_gcm16_decrypt(
     Ok(plaintext)
 }
 
+/// Encrypts one AES-128-GCM-16 record with an empty associated-data field.
+///
+/// The counterpart of [`aes128_gcm16_decrypt`], needed for the reply of the
+/// Apple pairing setup (`upstream/UxPlay/lib/pairing.c:632-638`): a key or IV
+/// of any length other than 16 bytes is rejected with
+/// [`CryptoError::InvalidLength`]. Returns the ciphertext and its tag.
+pub fn aes128_gcm16_encrypt(
+    key: &[u8],
+    iv: &[u8],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
+    let key = aes_gcm::Key::<Aes128Gcm16>::from_exact_iter(key.iter().copied())
+        .ok_or(CryptoError::InvalidLength("AES-128 key"))?;
+    let nonce = Nonce::<cipher::consts::U16>::from_exact_iter(iv.iter().copied())
+        .ok_or(CryptoError::InvalidLength("AES-GCM IV"))?;
+    let cipher = Aes128Gcm16::new(&key);
+    let mut ciphertext = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(&nonce, b"", &mut ciphertext)
+        .map_err(|_| CryptoError::InvalidLength("AES-GCM plaintext"))?;
+    let mut tag_bytes = [0u8; 16];
+    tag_bytes.copy_from_slice(&tag);
+    Ok((ciphertext, tag_bytes))
+}
+
 pub fn x25519_public(private_key: &[u8; 32]) -> [u8; 32] {
     x25519(*private_key, X25519_BASEPOINT_BYTES)
 }
 
 pub fn x25519_shared(private_key: &[u8; 32], peer_public: &[u8; 32]) -> [u8; 32] {
     x25519(*private_key, *peer_public)
+}
+
+/// Ed25519 public key of a 32-byte private seed.
+///
+/// A receiver advertises the public key of its long-term pairing identity
+/// (`upstream/UxPlay/lib/raop.c:669-674`), so the seed alone is enough to
+/// describe the identity a caller injects.
+pub fn ed25519_public_key(private_key: &[u8; 32]) -> [u8; 32] {
+    use ed25519_dalek::SigningKey;
+    SigningKey::from_bytes(private_key)
+        .verifying_key()
+        .to_bytes()
 }
 
 pub fn ed25519_sign(private_key: &[u8; 32], message: &[u8]) -> [u8; 64] {

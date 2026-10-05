@@ -12,6 +12,8 @@ The plist layer (`crates/airplay-core/src/plist.rs`) depends on the [`plist`](ht
 
 The network control service (`crates/airplay-core/src/server/`) depends on [`tokio`](https://crates.io/crates/tokio) 1.53.1 (MIT) with the `rt-multi-thread`, `net`, `time`, `sync`, `io-util` and `macros` features, the async runtime `Cargo.lock` pins together with `bytes`, `mio`, `pin-project-lite`, `socket2`, `tokio-macros` and `windows-sys`. The choice, its alternatives and the MSRV evidence are in `docs/ADR-0001-network-stack.md`.
 
+The pairing service (`crates/airplay-core/src/server/pairing.rs`) draws its random values — the one-time PIN, the SRP salt and private value, and the X25519 key pair of `/pair-verify` — from [`getrandom`](https://crates.io/crates/getrandom) 0.2.15 (MIT OR Apache-2.0). It was already pinned as a transitive dependency of `rand_core` before it was declared directly, so the dependency set of the product is unchanged; the decision and the identity rules around it are in `docs/ADR-0002-pairing-identity.md`.
+
 To obtain the reference checkout on a new machine:
 
 ```powershell

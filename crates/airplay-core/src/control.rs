@@ -378,6 +378,13 @@ pub struct ControlResponse {
     pub headers: Vec<(String, String)>,
     /// Response body, empty for a header-only response.
     pub body: Vec<u8>,
+    /// Whether the connection is closed once this response is written.
+    ///
+    /// Upstream asks its connection to disconnect through
+    /// `http_response_set_disconnect` (`upstream/UxPlay/lib/http_response.c:172-186`),
+    /// which `RAOP` uses for `TEARDOWN` and for a failed `/pair-verify`
+    /// signature. It is not visible on the wire by itself.
+    pub close_after_reply: bool,
 }
 
 impl ControlResponse {
@@ -389,6 +396,7 @@ impl ControlResponse {
             reason,
             headers: Vec::new(),
             body: Vec::new(),
+            close_after_reply: false,
         }
     }
 
@@ -461,6 +469,8 @@ pub struct RouteReply {
     pub headers: Vec<(String, String)>,
     /// Response body, empty for a header-only response.
     pub body: Vec<u8>,
+    /// Whether the connection is closed once this reply is written.
+    pub close_after_reply: bool,
 }
 
 impl RouteReply {
@@ -488,6 +498,7 @@ impl RouteReply {
             reason,
             headers: Vec::new(),
             body: Vec::new(),
+            close_after_reply: false,
         }
     }
 
@@ -508,6 +519,12 @@ impl RouteReply {
     /// Sets the response body.
     pub fn with_body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
+        self
+    }
+
+    /// Closes the connection once this reply is written.
+    pub fn closing(mut self) -> Self {
+        self.close_after_reply = true;
         self
     }
 }
@@ -804,6 +821,7 @@ impl ControlSession {
             }
         }
         response.body = reply.body;
+        response.close_after_reply = reply.close_after_reply;
         Ok(ControlOutcome::Respond(response))
     }
 
@@ -846,7 +864,9 @@ fn ported_reply(route: Route, audio_delay_micros: u32) -> RouteReply {
                 .with_header("Audio-Latency", &latency)
                 .with_header("Audio-Jack-Status", AUDIO_JACK_STATUS_RECORD)
         }
-        Route::Teardown => RouteReply::ok().with_header("Connection", "close"),
+        Route::Teardown => RouteReply::ok()
+            .with_header("Connection", "close")
+            .closing(),
         _ => RouteReply::ok(),
     }
 }

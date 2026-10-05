@@ -54,6 +54,7 @@ dependencies = [
  "cipher",
  "ctr",
  "ed25519-dalek",
+ "getrandom",
  "md-5",
  "num-bigint",
  "num-traits",

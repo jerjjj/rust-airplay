@@ -190,6 +190,24 @@ impl AppleSrpServer {
         })
     }
 
+    /// Server public value `B = k*v + g^b` in the minimal encoding Apple uses.
+    ///
+    /// `/pair-setup-pin` answers its first step with `B` before the client sends
+    /// its own public value (`upstream/UxPlay/lib/pairing.c:543-550`), so a
+    /// server has to be able to produce `B` on its own. The value does not
+    /// depend on the client's public value.
+    pub fn server_public(&self) -> Result<Vec<u8>, SrpError> {
+        Ok(minimal_bytes(&self.server_public_value()?))
+    }
+
+    fn server_public_value(&self) -> Result<BigUint, SrpError> {
+        let n = modulus();
+        let generator = BigUint::from(2u8);
+        let multiplier = hash_padded_pair(n, &generator)?;
+        let generator_b = generator.modpow(&self.private_b, n);
+        Ok(((&multiplier * &self.verifier) + generator_b) % n)
+    }
+
     pub fn respond(&self, client_public_bytes: &[u8]) -> Result<AppleSrpResponse, SrpError> {
         // Apple sends the client public key as one 2048-bit Data block; reject an
         // empty or oversized value before it reaches the big-integer math.
@@ -202,10 +220,7 @@ impl AppleSrpServer {
             return Err(SrpError::InvalidValue("SRP client public key"));
         }
 
-        let generator = BigUint::from(2u8);
-        let multiplier = hash_padded_pair(n, &generator)?;
-        let generator_b = generator.modpow(&self.private_b, n);
-        let server_public = ((&multiplier * &self.verifier) + generator_b) % n;
+        let server_public = self.server_public_value()?;
         let scrambling = hash_padded_pair(&client_public, &server_public)?;
         let verifier_power = self.verifier.modpow(&scrambling, n);
         let premaster = (&client_public * verifier_power).modpow(&self.private_b, n);
@@ -237,6 +252,65 @@ pub fn constant_time_proof_eq(expected: &[u8; APPLE_SRP_HASH_SIZE], actual: &[u8
         difference |= expected ^ actual;
     }
     difference == 0
+}
+
+/// Deterministic SRP client used by the pairing tests of this crate.
+///
+/// It computes what Apple's client computes for `/pair-setup-pin`, from a fixed
+/// private value, so the tests of the control service can drive the server
+/// without a second copy of the group, the hashing rules or the proof layout.
+#[cfg(test)]
+pub(crate) mod test_client {
+    use super::*;
+
+    /// Client side of one exchange.
+    pub(crate) struct Exchange {
+        /// Public value `A` the client sends in step 2.
+        pub(crate) public_key: Vec<u8>,
+        /// Proof `M` the client sends in step 2.
+        pub(crate) proof: [u8; APPLE_SRP_HASH_SIZE],
+        /// Server proof `M2` the client expects in the reply of step 2.
+        pub(crate) server_proof: [u8; APPLE_SRP_HASH_SIZE],
+        /// Session key both sides derive.
+        pub(crate) session_key: [u8; APPLE_SESSION_KEY_SIZE],
+    }
+
+    /// Runs the client side of one exchange against the server public value of
+    /// step 1.
+    pub(crate) fn exchange(
+        username: &[u8],
+        password: &[u8],
+        salt: &[u8],
+        private_a: &[u8; 32],
+        server_public: &[u8],
+    ) -> Exchange {
+        let private_a = BigUint::from_bytes_be(private_a);
+        let client_public = BigUint::from(2u8).modpow(&private_a, modulus());
+        let server_public_value = BigUint::from_bytes_be(server_public);
+        let x = BigUint::from_bytes_be(&hash(&[salt, &hash(&[username, b":", password])]));
+        let verifier = BigUint::from(2u8).modpow(&x, modulus());
+        let scrambling =
+            hash_padded_pair(&client_public, &server_public_value).expect("scrambling value");
+        let multiplier = hash_padded_pair(modulus(), &BigUint::from(2u8)).expect("multiplier");
+        let kv = (&multiplier * verifier) % modulus();
+        let base = (&server_public_value + modulus() - kv) % modulus();
+        let exponent = &private_a + scrambling * x;
+        let client_secret = base.modpow(&exponent, modulus());
+        let session_key = session_key_from_secret(&client_secret);
+        let proof = proof(
+            username,
+            salt,
+            &client_public,
+            &server_public_value,
+            &session_key,
+        );
+        Exchange {
+            public_key: minimal_bytes(&client_public),
+            proof,
+            server_proof: server_proof(&client_public, &proof, &session_key),
+            session_key,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +349,28 @@ mod tests {
             server.respond(&[0; APPLE_SRP_MODULUS_SIZE]),
             Err(SrpError::InvalidValue("SRP client public key"))
         ));
+    }
+
+    #[test]
+    fn server_public_value_does_not_depend_on_the_client() {
+        let server = AppleSrpServer::new(
+            b"AA:BB:CC:DD:EE:FF",
+            b"1234",
+            &[0x01; APPLE_SRP_SALT_SIZE],
+            &[0x02; 32],
+        )
+        .unwrap();
+        let standalone = server.server_public().unwrap();
+        let response = server
+            .respond(&minimal_bytes(
+                &BigUint::from(2u8).modpow(&BigUint::from_bytes_be(&[0x03; 32]), modulus()),
+            ))
+            .unwrap();
+        // `/pair-setup-pin` step 1 answers with `B` before the client sends `A`,
+        // so both paths have to produce the same value.
+        assert_eq!(standalone, response.public_key);
+        assert!(!standalone.is_empty());
+        assert!(standalone.len() <= APPLE_SRP_MODULUS_SIZE);
     }
 
     #[test]

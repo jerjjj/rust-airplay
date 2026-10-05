@@ -111,7 +111,13 @@
 - 依赖：W3 + W4。写作用域：`crates/airplay-core/src/server/`（新建）。
 - 状态：**拆分为 W5a（已完成）与 W5b（待做）**。
   - **W5a 已完成**（`322e01b`）：`crates/airplay-core/src/server/` 三个模块——`mod.rs`（`ServerConfig`/`Server::bind`/`Server::run`，accept 前先取连接许可，满了就在 backlog 等待，对应 `httpd.c:389-402`）、`connection.rs`（按 `control::request_length` 分帧的连接循环，未完成请求不能刷新空闲超时，无法成帧的请求答一次后关闭）、`handlers.rs`（`DeviceIdentity` + 上游默认值，`/feedback`、`/info`、`/fp-setup` 三个路由）。同时 `control.rs` 增加 `RouteHandler`/`RouteReply`/`RouteRequest`/`NoHandler` 与 `ControlSession::handle_with`（信封与前置条件仍集中在一处），`request_length` 负责帧长。`tests/server_spec.rs` 用 9 个真实 socket 用例覆盖 /info 往返、同一次写入的两个请求（**该用例发现并修掉了「缓冲区里已有完整请求却仍阻塞在 read」的真实缺陷**）、分片请求、80 KiB 头的 431、畸形请求的 400、TEARDOWN 的 `Connection: close`、feedback 回调与 `max_connections=1` 的连接上限。验收：67 单元 + 15 + 5 + 9 集成全绿，fmt/clippy/doc 全绿。
-  - **W5b 待做**：`/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify` 四条配对路由。它们需要**接收端共享的 PIN 与长期身份密钥**（上游存在 `raop->pin` 与 `pairing_init_generate` 生成的 Ed25519 密钥文件里，`upstream/UxPlay/lib/raop.c:659`），而当前 `RouteHandlers` 是按连接创建的；因此在动手前要先决定身份密钥从哪来（持久化文件 vs 由调用方注入），并把 PIN 放进可在连接间共享的状态。这四条路由现在按「未移植」答 501（显式失败，不假装成功）。
+  - **W5b 已完成**（本次提交）：四条配对路由落地。新增 `crates/airplay-core/src/server/pairing.rs`（`PairingState`＝接收端共享的长期身份、PIN 策略、失败计数、注册谓词、随机源；`PairingSession`＝每连接的 `Initial → Setup → Handshake → Finished` 状态机与三步 `/pair-setup-pin`、legacy `/pair-setup`、两步 `/pair-verify`）。写作用域按评审结论放宽到：`crypto.rs`（新增 `aes128_gcm16_encrypt`、`ed25519_public_key`）、`pairing.rs`（**修掉 `/pair-verify` 第二步的 CTR 偏移**：客户端签名用密钥流第 2 段 64 字节，原实现从 0 开始；把 `pair_setup_gcm_iv` 换成显式 `pair_setup_gcm_nonces`（解密 +1／加密 +2）并修正文档，清除 D10 里该模块的 `missing_docs` allow）、`srp.rs`（新增 `AppleSrpServer::server_public()` 与仅测试用的确定性客户端 `test_client`）、`control.rs`（`RouteReply::closing` 与 `ControlResponse::close_after_reply`，对应上游 `http_response_set_disconnect`）、`server/`、`tests/server_spec.rs`。
+  - 评审（技术方案评审团：架构／安全／验收）给出 1 项 Critical 与 4 项阻断项，主理人逐条独立核对上游原文后处理：
+    - **Critical（上游缺陷，未照搬）**：上游第 3 步不校验第 2 步是否通过，GCM 密钥取自 `calloc` 出的**全零**会话密钥（`pairing.c:513`、`:587`、`:603`），任意对端 2 个请求即可在不知道 PIN 的情况下让接收端装上攻击者公钥。本移植把会话密钥建模为 `Option`（仅在 proof 校验通过后写入），第 3 步在没有它时答 `470`，并有单测（断言 `client_public_key` 未被写入、连接仍可正常配对）与真实 socket 用例。
+    - **阻断项**：乱序/越界（上游 `pairing.c:560`、`:603` 空指针解引用；`raop_handlers.h:366`、`:408-409` 越界读）→ 全部精确校验长度并答 `470`；CTR 偏移（见上）；缺 GCM 加密原语（见上）；无有效 PIN 时必须拒绝（上游隐式 `"0000"`）→ 本移植 `PinMode::Disabled` 与「未生成一次性 PIN」一律 `470`。
+    - **有意偏离清单**（每条都有测试与模块文档）：一次性 PIN 仅在配对成功后消费、重复 `/pair-pin-start` 不轮换已显示的 PIN、`MAX_PIN_FAILURES = 5` 次错误后作废（上游无失败计数、且任意对端可作废 PIN）、未生成 PIN 时不回退到 `"0000"`、`/pair-setup-pin` 只接受二进制 plist（上游 `plist_from_bin` 同义）、长度为 0 的共享密钥拒绝、每连接状态不匹配答 `470` 而非崩溃。
+    - **未采纳的一条建议**：安全角色建议把上游「默认 200 空响应」的所有分支统一改成 `470`。主理人不采纳——`/pair-verify` 在未 setup 且未配 PIN 时的 200 空是客户端回退到 legacy `/pair-setup` 的**协议信号**，`method != "pin"` 与 `/pair-setup` 长度不符同理；改成 470 会破坏真实客户端的回退路径。仅在上游本身返回 470 的分支与上述安全阻断点上使用 470。
+  - 验收：**83 单元 + 15 control_spec + 5 plist_spec + 15 server_spec = 118 全绿**；fmt/clippy/doc 全绿。配对向量的独立性：`pairing.rs` 的 CTR/GCM 向量由验收角色用纯 Python 独立实现生成，主理人再用 Node `crypto` 复算一致后才写入测试（仓库代码不参与生成）；`/pair-verify` 第二步的偏移错误由此可被测试报红。真机项（客户端是否带 `CSeq`、三阶段 plist 真实形状、`+1/+2` nonce 与 64 字节偏移是否被真实 iOS 接受、重启换钥后的表现）**全部未验证**，已列入 S3 验收的未测试清单。
 
 ### W6 DNS-SD 广告与访问控制
 
@@ -136,8 +142,8 @@
 |---|---|---|
 | 1 | D1–D8 | 本次完成，独立于 S3 设计决策 |
 | 2 | D9 剩余、D10、W4、W6、W7 | W1/W2/W4/W3 已完成；D10 与 W6/W7 互相独立，可并行 |
-| 3 | ~~W3~~ → ~~W5a~~ → W5b | W3 与 W5a 已完成；W5b（配对路由）需要先定身份密钥来源 |
-| 4 | W6、W7、W8 | W6/W7 可并行，W8 收尾 |
+| 3 | ~~W3~~ → ~~W5a~~ → ~~W5b~~ | W3、W5a、W5b 已完成；配对身份密钥来源见 [ADR-0002](ADR-0002-pairing-identity.md) |
+| 4 | W6、W7、W8 | W6/W7 可并行，W8 收尾；D9 剩余（`pairing.rs` 签名往返已随 W5b 补齐，仍缺 `verify_pair_signature` 的独立向量）与 D10（其余 7 个模块的 `missing_docs`）可并入 |
 
 写作用域互不重叠：W3 独占 `control.rs`，W4 新建 `plist.rs`，W5 新建 `server/`，W6 新建 `discovery.rs`，W7 只碰 `tests/` 与 fuzz 目标。
 
@@ -147,7 +153,7 @@
 2. ~~**新依赖**~~：**已定（2026-09-20）：接受 tokio + `plist` + `mdns-sd`**，见 [ADR-0001](ADR-0001-network-stack.md)；依赖按工作包逐个落地，不提前写入。
 3. **远程仓库**：是否配置远程让 CI 真正运行；否则继续标注「仅本地验证」。**仍待你决策。**
 4. **真机**：是否有可用 iPhone/iPad 用于 S3 配对验收；没有的话 S3 只能声明「本机可达」，不能声明互操作成功。**仍待你决策。**
-5. **配对身份密钥从哪来（W5b 前必须定）**：上游把 Ed25519 长期密钥生成并保存到文件（`upstream/UxPlay/lib/raop.c:659` 的 `pairing_init_generate(device_id, keyfile, …)`），PIN 存在接收端共享状态里。选项：(a) 由调用方注入密钥与 PIN，库本身不落盘；(b) 库按上游做法读写密钥文件（需要新增文件路径配置与权限/原子写考虑）；(c) 先用进程内临时密钥（每次重启都要重新配对）。**待你决策。**
+5. ~~**配对身份密钥从哪来（W5b 前必须定）**~~：**已定（2026-09-20）：库不落盘，长期身份由调用方注入 32 字节 Ed25519 种子；禁止 device_id 派生密钥；公钥与 `/info` 同源**。理由与被否方案见 [ADR-0002](ADR-0002-pairing-identity.md)；随机源经 `RandomSource` 注入，默认实现为已提升为直接依赖的 `getrandom 0.2.15`（不新增包）。
 
 ## 7. 进度记录
 
@@ -159,6 +165,6 @@
 | 2026-09-20 | W4 | `8e72227` | `plist.rs` + `plistlib` 双向夹具（`tests/plist_spec.rs`、`tools/plist_fixtures.py`）；51 单元 + 7 + 5 集成；`plist 1.8.0` 落地 |
 | 2026-09-20 | W3 | `833d8c4` | `control.rs` 无状态路由 + 有状态会话：`ControlOutcome`、`X-Apple-Session-ID` 绑定、可选 `CSeq`、协议回显、`Audio-Latency`、`Connection: close`、431/400 映射；`tests/control_spec.rs` 改 15 个正向断言；58 单元 + 15 + 5 集成 |
 | 2026-09-20 | W5a | `322e01b` | `server/` 三层 + `RouteHandler` 委派 + `request_length`；`/info`、`/feedback`、`/fp-setup`；`tests/server_spec.rs` 9 个真实 socket 用例（含修掉「缓冲区已有完整请求仍阻塞 read」的缺陷）；67 单元 + 15 + 5 + 9 集成 |
-| 2026-09-20 | W5b | 待做 | 配对路由 `/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify`；当前答 501；需先定身份密钥来源（见第 6 节第 5 条） |
+| 2026-09-20 | W5b | 本次提交 | 配对路由 `/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify`（`server/pairing.rs`）；修掉 `/pair-verify` 第二步 CTR 偏移、补 GCM 加密原语与 `AppleSrpServer::server_public()`、`RouteReply::closing`；拒绝上游「跳过 proof 校验即可完成配对的」Critical 缺陷；83 单元 + 15 + 5 + 15 集成 |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。

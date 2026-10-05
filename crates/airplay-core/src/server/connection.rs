@@ -53,9 +53,12 @@ pub(super) async fn serve<H: RouteHandler>(
                 deadline = Instant::now() + idle_timeout;
                 match outcome {
                     Ok(ControlOutcome::Respond(response)) => {
-                        let close = response
-                            .header("Connection")
-                            .is_some_and(|value| value.eq_ignore_ascii_case("close"));
+                        // `TEARDOWN` asks for the close with a header, a failed
+                        // `/pair-verify` signature only through the flag.
+                        let close = response.close_after_reply
+                            || response
+                                .header("Connection")
+                                .is_some_and(|value| value.eq_ignore_ascii_case("close"));
                         writer.write_all(&response.to_bytes()).await?;
                         writer.flush().await?;
                         if close {

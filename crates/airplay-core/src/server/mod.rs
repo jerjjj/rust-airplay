@@ -44,6 +44,7 @@
 
 mod connection;
 mod handlers;
+mod pairing;
 
 use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -59,6 +60,9 @@ pub use handlers::{
     AUDIO_OUTPUT_FORMATS, DEFAULT_FEATURES, DEFAULT_HEIGHT, DEFAULT_MAX_FPS, DEFAULT_MODEL,
     DEFAULT_PI, DEFAULT_REFRESH_RATE, DEFAULT_SOURCE_VERSION, DEFAULT_VV, DEFAULT_WIDTH,
     DISPLAY_FEATURES, DISPLAY_UUID, DeviceIdentity, RouteHandlers, STATUS_FLAGS,
+};
+pub use pairing::{
+    MAX_PIN_FAILURES, OsRandom, PairingError, PairingState, PinMode, RandomError, RandomSource,
 };
 
 /// Connections upstream serves at the same time

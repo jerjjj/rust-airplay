@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use airplay_core::plist::Plist;
 use airplay_core::server::{DeviceIdentity, RouteHandlers, Server, ServerConfig};
+use airplay_core::server::{PairingState, PinMode, RandomError, RandomSource};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -24,20 +25,26 @@ struct TestServer {
 }
 
 impl TestServer {
-    async fn start(config: ServerConfig, handlers: RouteHandlers) -> Self {
+    /// Starts a server whose handlers for each connection come from `handlers`.
+    async fn start_with<F>(config: ServerConfig, handlers: F) -> Self
+    where
+        F: Fn() -> RouteHandlers + Send + 'static,
+    {
         let server = Server::bind(config).await.expect("bind");
         let address = server.local_addr().expect("local_addr");
-        let identity = handlers.identity().clone();
-        let task = tokio::spawn(async move {
-            server
-                .run(move || {
-                    let mut handlers = RouteHandlers::new(identity.clone());
-                    handlers.set_feedback_callback(|| {});
-                    handlers
-                })
-                .await
-        });
+        let task = tokio::spawn(async move { server.run(handlers).await });
         Self { address, task }
+    }
+
+    /// Starts a server that serves `handlers`' identity and reports feedback.
+    async fn start(config: ServerConfig, handlers: RouteHandlers) -> Self {
+        let identity = handlers.identity().clone();
+        Self::start_with(config, move || {
+            let mut handlers = RouteHandlers::new(identity.clone());
+            handlers.set_feedback_callback(|| {});
+            handlers
+        })
+        .await
     }
 
     async fn connect(&self) -> TcpStream {
@@ -374,5 +381,373 @@ async fn serves_no_more_than_the_configured_number_of_connections() {
         .await
         .expect("response once a slot is free");
     assert!(String::from_utf8_lossy(&response).starts_with("RTSP/1.0 200 OK\r\n"));
+    server.shutdown();
+}
+
+/// Deterministic random source, so a pairing test can predict the PIN, the salt
+/// and the ephemeral keys.
+struct FixedRandom {
+    next: u8,
+}
+
+impl RandomSource for FixedRandom {
+    fn fill(&mut self, output: &mut [u8]) -> Result<(), RandomError> {
+        for byte in output.iter_mut() {
+            *byte = self.next;
+            self.next = self.next.wrapping_add(1);
+        }
+        Ok(())
+    }
+}
+
+fn pairing_identity() -> DeviceIdentity {
+    DeviceIdentity::new("aa:bb:cc:dd:ee:ff", "Pairing Receiver", Vec::new())
+}
+
+fn pairing_state(pin_mode: PinMode) -> Arc<PairingState> {
+    Arc::new(PairingState::with_random(
+        [0x5a; 32],
+        pin_mode,
+        Box::new(FixedRandom { next: 1 }),
+    ))
+}
+
+/// Handler factory that pairs every connection with the same receiver state.
+fn pairing_handlers(state: Arc<PairingState>) -> impl Fn() -> RouteHandlers + Send + 'static {
+    move || RouteHandlers::with_pairing(pairing_identity(), Arc::clone(&state))
+}
+
+/// Request with a body and optional extra headers, framed like a real client.
+fn request_with_body(target: &str, extra: &str, body: &[u8]) -> Vec<u8> {
+    let mut bytes = format!(
+        "{target} RTSP/1.0\r\nCSeq: 1\r\nContent-Length: {}\r\n{extra}\r\n",
+        body.len()
+    )
+    .into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn binary_plist(entries: Vec<(&str, airplay_core::plist::Value)>) -> Vec<u8> {
+    Plist::from_value(airplay_core::plist::dictionary(entries))
+        .encode_binary()
+        .expect("encode")
+}
+
+/// Splits a response into its head, its body and the parsed head fields.
+fn response_parts(response: &[u8]) -> (&[u8], &[u8]) {
+    let head_end = find(response, b"\r\n\r\n").expect("header terminator");
+    (&response[..head_end], &response[head_end + 4..])
+}
+
+#[tokio::test]
+async fn answers_pair_pin_start_with_the_configured_pin() {
+    let state = pairing_state(PinMode::Fixed(42));
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+    let mut client = server.connect().await;
+    client
+        .write_all(b"POST /pair-pin-start RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+        .await
+        .expect("write");
+
+    let mut pending = Vec::new();
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    assert_eq!(
+        header_value(head, "Audio-Jack-Status"),
+        Some("connected; type=digital")
+    );
+    // Upstream adds nothing to this reply, so it carries no content type.
+    assert_eq!(header_value(head, "Content-Type"), None);
+    assert_eq!(header_value(head, "Content-Length"), None);
+    assert!(body.is_empty());
+    assert_eq!(state.pending_pin().as_deref(), Some("0042"));
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn refuses_pairing_when_no_pin_is_configured() {
+    let state = pairing_state(PinMode::Disabled);
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    client
+        .write_all(b"POST /pair-pin-start RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    assert!(
+        response.starts_with(b"RTSP/1.0 470 Client Authentication Failure\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let body = binary_plist(vec![
+        ("method", airplay_core::plist::Value::from("pin")),
+        ("user", airplay_core::plist::Value::from("client")),
+    ]);
+    client
+        .write_all(&request_with_body(
+            "POST /pair-setup-pin",
+            "Content-Type: application/x-apple-binary-plist\r\n",
+            &body,
+        ))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    assert!(response.starts_with(b"RTSP/1.0 470 Client Authentication Failure\r\n"));
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pair_setup_answers_the_receiver_public_key() {
+    let state = pairing_state(PinMode::Fixed(1234));
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    // Upstream ignores the content of the 32-byte body of the legacy setup.
+    client
+        .write_all(&request_with_body("POST /pair-setup", "", &[0u8; 32]))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    assert_eq!(
+        header_value(head, "Content-Type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(body, state.identity_public());
+
+    // The same key is what the receiver advertises in `/info`: a client must
+    // never cache one public key and be authenticated with another.
+    client
+        .write_all(b"GET /info RTSP/1.0\r\nCSeq: 2\r\n\r\n")
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (_, body) = response_parts(&response);
+    let info = Plist::parse(body).expect("binary plist");
+    assert_eq!(info.get_data("pk").expect("pk"), state.identity_public());
+
+    // A body of another length is answered with the default reply.
+    client
+        .write_all(&request_with_body("POST /pair-setup", "", &[0u8; 31]))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    assert_eq!(header_value(head, "Content-Type"), None);
+    assert_eq!(header_value(head, "Content-Length"), None);
+    assert!(body.is_empty());
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pair_setup_pin_needs_a_verified_proof_before_the_third_step() {
+    let state = pairing_state(PinMode::Fixed(1234));
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+    let plist_type = "Content-Type: application/x-apple-binary-plist\r\n";
+
+    let step_one = binary_plist(vec![
+        ("method", airplay_core::plist::Value::from("pin")),
+        (
+            "user",
+            airplay_core::plist::Value::from("AA:BB:CC:DD:EE:FF"),
+        ),
+    ]);
+    client
+        .write_all(&request_with_body(
+            "POST /pair-setup-pin",
+            plist_type,
+            &step_one,
+        ))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    assert_eq!(
+        header_value(head, "Content-Type"),
+        Some("application/x-apple-binary-plist")
+    );
+    let step_one_reply = Plist::parse(body).expect("binary plist");
+    assert_eq!(step_one_reply.get_data("salt").expect("salt").len(), 16);
+    let public = step_one_reply.get_data("pk").expect("pk");
+    assert!(!public.is_empty() && public.len() <= 256);
+
+    // Skip step 2 and seal a key with the all-zero session key of an SRP
+    // context whose proof was never verified. Upstream installs this key.
+    let session_key = [0u8; 40];
+    let keys = airplay_core::pairing::derive_pair_setup_keys(&session_key);
+    let (decrypt_iv, _) = airplay_core::pairing::pair_setup_gcm_nonces(&session_key);
+    let attacker_key = [0x11u8; 32];
+    let (epk, tag) =
+        airplay_core::crypto::aes128_gcm16_encrypt(&keys.key, &decrypt_iv, &attacker_key)
+            .expect("seal");
+    let step_three = binary_plist(vec![
+        ("epk", airplay_core::plist::Value::Data(epk)),
+        ("authTag", airplay_core::plist::Value::Data(tag.to_vec())),
+    ]);
+    client
+        .write_all(&request_with_body(
+            "POST /pair-setup-pin",
+            plist_type,
+            &step_three,
+        ))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    assert!(
+        response.starts_with(b"RTSP/1.0 470 Client Authentication Failure\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // A request without the plist content type is refused as well, and the
+    // connection is still usable afterwards.
+    client
+        .write_all(&request_with_body("POST /pair-setup-pin", "", &step_one))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    assert!(response.starts_with(b"RTSP/1.0 470 Client Authentication Failure\r\n"));
+    client
+        .write_all(b"GET /info RTSP/1.0\r\nCSeq: 3\r\n\r\n")
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pair_verify_signs_the_exchange_and_closes_on_a_bad_signature() {
+    let state = pairing_state(PinMode::Fixed(1234));
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    // The legacy setup puts the connection into the state the handshake needs.
+    client
+        .write_all(&request_with_body("POST /pair-setup", "", &[0u8; 32]))
+        .await
+        .expect("write");
+    read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("setup response");
+
+    let private = [0x21u8; 32];
+    let public = airplay_core::crypto::x25519_public(&private);
+    let identity_seed = [0x33u8; 32];
+    let identity_public = airplay_core::crypto::ed25519_public_key(&identity_seed);
+    let mut handshake = vec![1u8, 0, 0, 0];
+    handshake.extend_from_slice(&public);
+    handshake.extend_from_slice(&identity_public);
+    client
+        .write_all(&request_with_body("POST /pair-verify", "", &handshake))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    assert_eq!(
+        header_value(head, "Content-Type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(body.len(), 96);
+
+    // The client authenticates the receiver with the key it cached.
+    let server_ecdh: [u8; 32] = body[..32].try_into().expect("server key");
+    let mut signature: [u8; 64] = body[32..].try_into().expect("signature");
+    let shared = airplay_core::crypto::x25519_shared(&private, &server_ecdh);
+    let keys = airplay_core::pairing::derive_pair_verify_keys(&shared);
+    let mut cipher = airplay_core::crypto::Aes128CtrState::new(&keys.key, &keys.iv).expect("ctr");
+    cipher.apply(&mut signature);
+    assert!(
+        airplay_core::crypto::ed25519_verify(
+            &state.identity_public(),
+            &[server_ecdh, public].concat(),
+            &signature
+        ),
+        "the receiver's signature must verify with the advertised key"
+    );
+
+    // The second step signs the other transcript order, encrypted with the
+    // second block of the shared keystream.
+    let mut client_signature =
+        airplay_core::crypto::ed25519_sign(&identity_seed, &[public, server_ecdh].concat());
+    let mut cipher = airplay_core::crypto::Aes128CtrState::new(&keys.key, &keys.iv).expect("ctr");
+    let mut discarded = [0u8; 64];
+    cipher.apply(&mut discarded);
+    cipher.apply(&mut client_signature);
+    client_signature[7] ^= 0x01;
+    let mut finish = vec![0u8, 0, 0, 0];
+    finish.extend_from_slice(&client_signature);
+    client
+        .write_all(&request_with_body("POST /pair-verify", "", &finish))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    // Upstream returns before it adds the content type, and closes.
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    assert_eq!(header_value(head, "Content-Type"), None);
+    assert_eq!(header_value(head, "Content-Length"), None);
+    assert!(body.is_empty());
+    let mut rest = Vec::new();
+    assert_eq!(client.read_to_end(&mut rest).await.expect("read"), 0);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pair_verify_without_a_pin_falls_back_to_the_legacy_setup() {
+    let state = pairing_state(PinMode::Disabled);
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    let mut handshake = vec![1u8, 0, 0, 0];
+    handshake.extend_from_slice(&[0x21u8; 32]);
+    handshake.extend_from_slice(&[0x33u8; 32]);
+    client
+        .write_all(&request_with_body("POST /pair-verify", "", &handshake))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    assert_eq!(header_value(head, "Content-Length"), None);
+    assert!(body.is_empty());
     server.shutdown();
 }
