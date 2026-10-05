@@ -222,7 +222,51 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 - 曾实现"请求头只解析一次（新增 `Frame`/`handle_frame`）+ 响应零分配（`write_into`）"的结构优化，release 三次测量**没有收益**（优化后 73.7k/31.3k req/s 对优化前 75.4k/32.5k，落在噪声内），因此按「不为未测量的需求增加 API 面」撤销，只保留测量用例本身。
 - 真正的性能工作属于 **S4 媒体路径**：RTP 接收避免每包分配与拷贝、抖动缓冲的容量与水位、镜像/音频交给 GStreamer 而不是自己解码、以及避免在音频线程上做锁竞争与日志格式化。S3 结束时不对媒体性能做任何声明。
 
-## 8. 进度记录
+## 8. 后续实现计划（2026-10-05 盘点）
+
+盘点结论：工程配置基本齐备（workspace lint `unsafe_code = forbid` / `missing_docs = warn` / clippy `all`、`rust-version = 1.85`、`publish = false`、`.gitattributes` 统一 LF、`README`/`LICENSE`/`THIRD_PARTY_NOTICES` 与 5 篇 `docs/`）。缺口 4 处：CI 从未运行（无远程）、无 `deny.toml`/cargo-deny（许可与漏洞检查）、无 fuzz/基准设施、CLI 仍是占位。按以下顺序推进，每项完成即一个本地提交并通过四门禁。
+
+### A. S3 收尾（1–2 个提交，无新依赖）
+1. **`SET_PARAMETER`/`GET_PARAMETER`**：上游 `SET_PARAMETER` 在 `text/parameters` 下处理 `volume:`/`progress:`（`raop_handlers.h:1141-1168`），无媒体层时走 `audio_set_volume` 回调。本移植加一个参数回调 + 200，`GET_PARAMETER` 的状态码按上游对照后记录（现为 501）。
+2. **plist 重复键语义**：安全评审 D3 要求把"后者覆盖"写进 `plist.rs` 文档并加一条用例。
+3. **引用一致性**：`src/**` 中新增的上游引用必须带 `@<hash>`；把这条写进 W8 的出口检查（可做成一个 grep 断言）。
+
+### B. W7 测试基建（可与 C/D 并行）
+1. **fuzz/proptest**：覆盖 `wire.rs`（头部三项上限、`Transfer-Encoding`、重复/带符号 `Content-Length`、分片与粘包）、`plist.rs`（深度 ≥33、对象数 >4096、畸形 bplist/XML）、`control.rs::request_length` 与 `server/connection.rs` 的分帧。本轮新增的全部解析约束正是它的目标。
+2. **oracle 纳入常规回归**：`tools/oracle/build.ps1` + 两条 ignored 测试已在文档里；补一条 docker/CI 可选 job 或本地脚本，并在 CI 可用时跑。
+3. **控制层场景**：多连接并发配对（注册粘滞、nonce 单次、PIN 预算是本轮修的，需并发用例）、乱序/重复请求、`max_connections` 下的排队。
+4. **基准**：把 `#[ignore]` 的吞吐测量扩到 SETUP/配对路径，作为 S4 前的性能基线。
+
+### C. W6 DNS-SD 与访问控制
+1. 引入 `mdns-sd`（[ADR-0001](ADR-0001-network-stack.md)），广播 `_airplay._tcp`/`_raop._tcp`，TXT 与 `dnssd.c`/`dnssdint.h` 对齐；**契约**：`pk` == `PairingState::identity_public()`、`sf`/bit 27 与 `PinMode` 一致。
+2. `/info` 的 `txtAirPlay`/`txtRAOP` 填真实记录（现在是空 data）。
+3. `Active-Remote`/`DACP-ID` 传递（上游 `raop.c:342-351` 只导出，不做鉴权）。
+4. **注册表接线**：`with_client_registered` + `SetupRequest.client_identity` → 真实名单（配置层负责持久化，见 [ADR-0002](ADR-0002-pairing-identity.md)）。
+5. Windows 上 `mdns-sd` 可用性记录；不可用则按 ADR-0001 的降级路径决策。
+
+### D. S4 前置（媒体栈）
+1. **FFmpeg 决策**（用户）与 GStreamer 版本/插件矩阵确认。
+2. **端口绑定**：NTP 时序口、音频 data/control、镜像 data 真实绑定后填进 `SetupPorts`，SETUP 响应从此声明真实端口（现在未绑定的字段一律不写）。
+3. **媒体会话接口**：以 `SetupRequest`（audio key/IV/streams/identity/auth）为输入，定义 RECORD/FLUSH/TEARDOWN 的媒体语义、重传与 NTP 同步（上游 `raop_ntp.c` 的签名已变，开工前重读）。
+4. **性能设施**：抓包回放 + 同硬件对比（MIGRATION_PLAN 测试策略 5）。
+
+### E. W8 S3 验收与文档
+1. 退出标准逐条对照；真机矩阵无设备时写"未测试"。
+2. 能力声明区分 `RouteHandlers::new`（配对 501）与 `with_pairing`。
+3. ADR 索引 + 引用一致性检查（见 A3）。
+4. README 状态更新（当前：控制面 + 配对 + SETUP 密钥派生；无媒体）。
+
+### F. 工程化（建议，低成本）
+1. **`deny.toml` + cargo-deny**：许可白名单（与 `THIRD_PARTY_NOTICES.md` 对齐：MIT / Apache-2.0 / MIT OR Apache-2.0 / LGPL-2.1-or-later 的移植边界）、advisory、重复依赖；本地可跑，CI 恢复后纳入。
+2. **远程仓库**（用户决策 3）：配置后 CI 的 3 OS + MSRV 1.85 job 才会真正运行；未配置前一律标注"仅本地验证"。
+3. **CLI 占位**：`--help`/`--version` 目前由 `main` 直接输出，S6 做完整选项矩阵时统一。
+4. 可选择补 `rust-toolchain.toml`；MSRV job 已覆盖 1.85，本地 stable 漂移风险可控。
+
+### 依赖与决策点
+- 顺序：A → (B ∥ C) → D → E；F1/F3 随时可做，F2 取决于用户。
+- **待用户决策**：① 远程仓库/CI 是否启用；② 是否有 iPhone/iPad 做真机验收（否则 S3 出口建议显式改写为"本机可达 + 离线差分"）；③ FFmpeg 取舍（S4 前）。
+
+## 9. 进度记录
 
 | 日期 | 工作包 | 提交 | 说明 |
 |---|---|---|---|
