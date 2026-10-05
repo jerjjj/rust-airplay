@@ -239,7 +239,7 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 
 ### B. W7 测试基建（可与 C/D 并行）
 1. **fuzz/proptest**：覆盖 `wire.rs`（头部三项上限、`Transfer-Encoding`、重复/带符号 `Content-Length`、分片与粘包）、`plist.rs`（深度 ≥33、对象数 >4096、畸形 bplist/XML）、`control.rs::request_length` 与 `server/connection.rs` 的分帧。本轮新增的全部解析约束正是它的目标。
-2. **oracle 纳入常规回归**：`tools/oracle/build.ps1` + 两条 ignored 测试已在文档里；补一条 docker/CI 可选 job 或本地脚本，并在 CI 可用时跑。
+2. **✅ oracle 纳入常规回归（已完成）**：新增 `tools/oracle/run.ps1` —— 若 oracle 未构建则先调用 `build.ps1`，然后设置 `AIRPLAY_UPSTREAM_ORACLE` 并运行 `cargo test --workspace --all-targets --no-fail-fast -- --ignored`，退出码即测试结果，可被流水线使用；支持 `-Rebuild` 与 `-Filter <名字>`。**这一步立刻暴露了一个真问题**：这些差分测试需要 `AIRPLAY_UPSTREAM_ORACLE` 环境变量指向 oracle，而之前没有任何地方设置它——也就是说"ignored 的差分"在常规操作下从来没被真正跑过。现在一条命令即可运行，本机实测 **7 条差分全部通过**（lib 内 3 条含 SRP 验证器接受本移植 proof、`upstream_oracle.rs` 3 条含 pair-verify 密钥流/pair-setup nonce 与 GCM/FairPlay、以及吞吐测量 1 条）。CI 里加了独立的 `oracle` job（ubuntu + `libssl-dev` + pwsh 调这两个脚本）；**诚实标注**：`build.ps1` 的 Linux 分支未在本机（Windows）验证过，CI 首次运行时需要确认，且该 job 只在本地存在 `upstream/UxPlay` 检出时才有意义。
 3. **控制层场景**：多连接并发配对（注册粘滞、nonce 单次、PIN 预算是本轮修的，需并发用例）、乱序/重复请求、`max_connections` 下的排队。
 4. **基准**：把 `#[ignore]` 的吞吐测量扩到 SETUP/配对路径，作为 S4 前的性能基线。
 

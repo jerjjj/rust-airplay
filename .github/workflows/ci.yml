@@ -31,3 +31,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - run: cargo check --workspace --all-targets --locked
+
+  # The differential tests compare this port with the upstream C implementation.
+  # They are `#[ignore]`d in the ordinary suite, which must not need a C
+  # toolchain; this job is what keeps them from being forgotten.
+  oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # tools/oracle/build.ps1 compiles sources from the local upstream
+          # checkout, which is not vendored here, so this job can only run where
+          # that checkout is present.
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the upstream oracle
+        run: pwsh -File tools/oracle/build.ps1
+      - name: Run the differential tests
+        run: pwsh -File tools/oracle/run.ps1
