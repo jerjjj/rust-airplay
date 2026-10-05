@@ -19,6 +19,7 @@ ctr = "0.9"
 ed25519-dalek = "2"
 getrandom = "0.2"
 md-5 = "0.10"
+mdns-sd = "0.21.4"
 num-bigint = "0.4"
 num-traits = "0.2"
 plist = { version = "1.8.0", default-features = false }

@@ -165,6 +165,12 @@
 - 依赖：W2。写作用域：`crates/airplay-core/src/discovery.rs`（新建）。
 - 契约约束（W5c/W6 必须一致，否则客户端会选错配对流程）：TXT 的 `pk` 必须等于 `PairingState::identity_public()`；`sf`/feature bit 27 必须与 `PinMode` 一致（配了 PIN 才声明现代配对可用）；`with_client_registered` 必须接到真实注册表（上游 `uxplay.cpp` 的 `registered_keys`/`-reg`），不能只留谓词。
 - 选型旁证（2026-10-05 上游核对）：上游给系统 Bonjour/Avahi 路径新增的 API 自述「必须由应用 service 其 socket，否则 daemon 侧队列无界增长」，且 Windows 需要哑回调才能链接；`mdns-sd` 不需要 fd 服务、不依赖系统 daemon、无平台回调泄漏 —— 这**支持** [ADR-0001](ADR-0001-network-stack.md) 的既有选择，W6 仍须在本机（含 Windows）记录 `mdns-sd` 的真实可用性。
+- **状态（2026-10-05）：广告已完成，访问控制待做。**
+  - `discovery.rs`：`Advertisement::new(identity, port, protection)` 逐字段复刻上游 `lib/dns_sd/dns_sd.c:238-360` 与 `lib/dnssdint.h:32-49` —— RAOP 记录（`txtvers=1`、`ch=2`、`cn=0,1,2,3`、`da=true`、`et=0,3,5`、`vv=2`、`ft`＝`features` 的 `0x%X,0x%X` 形式、`am`＝model、`md=0,1,2`、`rhd=5.6.0.0`、`pw`/`sf`（无认证 `0x4`、口令 `0x84`、PIN `0x8c`）、`sr=44100`、`ss=16`、`sv=false`、`tp=UDP`、`vs`＝sourceVersion、`vn=65537`、`pk`＝身份公钥；实例名 `AABBCCDDEEFF@Name`）与 AirPlay 记录（`deviceid`、`features`、`pw`、`flags=0x4`、`model`、`pk`、`pi`、`srcvers`、`vv`）。`Advertiser::register`/`unregister` 用 `mdns-sd` 注册两条记录，`enable_addr_auto` 让 responder 自行填地址；单元测试固定了每个字段的期望值（含"不得多写字段"的计数断言）。
+  - **本机实测**：CLI 在 `0.0.0.0:47000` 起服务并注册成功；系统 Bonjour 浏览器 `dns-sd -B _raop._tcp local` 在多个接口上看到 `7A341A4E7FA3@Rust AirPlay Test` —— **`mdns-sd` 与 Apple Bonjour 服务可在同一台机器上共存**（两者都用 UDP 5353），这条 Windows 可用性记录补上了第 167 行的要求；入站防火墙规则（`rust-airplay` Allow ×2）已存在。
+  - CLI（`crates/airplay-cli`）现在是可运行入口：`--name/--port/--pin [digits]/--no-pin/--password/--device-id/--seed/--help`；身份种子持久化在 `%LOCALAPPDATA%\rust-airplay\identity.seed`（库仍不碰文件系统，符合 ADR-0002），设备 ID 由种子派生（首字节为本地管理地址），PIN 出现时打印到控制台。
+  - **Windows 端口注意**：`--port 7000` 在本机失败（`os error 10013`），因为 Hyper-V 保留了 TCP 6935–7034；端口可配置，广告用实际绑定端口，`--port 0` 自动挑空闲端口。
+  - **W6 剩余**：① `/info` 的 `txtAirPlay`/`txtRAOP` 仍返回空 data，需填入与广告一致的原始 TXT 记录；② 注册表接线（`with_client_registered` + `SetupRequest.client_identity` → 真实名单）；③ `Active-Remote`/`DACP-ID` 传递；④ `sf`/bit 27 与 `PinMode` 的映射已实现，待真机确认客户端实际选择哪条配对流程。
 
 ### W7 测试基建：集成层、上游差分 oracle、fuzz
 

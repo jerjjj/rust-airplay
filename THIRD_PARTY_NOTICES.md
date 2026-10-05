@@ -16,6 +16,8 @@ The pairing service (`crates/airplay-core/src/server/pairing.rs`) draws its rand
 
 The differential oracle under `tools/oracle/` is a **test tool**: it compiles the upstream sources named above (`srp.c`, `crypto.c`, `pairing.c`, `fairplay_playfair.c`, `playfair/*`, `logger.c`, `compat.c`, `utils.c`) into one program that prints vectors, and the ignored Rust tests compare them with this port. It is built from the local `upstream/UxPlay` checkout, it is never linked into the Rust product, its binary is ignored by Git, and it inherits the upstream notices listed above — including the MIT notice of Tom Cocagne's SRP implementation, which `srp.c` carries. `tools/oracle/README.md` records how to build and run it and what each vector checks.
 
+Discovery (`crates/airplay-core/src/discovery.rs`) depends on [`mdns-sd`](https://crates.io/crates/mdns-sd) 0.21.5 (Apache-2.0 OR MIT), a multicast-DNS responder written in Rust. `Cargo.lock` also pins its transitive dependencies (`if-addrs`, `socket-pktinfo`, `socket2`, `flume`, `log`, `parking_lot`/`lock_api`, `scopeguard`, `spin`, ...). The choice and the alternatives it replaced — Apple's Bonjour through `dns_sd.h`, or Avahi through its client library — are recorded in `docs/ADR-0001-network-stack.md`. The record contents this module advertises are transcribed from upstream `lib/dns_sd/dns_sd.c` and `lib/dnssdint.h`, which is what makes a stock client accept the receiver.
+
 To obtain the reference checkout on a new machine:
 
 ```powershell
