@@ -292,3 +292,31 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 | 2026-10-05 | 本轮覆盖缺口 | — | 安全角色（应用安全工程师）的验收分析未产出。它被交接的四项由主理人自行裁决并记入文档：注册拒绝改为粘滞（fail-closed）、分帧类偏离一律 fail-closed、`x25519_shared` 全零拒绝、W6 不复制系统 Bonjour 路径。**待办**：若要在 W5c（Digest 401、会话密钥接入）开工前补齐独立安全视角，需要重新召集该角色 |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。
+
+## 10. 结构整理与 bug 审计（2026-10-05）
+
+### 10.1 生产代码 panic 审计
+扫描全部 `.rs`（排除 `#[cfg(test)]` 之后的测试代码）中的 `unwrap/expect/panic!/todo!/unimplemented!`：**协议库生产代码 0 处依赖外部输入的 panic 路径**。剩余的少数几处是"构造上不可能失败"的类型转换——`src/pairing.rs:37-85` 是对 32 字节哈希切出 `[u8;16]` 的 `try_into()`，`src/srp.rs:53` 是解析编译期常量模数——它们不随客户端输入变化，保留并在评审中记录。**已修复的真实脆弱点**：CLI 三处 `Mutex::lock().expect("lock")`（stdout 关闭会让回调 panic → 锁中毒 → 之后每条连接都 panic）改为 `unwrap_or_else(PoisonError::into_inner)`，与库内 `guard()` 的既有做法一致。
+
+### 10.2 大文件拆分
+测试模块从生产文件中抽出为同级 `tests.rs`（`foo.rs` + `foo/tests.rs`），生产文件不再被上千行测试淹没：
+
+| 文件 | 拆分前 | 拆分后（生产） | 抽出的测试 |
+|---|---|---|---|
+| `src/server/pairing.rs` | 1742 | **985** | 757 → `src/server/pairing/tests.rs` |
+| `src/control.rs` | 1330 | **985** | 345 → `src/control/tests.rs` |
+| `src/server/handlers.rs` | 1038 | **926** | 112 → `src/server/handlers/tests.rs` |
+| `src/playfair.rs` | 798 | **601** | 197 → `src/playfair/tests.rs` |
+| `src/plist.rs` | 610 | **413** | 197 → `src/plist/tests.rs` |
+| `src/discovery.rs` | 519 | **353** | 166 → `src/discovery/tests.rs` |
+
+拆分是纯机械操作，安全性由**测试数量不变**证明（拆分前后均为 165 通过 / 9 忽略）。未拆的两类文件：`playfair_tables.rs`(6108) 与 `playfair/hand_garble_generated.rs`(873) 是**生成的数据表**，拆分只会破坏"生成物与生成器一一对应"；`tests/server_spec.rs`(1572) 是测试文件本身，拆分需要抽出共享夹具，留待需要时再做。
+
+### 10.3 性能复核（release，观测缝落地之后）
+| 路径 | 本次 | 此前基线 | 结论 |
+|---|---|---|---|
+| OPTIONS | 62 580 req/s（16.0 µs） | ≈74k | 单次运行波动（同机不同时刻，loopback 测量对后台负载敏感） |
+| `GET /info` | 31 376 req/s（31.9 µs） | ≈31–32k | 无回归 |
+| SETUP | 9 621 req/s（103.9 µs） | 15 062（66.4 µs） | 波动较大，见下 |
+
+观察：这三条都是**微秒级、单连接、loopback** 测量，重复运行的离散度可达 ±30%（OPTIONS 62.6k–74k、SETUP 9.6k–15k），因此**只能用作量级参考，不能当作性能承诺**；这也解释了为什么早先"解析一次 + 零分配回复"的改动测出 73.7k vs 75.4k——落在噪声里，故当时已回退。**新增的观测缝没有可测量的开销**（`trace: None` 时只是一次 Option 检查），但上面的数字不足以证明这一点，真正的结论需要 S4 的抓包回放与同硬件对比设施（计划 §8 的 D4）。

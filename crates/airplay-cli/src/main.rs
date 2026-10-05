@@ -8,7 +8,14 @@
 
 use std::collections::HashSet;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// Locks a lock this process shares, ignoring poisoning.
+////// A callback that panicked once must not turn every later connection into a
+/// panic: the receiver keeps serving the clients it can.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 use std::time::Duration;
 
 use airplay_core::crypto::sha512_concat;
@@ -99,13 +106,13 @@ async fn run() -> Result<(), String> {
     let known = Arc::new(Mutex::new(load_clients(&clients_path)));
     println!(
         "clients   {} remembered, {}",
-        known.lock().expect("lock").len(),
+        lock(&known).len(),
         clients_path.display()
     );
 
     let mut state = PairingState::new(seed, options.pin).with_client_registered({
         let known = Arc::clone(&known);
-        move |key| known.lock().expect("lock").contains(key)
+        move |key| lock(&known).contains(key)
     });
     if let Some(password) = options.password.as_deref() {
         state = state.with_password(password);
@@ -190,7 +197,7 @@ async fn run() -> Result<(), String> {
                     let Some(client) = request.client_identity else {
                         return;
                     };
-                    if known.lock().expect("lock").insert(client) {
+                    if lock(&known).insert(client) {
                         println!("*** client {} is now remembered ***", hex(&client));
                         if let Err(error) = record_client(&clients_path, &client) {
                             eprintln!("rust-airplay: cannot record the client: {error}");
