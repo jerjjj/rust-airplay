@@ -167,8 +167,17 @@ async fn run() -> Result<(), String> {
             // A trace names what a client asked and what it got, which is what
             // makes a device session readable; it never carries a body or key.
             handlers.set_trace_callback(|trace| {
+                // `Active-Remote`/`DACP-ID` name the remote-control connection a
+                // client uses; they are shown because a device session is hard to
+                // follow without them, not because they prove anything.
+                let remote = match (trace.active_remote, trace.dacp_id) {
+                    (None, None) => String::new(),
+                    (active, dacp) => {
+                        format!(" remote={}/{}", active.unwrap_or("-"), dacp.unwrap_or("-"))
+                    }
+                };
                 println!(
-                    "  -> {:<14} {:<24} cseq={:<6} body={:<6} {}{}{} => {}",
+                    "  -> {:<14} {:<24} cseq={:<6} body={:<6} {}{}{}{} => {}",
                     trace.method,
                     trace.target,
                     trace
@@ -183,6 +192,7 @@ async fn run() -> Result<(), String> {
                         .unwrap_or_default(),
                     if trace.status == 200 { "" } else { " !" },
                     trace.status,
+                    remote,
                 );
             });
             handlers

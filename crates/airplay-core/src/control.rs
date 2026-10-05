@@ -570,6 +570,18 @@ pub struct RequestTrace<'a> {
     pub user_agent: Option<&'a str>,
     /// `Content-Type` header, when the client sent one.
     pub content_type: Option<&'a str>,
+    /// `Active-Remote` token, when the client sent one.
+    ///
+    /// Upstream records it on the connection and hands it to its caller
+    /// (`upstream/UxPlay/lib/raop.c:342-351`). It names the remote-control
+    /// client a request came from, and it authorizes nothing: the header is
+    /// written by whoever connects.
+    pub active_remote: Option<&'a str>,
+    /// `DACP-ID` header, when the client sent one.
+    ///
+    /// The same header pair identifies the remote-control connection a client
+    /// wants to use; see [`RequestTrace::active_remote`].
+    pub dacp_id: Option<&'a str>,
     /// Length of the body the request carried.
     pub body_len: usize,
     /// Status the connection answered with.
@@ -847,6 +859,8 @@ impl ControlSession {
             cseq,
             user_agent: head.header("user-agent"),
             content_type: head.header("content-type"),
+            active_remote: head.header("active-remote"),
+            dacp_id: head.header("dacp-id"),
             body_len: body.len(),
             status: reply.status,
         });

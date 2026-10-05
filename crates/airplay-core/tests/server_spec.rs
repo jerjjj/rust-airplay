@@ -834,6 +834,8 @@ async fn a_trace_reports_what_a_request_asked_and_what_it_got() {
                     trace.content_type.map(str::to_owned),
                     trace.body_len,
                     trace.status,
+                    trace.active_remote.map(str::to_owned),
+                    trace.dacp_id.map(str::to_owned),
                 ));
             });
             handlers
@@ -849,6 +851,11 @@ async fn a_trace_reports_what_a_request_asked_and_what_it_got() {
         request_with_body("OPTIONS *", "", b""),
         request_with_body("GET /info", "Content-Type: text/parameters\r\n", b"body"),
         request_with_body("GET_PARAMETER /stream", "", b""),
+        request_with_body(
+            "SETUP /stream",
+            "Active-Remote: 12345\r\nDACP-ID: dacp-1\r\n",
+            b"",
+        ),
     ] {
         client.write_all(&request).await.expect("write");
         read_response(&mut client, &mut pending, Duration::from_secs(5))
@@ -857,7 +864,7 @@ async fn a_trace_reports_what_a_request_asked_and_what_it_got() {
     }
 
     let seen = seen.lock().expect("lock");
-    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(seen.len(), 4, "{seen:?}");
     assert_eq!(seen[0].0, "OPTIONS");
     assert_eq!(seen[0].2, Some(1));
     assert_eq!(seen[0].4, 0);
@@ -872,6 +879,10 @@ async fn a_trace_reports_what_a_request_asked_and_what_it_got() {
     // what was intended.
     assert_eq!(seen[2].0, "GET_PARAMETER");
     assert_eq!(seen[2].5, 451);
+    // The remote-control identifiers reach the caller, and are reported as what
+    // they are: values a client wrote.
+    assert_eq!(seen[3].6.as_deref(), Some("12345"));
+    assert_eq!(seen[3].7.as_deref(), Some("dacp-1"));
     drop(seen);
     server.shutdown();
 }

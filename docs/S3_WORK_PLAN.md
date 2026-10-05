@@ -171,7 +171,7 @@
   - CLI（`crates/airplay-cli`）现在是可运行入口：`--name/--port/--pin [digits]/--no-pin/--password/--device-id/--seed/--help`；身份种子持久化在 `%LOCALAPPDATA%\rust-airplay\identity.seed`（库仍不碰文件系统，符合 ADR-0002），设备 ID 由种子派生（首字节为本地管理地址），PIN 出现时打印到控制台。
   - **Windows 端口注意**：`--port 7000` 在本机失败（`os error 10013`），因为 Hyper-V 保留了 TCP 6935–7034；端口可配置，广告用实际绑定端口，`--port 0` 自动挑空闲端口。
   - **C2 已完成**：`Advertisement::txt_records()` 把两条记录编码成 RFC 6763 线格式（长度前缀 `key=value`，按 key 排序保证稳定，单个条目超过 255 字节则**省略**——上游 `TXTRecordSetValue` 同样拒绝）。CLI 用**同一个 `Advertisement` 值**既填 `DeviceIdentity::txt_airplay`/`txt_raop`（`/info?txtAirPlay` 的回答）又做 mDNS 注册，因此"广告说一套、`/info` 说另一套"在结构上不可能发生；单元测试用解码器做往返断言证明这一点。
-  - **W6 剩余**：① 注册表接线（`with_client_registered` + `SetupRequest.client_identity` → 真实名单）；② `Active-Remote`/`DACP-ID` 传递；③ `sf`/bit 27 与 `PinMode` 的映射已实现，待真机确认客户端实际选择哪条配对流程。
+  - **W6 剩余**：① 注册表接线（`with_client_registered` + `SetupRequest.client_identity` → 真实名单）；② **C3 已完成**：`RequestTrace` 增加 `active_remote`/`dacp_id`（来自请求头，`upstream/UxPlay/lib/raop.c:342-351` 只是把它们记在连接上交给调用方），文档写明"它们标明请求来自哪个遥控客户端，**不构成任何授权**"（头是连接方自己写的）；CLI 轨迹把它们显示为 `remote=<active>/<dacp>`；socket 用例断言两者确实到达调用方。③ `sf`/bit 27 与 `PinMode` 的映射已实现，待真机确认客户端实际选择哪条配对流程。
 
 ### W7 测试基建：集成层、上游差分 oracle、fuzz
 
