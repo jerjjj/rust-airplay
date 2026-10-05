@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::control::{Route, RouteHandler, RouteReply, RouteRequest};
+use crate::control::{RequestTrace, Route, RouteHandler, RouteReply, RouteRequest};
 use crate::crypto::sha512_concat;
 use crate::fairplay::{FairPlaySession, HANDSHAKE_REQUEST_LEN, SETUP_REQUEST_LEN};
 use crate::pairing::parse_digest_authorization;
@@ -105,6 +105,12 @@ pub enum SetParameter {
         end: u32,
     },
 }
+
+/// Callback that is told about every request a connection served.
+///
+/// It borrows the trace rather than owning it, so a receiver that logs requests
+/// does not copy request data around.
+pub type TraceCallback = Box<dyn FnMut(&RequestTrace<'_>) + Send>;
 
 /// Model upstream advertises when the user does not override it
 /// (`upstream/UxPlay/lib/global.h:21`).
@@ -268,6 +274,7 @@ pub struct RouteHandlers {
     setup_ports: SetupPorts,
     setup: Option<Box<dyn FnMut(SetupRequest) + Send>>,
     parameter: Option<Box<dyn FnMut(SetParameter) + Send>>,
+    trace: Option<TraceCallback>,
     authenticated: bool,
     digest_nonce: Option<[u8; 16]>,
 }
@@ -287,6 +294,7 @@ impl RouteHandlers {
             setup_ports: SetupPorts::default(),
             setup: None,
             parameter: None,
+            trace: None,
             authenticated: false,
             digest_nonce: None,
         }
@@ -311,6 +319,16 @@ impl RouteHandlers {
     /// Sets the ports a `SETUP` response may advertise.
     pub fn set_setup_ports(&mut self, ports: SetupPorts) {
         self.setup_ports = ports;
+    }
+
+    /// Sets the callback that is told about every request this connection served.
+    ///
+    /// A trace carries the method, target, `CSeq`, `User-Agent`, `Content-Type`,
+    /// body length and answer status of a request, and never a body, key or
+    /// signature, so a receiver can be followed against a real client without
+    /// printing secrets.
+    pub fn set_trace_callback(&mut self, callback: impl FnMut(&RequestTrace<'_>) + Send + 'static) {
+        self.trace = Some(Box::new(callback));
     }
 
     /// Sets the callback that receives what a `SET_PARAMETER` request asked for.
@@ -368,6 +386,10 @@ impl RouteHandler for RouteHandlers {
             Route::GetParameter => Some(self.get_parameter(request)),
             _ => None,
         }
+    }
+
+    fn trace(&mut self, trace: &RequestTrace<'_>) {
+        self.report_trace(trace);
     }
 }
 
@@ -684,6 +706,13 @@ impl RouteHandlers {
                 .with_body(format!("volume: {:9.6}\r\n", 0.0_f32).into_bytes());
         }
         RouteReply::new(200, "OK")
+    }
+
+    /// Reports one served request to the trace callback of this connection.
+    fn report_trace(&mut self, trace: &RequestTrace<'_>) {
+        if let Some(callback) = self.trace.as_mut() {
+            callback(trace);
+        }
     }
 
     /// Port of `raop_handler_feedback`

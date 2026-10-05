@@ -153,7 +153,32 @@ async fn run() -> Result<(), String> {
     let handlers_state = Arc::clone(&state);
     println!("waiting for a client (Ctrl+C to stop)");
     let result = server
-        .run(move || RouteHandlers::with_pairing(identity.clone(), Arc::clone(&handlers_state)))
+        .run(move || {
+            let mut handlers =
+                RouteHandlers::with_pairing(identity.clone(), Arc::clone(&handlers_state));
+            // A trace names what a client asked and what it got, which is what
+            // makes a device session readable; it never carries a body or key.
+            handlers.set_trace_callback(|trace| {
+                println!(
+                    "  -> {:<14} {:<24} cseq={:<6} body={:<6} {}{}{} => {}",
+                    trace.method,
+                    trace.target,
+                    trace
+                        .cseq
+                        .map(|cseq| cseq.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    trace.body_len,
+                    trace.content_type.unwrap_or("-"),
+                    trace
+                        .user_agent
+                        .map(|agent| format!(" ua={agent}"))
+                        .unwrap_or_default(),
+                    if trace.status == 200 { "" } else { " !" },
+                    trace.status,
+                );
+            });
+            handlers
+        })
         .await;
     advertiser.unregister().ok();
     result.map_err(|error| format!("the service stopped: {error}"))

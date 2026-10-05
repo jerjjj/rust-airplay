@@ -541,6 +541,39 @@ pub trait RouteHandler {
     ///
     /// `None` makes the control plane answer `501 Not Implemented`.
     fn handle(&mut self, route: Route, request: &RouteRequest<'_>) -> Option<RouteReply>;
+
+    /// Is told about every request this connection answered.
+    ///
+    /// Upstream logs the same facts (`upstream/UxPlay/lib/raop.c:347-360` logs
+    /// the method and URL of each request). A trace carries only what a client
+    /// sends in the clear — method, target, `CSeq`, `User-Agent`,
+    /// `Content-Type`, body length and the answer's status — and never a body,
+    /// a key or a signature, so a receiver can be debugged against a real client
+    /// without printing secrets.
+    fn trace(&mut self, _trace: &RequestTrace<'_>) {}
+}
+
+/// One request and the answer it got, for diagnostics.
+///
+/// The fields are the ones a person needs to follow a session: what was asked,
+/// how big it was, and what came back. Nothing here is secret by construction,
+/// which is the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTrace<'a> {
+    /// Method of the request, as sent.
+    pub method: &'a str,
+    /// Target of the request, as sent.
+    pub target: &'a str,
+    /// `CSeq` of the request, when the client sent one.
+    pub cseq: Option<u32>,
+    /// `User-Agent` header, when the client sent one.
+    pub user_agent: Option<&'a str>,
+    /// `Content-Type` header, when the client sent one.
+    pub content_type: Option<&'a str>,
+    /// Length of the body the request carried.
+    pub body_len: usize,
+    /// Status the connection answered with.
+    pub status: u16,
 }
 
 /// A [`RouteHandler`] that implements no route.
@@ -805,6 +838,18 @@ impl ControlSession {
             Dispatch::UnknownRtspMethod => RouteReply::not_implemented(),
             Dispatch::Unhandled => RouteReply::ok(),
         };
+
+        // The trace happens once the answer is known, so it reports what the
+        // client actually got rather than what was intended.
+        handler.trace(&RequestTrace {
+            method: &head.method,
+            target: &head.target,
+            cseq,
+            user_agent: head.header("user-agent"),
+            content_type: head.header("content-type"),
+            body_len: body.len(),
+            status: reply.status,
+        });
 
         let mut response = ControlResponse::new(&head.version, reply.status, reply.reason);
         // `raop.c:338-340`: added before the handler runs, for every RTSP

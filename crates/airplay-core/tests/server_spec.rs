@@ -818,6 +818,64 @@ async fn parameters_report_volume_and_progress_and_answer_451_without_a_content_
     server.shutdown();
 }
 
+#[tokio::test]
+async fn a_trace_reports_what_a_request_asked_and_what_it_got() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::start_with(local_config(), {
+        let seen = Arc::clone(&seen);
+        move || {
+            let mut handlers = RouteHandlers::new(identity());
+            let seen = Arc::clone(&seen);
+            handlers.set_trace_callback(move |trace| {
+                seen.lock().expect("lock").push((
+                    trace.method.to_owned(),
+                    trace.target.to_owned(),
+                    trace.cseq,
+                    trace.content_type.map(str::to_owned),
+                    trace.body_len,
+                    trace.status,
+                ));
+            });
+            handlers
+        }
+    })
+    .await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    // A request the control layer answers itself, one a handler serves, and one
+    // this handler does not implement: all three are traced.
+    for request in [
+        request_with_body("OPTIONS *", "", b""),
+        request_with_body("GET /info", "Content-Type: text/parameters\r\n", b"body"),
+        request_with_body("GET_PARAMETER /stream", "", b""),
+    ] {
+        client.write_all(&request).await.expect("write");
+        read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("response");
+    }
+
+    let seen = seen.lock().expect("lock");
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(seen[0].0, "OPTIONS");
+    assert_eq!(seen[0].2, Some(1));
+    assert_eq!(seen[0].4, 0);
+    assert_eq!(seen[0].5, 200);
+    assert_eq!(seen[1].0, "GET");
+    assert_eq!(seen[1].1, "/info");
+    assert_eq!(seen[1].3.as_deref(), Some("text/parameters"));
+    assert_eq!(seen[1].4, 4);
+    assert_eq!(seen[1].5, 200);
+    // A parameter request that does not say what it carries is refused with
+    // upstream's status, and the trace reports what the client got rather than
+    // what was intended.
+    assert_eq!(seen[2].0, "GET_PARAMETER");
+    assert_eq!(seen[2].5, 451);
+    drop(seen);
+    server.shutdown();
+}
+
 /// Deterministic random source, so a pairing test can predict the PIN, the salt
 /// and the ephemeral keys.
 struct FixedRandom {
