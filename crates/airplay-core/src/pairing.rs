@@ -139,6 +139,95 @@ pub fn verify_pair_signature(
     crate::crypto::ed25519_verify(peer_ed25519_public, &message, signature)
 }
 
+/// Fields of a `Digest` authorization header this port has to check.
+///
+/// Upstream extracts the same names by searching the header with `strstr` and
+/// writing a NUL into the copy it made (`upstream/UxPlay/lib/pairing.c`,
+/// `get_token`); this type is what a read-only parse produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestAuthorization {
+    /// `username` field.
+    pub username: String,
+    /// `realm` field.
+    pub realm: String,
+    /// `nonce` field, which has to be the one this connection handed out.
+    pub nonce: String,
+    /// `uri` field, as sent by the client.
+    pub uri: String,
+    /// `response` field: the digest the client computed.
+    pub response: String,
+    /// `qop` field, when the client used the `auth` variant.
+    pub qop: Option<String>,
+    /// `nc` field, the client's request counter.
+    pub nonce_count: Option<String>,
+    /// `cnonce` field, the client's own nonce.
+    pub client_nonce: Option<String>,
+}
+
+/// Parses a `Digest` authorization header.
+///
+/// Returns `None` when a field the digest needs is missing or malformed, so a
+/// caller answers `401` instead of computing a digest from missing pieces
+/// (upstream would pass a null pointer into its formatting).
+pub fn parse_digest_authorization(header: &str) -> Option<DigestAuthorization> {
+    let (scheme, fields) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("digest") {
+        return None;
+    }
+    let mut username = None;
+    let mut realm = None;
+    let mut nonce = None;
+    let mut uri = None;
+    let mut response = None;
+    let mut qop = None;
+    let mut nonce_count = None;
+    let mut client_nonce = None;
+    for field in fields.split(',') {
+        let (name, value) = field.split_once('=')?;
+        let value = value.trim().trim_matches('"');
+        if value.is_empty() {
+            return None;
+        }
+        match name.trim().to_ascii_lowercase().as_str() {
+            "username" => username = Some(value.to_owned()),
+            "realm" => realm = Some(value.to_owned()),
+            "nonce" => nonce = Some(value.to_owned()),
+            "uri" => uri = Some(value.to_owned()),
+            "response" => response = Some(value.to_owned()),
+            "qop" => qop = Some(value.to_owned()),
+            "nc" => nonce_count = Some(value.to_owned()),
+            "cnonce" => client_nonce = Some(value.to_owned()),
+            // Unknown fields are ignored, as RFC 2617 allows.
+            _ => {}
+        }
+    }
+    Some(DigestAuthorization {
+        username: username?,
+        realm: realm?,
+        nonce: nonce?,
+        uri: uri?,
+        response: response?,
+        qop,
+        nonce_count,
+        client_nonce,
+    })
+}
+
+/// Compares two byte strings without returning early on the first difference.
+///
+/// A digest and a nonce are secrets in the sense that a timing signal about them
+/// helps an attacker, so the comparison folds every byte.
+pub fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (expected, actual) in expected.iter().zip(actual) {
+        difference |= expected ^ actual;
+    }
+    difference == 0
+}
+
 /// Lower-case hexadecimal MD5 of `input`, the encoding Digest authentication and
 /// the RAOP device identifier use.
 pub fn md5_hex(input: &[u8]) -> String {
@@ -317,6 +406,47 @@ mod tests {
             hex("6516e137584aa671eb384a52252556950d7ba04044c67e619e8b847f6fcfb220"),
             "sealing the reply with the request nonce would produce a different tag"
         );
+    }
+
+    #[test]
+    fn parses_digest_authorization_headers() {
+        let parsed = parse_digest_authorization(
+            "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", \
+             nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", uri=\"/dir/index.html\", \
+             qop=auth, nc=00000001, cnonce=\"0a4f113b\", \
+             response=\"6629fae49393a05397450978507c4ef1\"",
+        )
+        .expect("a complete header parses");
+        assert_eq!(parsed.username, "Mufasa");
+        assert_eq!(parsed.realm, "testrealm@host.com");
+        assert_eq!(parsed.uri, "/dir/index.html");
+        assert_eq!(parsed.response, "6629fae49393a05397450978507c4ef1");
+        assert_eq!(parsed.qop.as_deref(), Some("auth"));
+        assert_eq!(parsed.nonce_count.as_deref(), Some("00000001"));
+        assert_eq!(parsed.client_nonce.as_deref(), Some("0a4f113b"));
+
+        // Missing fields, a wrong scheme and empty values are all refused rather
+        // than fed into the digest computation.
+        for bad in [
+            "Digest username=\"Mufasa\"",
+            "Basic dXNlcjpwYXNz",
+            "Digest username=\"\", realm=\"r\", nonce=\"n\", uri=\"/u\", response=\"d\"",
+            "Digest username=\"Mufasa\", realm=\"r\", nonce=\"n\", uri=\"/u\"",
+            "Digest",
+        ] {
+            assert!(
+                parse_digest_authorization(bad).is_none(),
+                "must be refused: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_time_comparison_answers_equality_only() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

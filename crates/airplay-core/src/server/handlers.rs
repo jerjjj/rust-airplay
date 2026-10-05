@@ -12,9 +12,15 @@ use std::sync::Arc;
 use crate::control::{Route, RouteHandler, RouteReply, RouteRequest};
 use crate::crypto::sha512_concat;
 use crate::fairplay::{FairPlaySession, HANDSHAKE_REQUEST_LEN, SETUP_REQUEST_LEN};
+use crate::pairing::parse_digest_authorization;
 use crate::plist::{self, Plist};
 
 use super::pairing::{PairingError, PairingReply, PairingSession, PairingState, SessionAuth};
+
+/// Lower-case hexadecimal, for the one challenge value this module formats.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// Streams one `SETUP` request may ask for.
 ///
@@ -241,6 +247,8 @@ pub struct RouteHandlers {
     pairing: Option<PairingSession>,
     setup_ports: SetupPorts,
     setup: Option<Box<dyn FnMut(SetupRequest) + Send>>,
+    authenticated: bool,
+    digest_nonce: Option<[u8; 16]>,
 }
 
 impl RouteHandlers {
@@ -257,6 +265,8 @@ impl RouteHandlers {
             pairing: None,
             setup_ports: SetupPorts::default(),
             setup: None,
+            authenticated: false,
+            digest_nonce: None,
         }
     }
 
@@ -382,6 +392,13 @@ impl RouteHandlers {
     /// handler starts (`:910-929`); a receiver without them answers the ports it
     /// actually has.
     fn setup(&mut self, request: &RouteRequest<'_>) -> RouteReply {
+        // The password gate comes first, before any of the body is looked at:
+        // upstream parses the property list before it challenges
+        // (`raop_handlers.h:601-648`), and a receiver should not spend work on a
+        // request that has not authenticated yet.
+        if let Some(challenge) = self.digest_challenge(request) {
+            return challenge;
+        }
         // Upstream reads the body with `plist_from_bin` and carries on with an
         // empty request when that fails (`:601-644`); a malformed body is
         // refused here instead, because the alternative is a `200 OK` that
@@ -510,6 +527,46 @@ impl RouteHandlers {
             authentication,
         });
         binary_plist(plist::Value::Dictionary(dictionary))
+    }
+
+    /// RFC 2617 password gate of `SETUP`, or `None` when the request may pass.
+    ///
+    /// Upstream keeps the same three facts on its receiver: whether the
+    /// connection authenticated, the challenge it handed out, and how many
+    /// attempts failed (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:649-748`).
+    /// The port keeps the nonce and the flag per connection and the failure count
+    /// on the shared receiver state, so guessing across connections costs
+    /// attempts. The nonce is one the port drew from its own random source
+    /// instead of upstream's construction, which hashes a heap address.
+    fn digest_challenge(&mut self, request: &RouteRequest<'_>) -> Option<RouteReply> {
+        let state = Arc::clone(self.pairing.as_ref()?.shared());
+        if !state.has_password() || self.authenticated {
+            return None;
+        }
+        let method = request.head.method.as_str();
+        if let Some(header) = request.head.header("authorization") {
+            if let Some(parsed) = parse_digest_authorization(header) {
+                let nonce_matches = self
+                    .digest_nonce
+                    .is_some_and(|nonce| hex(&nonce) == parsed.nonce);
+                // The challenge is single use, whether or not it matched.
+                self.digest_nonce = None;
+                if nonce_matches && state.verify_password_digest(method, &parsed).is_ok() {
+                    self.authenticated = true;
+                    return None;
+                }
+            }
+        }
+        let mut nonce = [0u8; 16];
+        if state.fill_random(&mut nonce).is_err() {
+            // Without randomness there is no challenge worth sending.
+            return Some(RouteReply::new(401, "Unauthorized"));
+        }
+        self.digest_nonce = Some(nonce);
+        Some(RouteReply::new(401, "Unauthorized").with_header(
+            "WWW-Authenticate",
+            &format!("Digest realm=\"raop\", nonce=\"{}\"", hex(&nonce)),
+        ))
     }
 
     /// Reports an accepted `SETUP` to the callback of this connection.

@@ -568,6 +568,138 @@ async fn setup_derives_the_audio_key_and_answers_the_configured_ports() {
     server.shutdown();
 }
 
+#[tokio::test]
+async fn setup_hashes_the_audio_key_with_a_verified_pairing_secret() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let state = pairing_state(PinMode::Fixed(1234));
+    let server = TestServer::start_with(local_config(), {
+        let state = Arc::clone(&state);
+        let seen = Arc::clone(&seen);
+        move || {
+            let mut handlers = RouteHandlers::with_pairing(pairing_identity(), Arc::clone(&state));
+            let seen = Arc::clone(&seen);
+            handlers.set_setup_callback(move |request| seen.lock().expect("lock").push(request));
+            handlers
+        }
+    })
+    .await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    let mut challenge = [0u8; 16];
+    challenge[4] = 0x03;
+    let mut handshake = [0u8; 164];
+    handshake[4] = 0x03;
+    for request in [&challenge[..], &handshake[..]] {
+        client
+            .write_all(&request_with_body("POST /fp-setup", "", request))
+            .await
+            .expect("write");
+        read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("fairplay response");
+    }
+    let mut reference = FairPlaySession::new();
+    reference.setup(&challenge).expect("reference setup");
+    reference
+        .handshake(&handshake)
+        .expect("reference handshake");
+
+    // Legacy setup opens the key exchange, then the client verifies itself.
+    client
+        .write_all(&request_with_body("POST /pair-setup", "", &[0u8; 32]))
+        .await
+        .expect("write");
+    read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("setup response");
+
+    let private = [0x21u8; 32];
+    let public = airplay_core::crypto::x25519_public(&private);
+    let identity_seed = [0x33u8; 32];
+    let identity_public = airplay_core::crypto::ed25519_public_key(&identity_seed);
+    let mut handshake_body = vec![1u8, 0, 0, 0];
+    handshake_body.extend_from_slice(&public);
+    handshake_body.extend_from_slice(&identity_public);
+    client
+        .write_all(&request_with_body("POST /pair-verify", "", &handshake_body))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("handshake response");
+    let (_, body) = response_parts(&response);
+    let server_ecdh: [u8; 32] = body[..32].try_into().expect("server key");
+    let shared = airplay_core::crypto::x25519_shared(&private, &server_ecdh);
+
+    let keys = airplay_core::pairing::derive_pair_verify_keys(&shared);
+    let mut signature =
+        airplay_core::crypto::ed25519_sign(&identity_seed, &[public, server_ecdh].concat());
+    let mut cipher = airplay_core::crypto::Aes128CtrState::new(&keys.key, &keys.iv).expect("ctr");
+    let mut discarded = [0u8; 64];
+    cipher.apply(&mut discarded);
+    cipher.apply(&mut signature);
+    let mut finish = vec![0u8, 0, 0, 0];
+    finish.extend_from_slice(&signature);
+    client
+        .write_all(&request_with_body("POST /pair-verify", "", &finish))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("finish response");
+    assert!(
+        response.starts_with(b"RTSP/1.0 200 OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // Now SETUP has to mix the unwrapped audio key with the verified secret.
+    let ekey = vec![0x11u8; 72];
+    let fairplay_key = reference.decrypt(&ekey).expect("reference decrypt");
+    let body = binary_plist(vec![
+        ("ekey", plist::Value::Data(ekey)),
+        ("eiv", plist::Value::Data(vec![0x22; 16])),
+    ]);
+    client
+        .write_all(&request_with_body("SETUP /stream", "", &body))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("setup response");
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+
+    let expected = airplay_core::crypto::sha512_concat(&[&fairplay_key, &shared]);
+    {
+        let requests = seen.lock().expect("lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].audio_key,
+            Some(expected[..16].try_into().expect("key"))
+        );
+        assert_eq!(requests[0].authentication, SessionAuth::Verified);
+        assert_eq!(requests[0].client_identity, Some(identity_public));
+    }
+
+    // The connection's material was handed out, so a second SETUP cannot reuse
+    // it: the key stays the plain FairPlay one.
+    client
+        .write_all(&request_with_body("SETUP /stream", "", &body))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("second setup");
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    {
+        let requests = seen.lock().expect("lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].audio_key, Some(fairplay_key));
+    }
+    server.shutdown();
+}
+
 /// Deterministic random source, so a pairing test can predict the PIN, the salt
 /// and the ephemeral keys.
 struct FixedRandom {
@@ -599,6 +731,138 @@ fn pairing_state(pin_mode: PinMode) -> Arc<PairingState> {
 /// Handler factory that pairs every connection with the same receiver state.
 fn pairing_handlers(state: Arc<PairingState>) -> impl Fn() -> RouteHandlers + Send + 'static {
     move || RouteHandlers::with_pairing(pairing_identity(), Arc::clone(&state))
+}
+
+#[tokio::test]
+async fn setup_asks_for_a_password_once_and_then_accepts_the_digest() {
+    let password = "secret";
+    let state = Arc::new(
+        PairingState::with_random(
+            [0x5a; 32],
+            PinMode::Disabled,
+            Box::new(FixedRandom { next: 1 }),
+        )
+        .with_password(password),
+    );
+    let server = TestServer::start_with(local_config(), {
+        let state = Arc::clone(&state);
+        move || RouteHandlers::with_pairing(pairing_identity(), Arc::clone(&state))
+    })
+    .await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    // The key unwrapping needs a FairPlay session, so establish one first.
+    let mut challenge = [0u8; 16];
+    challenge[4] = 0x03;
+    let mut handshake = [0u8; 164];
+    handshake[4] = 0x03;
+    for request in [&challenge[..], &handshake[..]] {
+        client
+            .write_all(&request_with_body("POST /fp-setup", "", request))
+            .await
+            .expect("write");
+        read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("fairplay response");
+    }
+
+    // A request without a digest is challenged before its body is looked at: the
+    // body here is not even a property list.
+    client
+        .write_all(&request_with_body("SETUP /stream", "", b"not a plist"))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("challenge");
+    assert!(
+        response.starts_with(b"RTSP/1.0 401 Unauthorized\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let (head, _) = response_parts(&response);
+    let challenge = header_value(head, "WWW-Authenticate").expect("challenge header");
+    assert!(challenge.starts_with("Digest realm=\"raop\", nonce=\""));
+    let nonce = challenge
+        .split_once("nonce=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(nonce, _)| nonce.to_owned())
+        .expect("nonce in the challenge");
+    assert_eq!(
+        nonce.len(),
+        32,
+        "the challenge carries a 32 character nonce"
+    );
+
+    // The client answers with the digest it computes from the same fields.
+    let digest = airplay_core::pairing::digest_auth_response(
+        "SETUP", "client", "raop", password, &nonce, "/stream", None, None, None,
+    );
+    let authorization = format!(
+        "Authorization: Digest username=\"client\", realm=\"raop\", nonce=\"{nonce}\", uri=\"/stream\", response=\"{digest}\"\r\n"
+    );
+    let body = binary_plist(vec![
+        ("ekey", plist::Value::Data(vec![0x11; 72])),
+        ("eiv", plist::Value::Data(vec![0x22; 16])),
+    ]);
+    client
+        .write_all(&request_with_body("SETUP /stream", &authorization, &body))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("answer");
+    assert!(
+        response.starts_with(b"RTSP/1.0 200 OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // The challenge was single use, but the connection is authenticated now, so
+    // the same digest is not needed a second time.
+    client
+        .write_all(&request_with_body("SETUP /stream", &authorization, &body))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("repeat");
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+
+    // A wrong password on another connection is refused, and the failure is
+    // counted on the shared state.
+    let mut other = server.connect().await;
+    let mut pending = Vec::new();
+    other
+        .write_all(&request_with_body("SETUP /stream", "", &body))
+        .await
+        .expect("write");
+    let response = read_response(&mut other, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("challenge");
+    let (head, _) = response_parts(&response);
+    let nonce = header_value(head, "WWW-Authenticate")
+        .and_then(|challenge| challenge.split_once("nonce=\""))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(nonce, _)| nonce.to_owned())
+        .expect("nonce");
+    let wrong = airplay_core::pairing::digest_auth_response(
+        "SETUP", "client", "raop", "wrong", &nonce, "/stream", None, None, None,
+    );
+    let authorization = format!(
+        "Authorization: Digest username=\"client\", realm=\"raop\", nonce=\"{nonce}\", uri=\"/stream\", response=\"{wrong}\"\r\n"
+    );
+    other
+        .write_all(&request_with_body("SETUP /stream", &authorization, &body))
+        .await
+        .expect("write");
+    let response = read_response(&mut other, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("refusal");
+    assert!(response.starts_with(b"RTSP/1.0 401 Unauthorized\r\n"));
+    assert_eq!(state.password_failures(), 1);
+    server.shutdown();
 }
 
 /// Request with a body and optional extra headers, framed like a real client.

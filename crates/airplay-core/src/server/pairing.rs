@@ -96,6 +96,15 @@ const MAX_SETUP_PIN_ATTEMPTS: usize = MAX_PIN_FAILURES as usize + 1;
 /// that opening a new connection does not reset it.
 pub const MAX_PIN_FAILURES: u32 = 5;
 
+/// Refused password digests a receiver tolerates before it stops answering
+/// challenges.
+///
+/// Upstream keeps counting and, in its random-password mode, hands out a new
+/// password once the count is reached (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:664-669`);
+/// a configured password cannot be rotated like that, so the port stops
+/// accepting new attempts on a connection that keeps guessing.
+pub const MAX_PASSWORD_FAILURES: u32 = 5;
+
 /// Secret bytes a pairing exchange needs.
 ///
 /// Every use of randomness in pairing goes through this trait — the one-time
@@ -159,6 +168,8 @@ pub struct PairingState {
     identity_seed: [u8; ED25519_KEY_SIZE],
     identity_public: [u8; ED25519_KEY_SIZE],
     pin_mode: PinMode,
+    password: Option<Vec<u8>>,
+    password_failures: Mutex<u32>,
     pending_pin: Mutex<Option<u16>>,
     failures: Mutex<u32>,
     random: Mutex<Box<dyn RandomSource>>,
@@ -182,6 +193,8 @@ impl PairingState {
             identity_seed,
             identity_public: ed25519_public_key(&identity_seed),
             pin_mode,
+            password: None,
+            password_failures: Mutex::new(0),
             pending_pin: Mutex::new(None),
             failures: Mutex::new(0),
             random: Mutex::new(random),
@@ -189,9 +202,86 @@ impl PairingState {
         }
     }
 
-    /// Adds the predicate that decides whether a client may start
-    /// `/pair-verify` on a connection with no setup of its own.
+    /// Sets the password a client has to authenticate with before `SETUP`.
     ///
+    /// Upstream gets the same value from its `-pw` option and asks for it with
+    /// an RFC 2617 digest challenge (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:649-748`).
+    /// A receiver without a password answers `SETUP` without a challenge, which
+    /// is what an AirPlay 1 client expects when nothing is protected.
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Whether a password was configured.
+    pub fn has_password(&self) -> bool {
+        self.password.is_some()
+    }
+
+    /// Failures a password may collect before this receiver stops answering
+    /// challenges for new attempts.
+    ///
+    /// Upstream counts the same events; the bound and the shared counter are the
+    /// port's own, so guessing a password costs attempts across all connections.
+    pub fn password_failures(&self) -> u32 {
+        *self.guard(&self.password_failures)
+    }
+
+    /// Counts one refused password.
+    pub(crate) fn record_password_failure(&self) {
+        *self.guard(&self.password_failures) += 1;
+    }
+
+    /// Checks an RFC 2617 digest against the configured password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::PinUnavailable`] when no password is configured,
+    /// and [`PairingError::AuthenticationFailed`] once the failure bound is
+    /// reached, so a caller answers `401` in both cases.
+    pub(crate) fn verify_password_digest(
+        &self,
+        method: &str,
+        authorization: &crate::pairing::DigestAuthorization,
+    ) -> Result<(), PairingError> {
+        let Some(password) = self.password.as_deref() else {
+            return Err(PairingError::PinUnavailable);
+        };
+        if self.password_failures() >= MAX_PASSWORD_FAILURES {
+            return Err(PairingError::AuthenticationFailed);
+        }
+        let password = String::from_utf8_lossy(password);
+        let expected = crate::pairing::digest_auth_response(
+            method,
+            &authorization.username,
+            &authorization.realm,
+            &password,
+            &authorization.nonce,
+            &authorization.uri,
+            authorization.qop.as_deref(),
+            authorization.nonce_count.as_deref(),
+            authorization.client_nonce.as_deref(),
+        );
+        if crate::pairing::constant_time_eq(expected.as_bytes(), authorization.response.as_bytes())
+        {
+            *self.guard(&self.password_failures) = 0;
+            Ok(())
+        } else {
+            self.record_password_failure();
+            Err(PairingError::AuthenticationFailed)
+        }
+    }
+
+    /// Fills `output` from the random source, for a caller that needs bytes this
+    /// state owns instead of its own source.
+    pub(crate) fn fill_random(&self, output: &mut [u8]) -> Result<(), PairingError> {
+        self.guard(&self.random)
+            .fill(output)
+            .map_err(|_| PairingError::Random)
+    }
+
+    /// Adds the predicate that decides whether a client may start
+    /// `/pair-verify` on a connection with no setup of its own.    ///
     /// Upstream asks its application the same question and treats a missing list
     /// as "registered" (`upstream/UxPlay/lib/raop_handlers.h:504-516`), so a
     /// receiver without a predicate accepts every client; injecting one is how a
@@ -239,13 +329,6 @@ impl PairingState {
     /// integers and options.
     fn guard<'a, T>(&self, mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
         mutex.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Fills `output` from the random source.
-    fn fill_random(&self, output: &mut [u8]) -> Result<(), PairingError> {
-        self.guard(&self.random)
-            .fill(output)
-            .map_err(|_| PairingError::Random)
     }
 
     /// Draws a PIN in `1..=9999`, the range upstream's `random_pin` produces
@@ -540,6 +623,11 @@ impl PairingSession {
     pub(crate) fn pin_start(&mut self) -> Result<PairingReply, PairingError> {
         self.shared.start_pin()?;
         Ok(PairingReply::Silence)
+    }
+
+    /// The receiver-wide state this connection pairs against.
+    pub(crate) fn shared(&self) -> &Arc<PairingState> {
+        &self.shared
     }
 
     /// What this connection established, for a caller that has to branch on it.
