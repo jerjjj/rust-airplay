@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded property-list access for AirPlay control payloads.
 //!
+//! # Duplicate keys
+//!
+//! A property list is a tree whose dictionaries map a string key to a value, so
+//! a body that names the same key twice keeps one entry: the later value
+//! replaces the earlier one. Both the reader this module wraps and the
+//! [`Dictionary`] it re-exports behave that way, which is why a handler that
+//! reads a key always sees the value a client wrote last. A reader that has to
+//! reject such a body instead can count keys while walking the structure in
+//! `check_structure`; today the control plane only reads a handful of
+//! independent keys, so the map behavior is what the handlers are written
+//! against and `plist_spec.rs` pins it.
+//!
 //! UxPlay speaks the binary and XML property-list formats through libplist:
 //! `upstream/UxPlay/lib/raop.c:370` parses SETUP requests, `raop.c:518` parses
 //! `/pair-verify` requests, and responses are written with `plist_to_bin`

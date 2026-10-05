@@ -15,7 +15,8 @@ use airplay_core::fairplay::FairPlaySession;
 use airplay_core::plist::{self, Plist};
 use airplay_core::server::{DeviceIdentity, RouteHandlers, Server, ServerConfig};
 use airplay_core::server::{
-    PairingState, PinMode, RandomError, RandomSource, SessionAuth, SetupPorts, SetupStream,
+    PairingState, PinMode, RandomError, RandomSource, SessionAuth, SetParameter, SetupPorts,
+    SetupStream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -697,6 +698,123 @@ async fn setup_hashes_the_audio_key_with_a_verified_pairing_secret() {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].audio_key, Some(fairplay_key));
     }
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn parameters_report_volume_and_progress_and_answer_451_without_a_content_type() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::start_with(local_config(), {
+        let seen = Arc::clone(&seen);
+        move || {
+            let mut handlers = RouteHandlers::new(identity());
+            let seen = Arc::clone(&seen);
+            handlers.set_parameter_callback(move |parameter| {
+                seen.lock().expect("lock").push(parameter)
+            });
+            handlers
+        }
+    })
+    .await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+
+    // Both routes refuse a request that does not say what it carries
+    // (raop_handlers.h:1135-1139 and :1079-1083).
+    for method in ["SET_PARAMETER", "GET_PARAMETER"] {
+        client
+            .write_all(&request_with_body(
+                &format!("{method} /stream"),
+                "",
+                b"volume: 0.5\r\n",
+            ))
+            .await
+            .expect("write");
+        let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("response");
+        assert_eq!(
+            String::from_utf8_lossy(&response)
+                .split("\r\n")
+                .next()
+                .unwrap_or_default(),
+            "RTSP/1.0 451 Parameter not understood",
+            "{method}"
+        );
+    }
+
+    // A volume and a progress line reach the session layer.
+    for (body, expected) in [
+        (&b"volume: 0.25\r\n"[..], SetParameter::Volume(0.25)),
+        (
+            &b"progress: 1/2/3\r\n"[..],
+            SetParameter::Progress {
+                start: 1,
+                current: 2,
+                end: 3,
+            },
+        ),
+    ] {
+        client
+            .write_all(&request_with_body(
+                "SET_PARAMETER /stream",
+                "Content-Type: text/parameters\r\n",
+                body,
+            ))
+            .await
+            .expect("write");
+        let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("response");
+        assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+        assert_eq!(
+            *seen.lock().expect("lock").last().expect("reported"),
+            expected,
+            "{expected:?}"
+        );
+    }
+    let reported = seen.lock().expect("lock").len();
+
+    // Cover art belongs to the media layer, so it is answered without being
+    // reported, and a value no media layer could use is not reported either.
+    for (content_type, body) in [
+        ("Content-Type: image/jpeg\r\n", &b"\xff\xd8\xff"[..]),
+        (
+            "Content-Type: text/parameters\r\n",
+            &b"volume: not a number\r\n"[..],
+        ),
+    ] {
+        client
+            .write_all(&request_with_body(
+                "SET_PARAMETER /stream",
+                content_type,
+                body,
+            ))
+            .await
+            .expect("write");
+        let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("response");
+        assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    }
+    assert_eq!(seen.lock().expect("lock").len(), reported);
+
+    // A client that asks about the volume gets the value upstream falls back to
+    // when it has no media callback.
+    client
+        .write_all(&request_with_body(
+            "GET_PARAMETER /stream",
+            "Content-Type: text/parameters\r\n",
+            b"volume\r\n",
+        ))
+        .await
+        .expect("write");
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("response");
+    let (head, body) = response_parts(&response);
+    assert_eq!(header_value(head, "Content-Type"), Some("text/parameters"));
+    assert_eq!(body, b"volume:  0.000000\r\n");
     server.shutdown();
 }
 

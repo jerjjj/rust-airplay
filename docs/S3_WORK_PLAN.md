@@ -233,9 +233,9 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 盘点结论：工程配置基本齐备（workspace lint `unsafe_code = forbid` / `missing_docs = warn` / clippy `all`、`rust-version = 1.85`、`publish = false`、`.gitattributes` 统一 LF、`README`/`LICENSE`/`THIRD_PARTY_NOTICES` 与 5 篇 `docs/`）。缺口 4 处：CI 从未运行（无远程）、无 `deny.toml`/cargo-deny（许可与漏洞检查）、无 fuzz/基准设施、CLI 仍是占位。按以下顺序推进，每项完成即一个本地提交并通过四门禁。
 
 ### A. S3 收尾（1–2 个提交，无新依赖）
-1. **`SET_PARAMETER`/`GET_PARAMETER`**：上游 `SET_PARAMETER` 在 `text/parameters` 下处理 `volume:`/`progress:`（`raop_handlers.h:1141-1168`），无媒体层时走 `audio_set_volume` 回调。本移植加一个参数回调 + 200，`GET_PARAMETER` 的状态码按上游对照后记录（现为 501）。
-2. **plist 重复键语义**：安全评审 D3 要求把"后者覆盖"写进 `plist.rs` 文档并加一条用例。
-3. **引用一致性**：`src/**` 中新增的上游引用必须带 `@<hash>`；把这条写进 W8 的出口检查（可做成一个 grep 断言）。
+1. **✅ `SET_PARAMETER`/`GET_PARAMETER`（已完成）**：按上游 `raop_handlers.h:1069-1179` 移植——缺 `Content-Type` → **451 "Parameter not understood"**；`text/parameters` 的首行前缀匹配 `volume: `（严格解析 f32，非有限值忽略）与 `progress: a/b/c`（严格三段 u32），经 `SetParameter` 回调交给会话层（对应上游交给媒体层）；`image/jpeg`/`image/png`/`application/x-dmap-tagged` 属媒体层，答 200 但不上报（不假装存下了）；`GET_PARAMETER` 的 `volume` 回 `Content-Type: text/parameters` + `volume: {:.6}\r\n`（上游无媒体回调时的默认值 0.0，不编造音量）。socket 用例覆盖 451、volume、progress、封面忽略、非法值忽略与 GET 的响应体。
+2. **✅ plist 重复键语义（已完成）**：`plist.rs` 模块文档写明"字典是 key→value 映射，重复键后者覆盖"，`plist_spec.rs` 加用例固定该行为，并记录将来若要拒绝此类 body 应在 `check_structure` 里计数。
+3. **✅ 引用一致性（已完成）**：`tests/reference_consistency.rs` 扫描 `src/` 与 `tests/` 中所有 `upstream/UxPlay@<hash>`，断言哈希是固定基线（`57ea8341…`）或差分基线（`3dbf7cee`）的前缀（允许 git 短哈希），并有一条自测覆盖解析形式。**能抓的是"引用了未核对过的提交"，抓不到"整条引用漏了 hash"**——后者靠 W8 出口的人工复核。
 
 ### B. W7 测试基建（可与 C/D 并行）
 1. **fuzz/proptest**：覆盖 `wire.rs`（头部三项上限、`Transfer-Encoding`、重复/带符号 `Content-Length`、分片与粘包）、`plist.rs`（深度 ≥33、对象数 >4096、畸形 bplist/XML）、`control.rs::request_length` 与 `server/connection.rs` 的分帧。本轮新增的全部解析约束正是它的目标。
@@ -269,8 +269,9 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 4. 可选择补 `rust-toolchain.toml`；MSRV job 已覆盖 1.85，本地 stable 漂移风险可控。
 
 ### 依赖与决策点
-- 顺序：A → (B ∥ C) → D → E；F1/F3 随时可做，F2 取决于用户。
-- **待用户决策**：① 远程仓库/CI 是否启用；② 是否有 iPhone/iPad 做真机验收（否则 S3 出口建议显式改写为"本机可达 + 离线差分"）；③ FFmpeg 取舍（S4 前）。
+- 顺序：A → (B ∥ C) → D → E；F1/F3 随时可做，F2 取决于用户。**A 已完成，B ∥ C 进行中。**
+- **真机进展（2026-10-05）**：iPad 已发现本接收端并进入配对流程（接收端打印一次性 PIN，用户确认"可以连接"）。这是 S3 出口标准里"可发现 + 真实配对"的第一份真机证据；但**媒体未播放**（S4 未实现，SETUP 响应不声明媒体端口），也还没有请求轨迹，所以 iPad 每一步的具体请求内容尚未记录——B3/C 的收尾应把"真机请求序列"作为验收材料补齐。
+- **待用户决策**：① 远程仓库/CI 是否启用；② 真机已确认有 iPad，S3 出口可含真机配对证据，"播放"仍归 S4；③ FFmpeg 取舍（S4 前）。
 
 ## 9. 进度记录
 

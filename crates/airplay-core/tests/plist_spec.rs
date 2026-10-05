@@ -214,3 +214,15 @@ fn every_fixture_survives_a_binary_and_xml_round_trip() {
         dump.display()
     );
 }
+
+#[test]
+fn a_repeated_key_keeps_the_value_written_last() {
+    // The control plane reads keys by name and never counts entries, so the map
+    // behavior of `Dictionary` is the contract handlers rely on.
+    let mut dictionary = plist::Dictionary::new();
+    dictionary.insert("stage".to_owned(), plist::Value::from(1_u64));
+    dictionary.insert("stage".to_owned(), plist::Value::from(2_u64));
+    let plist = Plist::from_value(plist::Value::Dictionary(dictionary));
+
+    assert_eq!(plist.get_unsigned("stage"), Ok(2));
+}

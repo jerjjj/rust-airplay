@@ -86,6 +86,26 @@ pub struct SetupRequest {
     pub authentication: SessionAuth,
 }
 
+/// What a client asked to change with `SET_PARAMETER`.
+///
+/// Upstream hands both values straight to its media layer
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:1146-1158`); a receiver whose
+/// media layer is a later stage reports them instead of pretending to act.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SetParameter {
+    /// `volume: <value>`: the volume the client asked for.
+    Volume(f32),
+    /// `progress: <start>/<current>/<end>`, in seconds.
+    Progress {
+        /// Position the track started at.
+        start: u32,
+        /// Position the client is at.
+        current: u32,
+        /// Position the track ends at.
+        end: u32,
+    },
+}
+
 /// Model upstream advertises when the user does not override it
 /// (`upstream/UxPlay/lib/global.h:21`).
 pub const DEFAULT_MODEL: &str = "AppleTV3,2";
@@ -247,6 +267,7 @@ pub struct RouteHandlers {
     pairing: Option<PairingSession>,
     setup_ports: SetupPorts,
     setup: Option<Box<dyn FnMut(SetupRequest) + Send>>,
+    parameter: Option<Box<dyn FnMut(SetParameter) + Send>>,
     authenticated: bool,
     digest_nonce: Option<[u8; 16]>,
 }
@@ -265,6 +286,7 @@ impl RouteHandlers {
             pairing: None,
             setup_ports: SetupPorts::default(),
             setup: None,
+            parameter: None,
             authenticated: false,
             digest_nonce: None,
         }
@@ -289,6 +311,14 @@ impl RouteHandlers {
     /// Sets the ports a `SETUP` response may advertise.
     pub fn set_setup_ports(&mut self, ports: SetupPorts) {
         self.setup_ports = ports;
+    }
+
+    /// Sets the callback that receives what a `SET_PARAMETER` request asked for.
+    ///
+    /// Upstream applies the same values to its media session
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:1149-1158`).
+    pub fn set_parameter_callback(&mut self, callback: impl FnMut(SetParameter) + Send + 'static) {
+        self.parameter = Some(Box::new(callback));
     }
 
     /// Sets the callback that receives what a `SETUP` request established.
@@ -334,6 +364,8 @@ impl RouteHandler for RouteHandlers {
                 Some(self.pairing_reply(|session| session.verify(body)))
             }
             Route::Setup => Some(self.setup(request)),
+            Route::SetParameter => Some(self.set_parameter(request)),
+            Route::GetParameter => Some(self.get_parameter(request)),
             _ => None,
         }
     }
@@ -574,6 +606,84 @@ impl RouteHandlers {
         if let Some(callback) = self.setup.as_mut() {
             callback(request);
         }
+    }
+
+    /// Port of `raop_handler_set_parameter`
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:1125-1179`).
+    ///
+    /// Upstream reads the body of a `text/parameters` request with `sscanf` and
+    /// hands the result to its media layer; cover art and DMAP metadata go the
+    /// same way. This port parses the two values strictly, reports them, and
+    /// answers `200` for the content types whose payload belongs to the media
+    /// layer that does not exist yet — it does not claim to have stored them.
+    fn set_parameter(&mut self, request: &RouteRequest<'_>) -> RouteReply {
+        let Some(content_type) = request.head.header("content-type") else {
+            // Upstream answers the same status for a request that says nothing
+            // about what it carries (`:1135-1139`).
+            return RouteReply::new(451, "Parameter not understood");
+        };
+        if content_type.trim() != "text/parameters" {
+            return RouteReply::new(200, "OK");
+        }
+        // Upstream only looks at the start of the body (`:1146`, `:1155`), so a
+        // request that carries both values changes the volume and nothing else.
+        let first_line = request
+            .body
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
+        let Ok(line) = std::str::from_utf8(first_line) else {
+            return RouteReply::new(200, "OK");
+        };
+        let parameter = line
+            .strip_prefix("volume: ")
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            // A value no media layer can use is ignored rather than passed on:
+            // upstream's `sscanf` would leave its variable at zero.
+            .filter(|volume| volume.is_finite())
+            .map(SetParameter::Volume)
+            .or_else(|| {
+                line.strip_prefix("progress: ").and_then(|value| {
+                    let mut parts = value.trim().split('/');
+                    let start = parts.next()?.parse().ok()?;
+                    let current = parts.next()?.parse().ok()?;
+                    let end = parts.next()?.parse().ok()?;
+                    parts.next().is_none().then_some(SetParameter::Progress {
+                        start,
+                        current,
+                        end,
+                    })
+                })
+            });
+        if let Some(parameter) = parameter {
+            if let Some(callback) = self.parameter.as_mut() {
+                callback(parameter);
+            }
+        }
+        RouteReply::new(200, "OK")
+    }
+
+    /// Port of `raop_handler_get_parameter`
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:1069-1123`).
+    ///
+    /// A client that asks about `volume` gets the value its own player reported,
+    /// which upstream reads from its media callbacks and defaults to `0.0`
+    /// without them (`:1093-1097`). This port has no media layer, so it answers
+    /// that default instead of inventing a level.
+    fn get_parameter(&mut self, request: &RouteRequest<'_>) -> RouteReply {
+        let Some(content_type) = request.head.header("content-type") else {
+            return RouteReply::new(451, "Parameter not understood");
+        };
+        if content_type.trim() != "text/parameters" {
+            return RouteReply::new(200, "OK");
+        }
+        if request.body.starts_with(b"volume") {
+            return RouteReply::new(200, "OK")
+                .with_header("Content-Type", "text/parameters")
+                .with_body(format!("volume: {:9.6}\r\n", 0.0_f32).into_bytes());
+        }
+        RouteReply::new(200, "OK")
     }
 
     /// Port of `raop_handler_feedback`
