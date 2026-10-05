@@ -4,6 +4,23 @@
 
 启动日期：2026-09-20。基线：`FDH2/UxPlay@57ea83411d5f7e0b38c5841987439340543f025c`。上游参考树位于 `upstream/UxPlay`（被根仓库忽略，不进入产品链接）。
 
+## 0. 上游基线核对（2026-10-05 复核）
+
+上游已前进到 `origin/master = 3dbf7ceee65932154e85a2f83963d53520a799fa`（2026-10-05，自基线的 `57ea8341` 起 22 个提交）。逐文件判定结果：
+
+| 上游改动 | 我们对应的实现 | 判定 |
+|---|---|---|
+| `lib/httpd.c`：新增 `timeout_limit = 60` 的"死连接"清理；把连接建立时的 8 字节 peek 阻塞循环改成按连接的 `staging[8]` 累积 | `server/mod.rs`（`idle_timeout`）、`server/connection.rs`（分帧循环）、`server/mod.rs` 的"差异"小节 | **受影响**：空闲超时不再是"上游没有、我们自定"，已把默认值对齐为 60 s 并按硬超时执行（上游只在 socket 再次可读时检查该年龄，且移除连接后漏了 `continue`，两处都不照搬）。peek 重建只影响我们尚未实现的反向连接（PTTH）识别 |
+| `lib/http_request.c`：`on_url`/`on_header_field`/`on_header_value`/`on_body` 的 buffer 增长与初始化修复 | `wire.rs`（有界解析）、`control.rs`（`consumed`/`Content-Length`/分帧） | **不受影响**：改动是 llhttp 回调的内存管理（realloc 累积、初始化），没有新增或改变请求长度上限、`Content-Length` 语义或错误处理；我们复刻的可观测行为不变 |
+| `lib/raop_handlers.h`：只改 `raop_handler_set_parameter`（volume/progress 的 `conn->raop_rtp` 判空与 `free`） | 尚未移植（属 W5c/S4） | **不受影响**：`/info`、`/fp-setup`、`/pair-*`、`/feedback`、`OPTIONS`/`RECORD`/`FLUSH`/`TEARDOWN` 处理函数一字未改 |
+| `lib/raop.c`（空格 + 新增 `get_codec_string`）、`lib/raop.h`（HLS 编解码枚举、`get_custom_profile` 回调、playlist 辅助声明） | 控制面与配对无关 | **不受影响**：属 HLS/视频（S4）范围 |
+| `lib/dns_sd/dns_sd.c`（+62）、`lib/dnssd.h`（+12）：Windows 支持与哑 DNS_SD 回调 | W6 尚未开始 | **纳入 W6 输入**：确定 TXT 字段与跨平台回调形状时要按新的 `dnssd.h` 核对 |
+| `lib/raop_ntp.c`/`.h`（+57）：`sync_delay`、允许 `recv_time_kernel = NULL`、清理 | `ntp.rs`（只有解析原语） | **纳入 S4 输入**：`raop_ntp` 的同步语义变了，移植 NTP 会话时要按新签名与行为 |
+| `lib/airplay_video.c`、`raop_rtp_mirror.c`、`uxplay.cpp`（+355：音量一致性、playlist 过滤、Windows 支持、内存泄漏修复） | 未移植（S4/CLI） | **不受影响**（本轮范围外），但 CLI 规划要参考新的 `uxplay.cpp` 选项 |
+| `lib/pairing.c`、`lib/srp.c`、`lib/crypto.c` | W5b 已移植 | **未改动**：上游至今没有修掉"第 3 步不校验第 2 步、用全零会话密钥完成配对"的缺陷，我们对齐到 `3dbf7cee` 后仍然选择偏离（见 W5b 小节） |
+
+结论：S3 已移植的可观测行为在上游 `3dbf7cee` 下**只有空闲超时一处需要对齐**（已改）；其余差异都落在尚未移植的区域，已登记为 W6/S4 的输入。
+
 ## 1. 基线快照
 
 - 工作区：`crates/airplay-core` + `crates/airplay-cli`；`resolver = "3"`、edition 2024、MSRV 1.85、GPL-3.0-or-later、`publish = false`。
@@ -118,7 +135,7 @@
     - **有意偏离清单**（每条都有测试与模块文档）：一次性 PIN 仅在配对成功后消费、重复 `/pair-pin-start` 不轮换已显示的 PIN、`MAX_PIN_FAILURES = 5` 次错误后作废（上游无失败计数、且任意对端可作废 PIN）、未生成 PIN 时不回退到 `"0000"`、`/pair-setup-pin` 只接受二进制 plist（上游 `plist_from_bin` 同义）、长度为 0 的共享密钥拒绝、每连接状态不匹配答 `470` 而非崩溃。
     - **未采纳的一条建议**：安全角色建议把上游「默认 200 空响应」的所有分支统一改成 `470`。主理人不采纳——`/pair-verify` 在未 setup 且未配 PIN 时的 200 空是客户端回退到 legacy `/pair-setup` 的**协议信号**，`method != "pin"` 与 `/pair-setup` 长度不符同理；改成 470 会破坏真实客户端的回退路径。仅在上游本身返回 470 的分支与上述安全阻断点上使用 470。
   - 验收：**83 单元 + 15 control_spec + 5 plist_spec + 15 server_spec = 118 全绿**；fmt/clippy/doc 全绿。配对向量的独立性：`pairing.rs` 的 CTR/GCM 向量由验收角色用纯 Python 独立实现生成，主理人再用 Node `crypto` 复算一致后才写入测试（仓库代码不参与生成）；`/pair-verify` 第二步的偏移错误由此可被测试报红。真机项（客户端是否带 `CSeq`、三阶段 plist 真实形状、`+1/+2` nonce 与 64 字节偏移是否被真实 iOS 接受、重启换钥后的表现）**全部未验证**，已列入 S3 验收的未测试清单。
-  - W5b 遗留的未验证/待定项（不得在 S3 验收中当作已通过）：① SRP 服务端公钥 `B` 用最小编码（与上游 `srp.c:730` 一致），若真实客户端按 RFC5054 左填充到 256 字节，则约 1/256 的概率会因 `M` 不一致而失败——需要真机或抓包确认；② 一次性 PIN 在「配对成功才消费」的语义下，两个都知道 PIN 的对端可在第一个成功前的窗口内各自完成配对（已在模块文档记录，未加预留机制）；③ `plist` crate 对深嵌套 bplist 的递归深度未验证（< 64 KiB 的深嵌套输入是否会导致栈溢出需要单独测）；④ 空闲超时默认 30 s 与「用户读 PIN 再输入」的交互：上游无超时，超时后需重新 `/pair-pin-start`（PIN 语义已保证不因此失效）。
+  - W5b 遗留的未验证/待定项（不得在 S3 验收中当作已通过）：① SRP 服务端公钥 `B` 用最小编码（与上游 `srp.c:730` 一致），若真实客户端按 RFC5054 左填充到 256 字节，则约 1/256 的概率会因 `M` 不一致而失败——需要真机或抓包确认；② 一次性 PIN 在「配对成功才消费」的语义下，两个都知道 PIN 的对端可在第一个成功前的窗口内各自完成配对（已在模块文档记录，未加预留机制）；③ `plist` crate 对深嵌套 bplist 的递归深度未验证（< 64 KiB 的深嵌套输入是否会导致栈溢出需要单独测）；④ 空闲超时与「用户读 PIN 再输入」的交互：默认已按上游新加的 `timeout_limit = 60`（`upstream/UxPlay@3dbf7cee:lib/httpd.c:377`）对齐为 60 s，超时后需重新 `/pair-pin-start`（PIN 语义已保证不因此失效）；上游只在 socket 再次可读时才检查该年龄，本移植按硬超时执行（更强的同义实现）。
 
 ### W6 DNS-SD 广告与访问控制
 
@@ -156,7 +173,26 @@
 4. **真机**：是否有可用 iPhone/iPad 用于 S3 配对验收；没有的话 S3 只能声明「本机可达」，不能声明互操作成功。**仍待你决策。**
 5. ~~**配对身份密钥从哪来（W5b 前必须定）**~~：**已定（2026-09-20）：库不落盘，长期身份由调用方注入 32 字节 Ed25519 种子；禁止 device_id 派生密钥；公钥与 `/info` 同源**。理由与被否方案见 [ADR-0002](ADR-0002-pairing-identity.md)；随机源经 `RandomSource` 注入，默认实现为已提升为直接依赖的 `getrandom 0.2.15`（不新增包）。
 
-## 7. 进度记录
+## 7. 性能基线（2026-10-05）
+
+方法与结果（可复现）：`crates/airplay-core/tests/server_spec.rs` 的 `measures_control_plane_throughput`（默认 `#[ignore]`，因为它是测量而不是断言）。单条 loopback 连接、把请求一次性流水线写入、服务端写回后读到 EOF：
+
+```
+cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
+```
+
+| 路由 | release（3 次） | debug |
+|---|---|---|
+| `OPTIONS`（无 body） | 74 460 / 69 305 / 77 185 req/s（13.2–14.4 µs/请求） | ~51 000–55 000 req/s |
+| `GET /info`（二进制 plist，约 1 KiB 响应） | 31 250 / 30 060 / 32 616 req/s（30.1–33.3 µs/请求） | ~5 500 req/s |
+
+结论与决策：
+
+- **控制面不是瓶颈**。真实客户端在会话建立后每秒只发个位数控制请求，当前余量约三个数量级；`/info` 的成本主要在构造并编码那份 plist（14 个顶层键 + 嵌套数组）。
+- 曾实现"请求头只解析一次（新增 `Frame`/`handle_frame`）+ 响应零分配（`write_into`）"的结构优化，release 三次测量**没有收益**（优化后 73.7k/31.3k req/s 对优化前 75.4k/32.5k，落在噪声内），因此按「不为未测量的需求增加 API 面」撤销，只保留测量用例本身。
+- 真正的性能工作属于 **S4 媒体路径**：RTP 接收避免每包分配与拷贝、抖动缓冲的容量与水位、镜像/音频交给 GStreamer 而不是自己解码、以及避免在音频线程上做锁竞争与日志格式化。S3 结束时不对媒体性能做任何声明。
+
+## 8. 进度记录
 
 | 日期 | 工作包 | 提交 | 说明 |
 |---|---|---|---|

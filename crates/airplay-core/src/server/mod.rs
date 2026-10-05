@@ -9,8 +9,7 @@
 //!
 //! # Bounds
 //!
-//! Every limit the service enforces is a documented port decision, because
-//! upstream's control thread has none of them:
+//! Every limit the service enforces is a documented port decision:
 //!
 //! * A request head is limited to [`crate::wire::DEFAULT_MAX_HEAD`] and a body
 //!   to [`crate::control::MAX_CONTROL_BODY`]; both are checked before the bytes
@@ -19,11 +18,13 @@
 //!   Like upstream, the listener stops accepting while the limit is reached
 //!   instead of rejecting a client, so further connections wait in the kernel
 //!   backlog (`upstream/UxPlay/lib/httpd.c:389-402`).
-//! * A connection that is idle for [`ServerConfig::idle_timeout`] is closed,
-//!   and bytes that continue an unfinished request do not refresh that
-//!   deadline. Upstream never closes an idle connection
-//!   (`upstream/UxPlay/lib/httpd.c:359-618`), so a stalled client holds one of
-//!   its 12 slots until the peer goes away.
+//! * A connection that is idle for [`ServerConfig::idle_timeout`] is closed, and
+//!   bytes that continue an unfinished request do not refresh that deadline.
+//!   Upstream added the same limit later than the port started
+//!   (`timeout_limit = 60` at `upstream/UxPlay@3dbf7cee:lib/httpd.c:377`), but
+//!   enforces it only once the socket becomes readable again, so a client that
+//!   goes quiet keeps its slot. The port uses the same 60 seconds as a hard
+//!   deadline instead, which is the stronger reading of the same intent.
 //! * A request the service cannot frame is answered once
 //!   ([`crate::control::ControlError::to_response`]) and the connection is
 //!   closed, because the bytes after a rejected request cannot be trusted.
@@ -73,9 +74,11 @@ pub const MAX_CONNECTIONS: usize = 12;
 /// How long a connection may make no progress before it is closed, which is the
 /// default of [`ServerConfig::idle_timeout`].
 ///
-/// This is a port decision: upstream has no idle timeout, so the value is chosen
-/// to be longer than any pause a client takes between control requests.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// It matches the `timeout_limit = 60` upstream added for dead connections
+/// (`upstream/UxPlay@3dbf7cee:lib/httpd.c:377`), with one difference the module
+/// documentation describes: the port applies it as a deadline, upstream only
+/// when the socket becomes readable again.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How a [`Server`] listens and how many clients it serves.
 #[derive(Debug, Clone, PartialEq)]

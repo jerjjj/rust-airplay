@@ -118,9 +118,54 @@ fn identity() -> DeviceIdentity {
 fn local_config() -> ServerConfig {
     ServerConfig {
         bind: "127.0.0.1:0".parse().expect("address"),
-        idle_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(60),
         ..ServerConfig::default()
     }
+}
+
+/// Measures how many control requests the service answers per second.
+///
+/// Ignored by default: the numbers depend on the machine, so this is a
+/// measurement rather than an assertion. Run it with
+/// `cargo test -p airplay-core --test server_spec -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "measurement, not an assertion"]
+async fn measures_control_plane_throughput() {
+    type Build = fn(usize) -> String;
+    let server = TestServer::start(local_config(), RouteHandlers::new(identity())).await;
+    let cases: [(&str, usize, Build); 2] = [
+        ("OPTIONS (no body)", 4_000, |index| {
+            format!("OPTIONS * RTSP/1.0\r\nCSeq: {index}\r\n\r\n")
+        }),
+        ("GET /info (binary plist)", 1_000, |index| {
+            format!("GET /info RTSP/1.0\r\nCSeq: {index}\r\n\r\n")
+        }),
+    ];
+    for (label, count, build) in cases {
+        let mut client = server.connect().await;
+        let mut requests = Vec::new();
+        for index in 0..count {
+            requests.extend_from_slice(build(index).as_bytes());
+        }
+        let started = std::time::Instant::now();
+        client.write_all(&requests).await.expect("write");
+        client.shutdown().await.expect("shutdown");
+        let mut responses = Vec::new();
+        client.read_to_end(&mut responses).await.expect("read");
+        let elapsed = started.elapsed();
+        let answered = responses
+            .windows(15)
+            .filter(|window| *window == b"RTSP/1.0 200 OK")
+            .count();
+        assert_eq!(answered, count, "{label}: every request is answered");
+        println!(
+            "{label}: {answered} requests, {:.1} KiB back, {elapsed:?} total, {:.0} req/s, {:.1} us/request",
+            responses.len() as f64 / 1024.0,
+            answered as f64 / elapsed.as_secs_f64(),
+            elapsed.as_secs_f64() * 1e6 / answered as f64
+        );
+    }
+    server.shutdown();
 }
 
 #[tokio::test]

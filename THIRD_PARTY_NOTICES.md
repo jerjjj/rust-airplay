@@ -1,6 +1,6 @@
 # Upstream provenance and third-party notices
 
-This project targets behavior of [FDH2/UxPlay](https://github.com/FDH2/UxPlay) at commit `57ea83411d5f7e0b38c5841987439340543f025c` (2026-09-17). The local research checkout is under `upstream/UxPlay`, is ignored by the root repository, and is not linked into the Rust product.
+This project targets behavior of [FDH2/UxPlay](https://github.com/FDH2/UxPlay) at commit `57ea83411d5f7e0b38c5841987439340543f025c` (2026-09-17). On 2026-10-05 the reference checkout was fetched again and the differences to `3dbf7ceee65932154e85a2f83963d53520a799fa` were reviewed file by file; the verdict per upstream file is recorded in `docs/S3_WORK_PLAN.md` section 0. The local research checkout is under `upstream/UxPlay`, is ignored by the root repository, and is not linked into the Rust product.
 
 The Rust migration is licensed under GPL-3.0-or-later. UxPlay incorporates sources with GPL, LGPL and MIT notices. This document does not relicense those components. Retain original copyright and license notices whenever translating or incorporating their implementation/data. Before each such migration, record the exact source files and notices here.
 

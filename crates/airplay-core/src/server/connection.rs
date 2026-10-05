@@ -39,10 +39,12 @@ pub(super) async fn serve<H: RouteHandler>(
     let mut session = ControlSession::new();
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; READ_CHUNK];
-    // `httpd.c:359-618` has no timeout at all: upstream keeps a stalled client
-    // in one of its 12 connection slots forever. The port closes an idle
-    // connection instead, and bytes that continue an unfinished request do not
-    // refresh this deadline, so a client cannot hold a slot by dribbling.
+    // Upstream removes a connection that has been silent for longer than its
+    // `timeout_limit` (`upstream/UxPlay@3dbf7cee:lib/httpd.c:377`, `:473-478`),
+    // but only checks that age once the socket becomes readable again, so a
+    // client that simply goes quiet keeps its slot. The port treats the same
+    // limit as a deadline, and bytes that continue an unfinished request do not
+    // refresh it, so a client cannot hold a slot by dribbling.
     let mut deadline = Instant::now() + idle_timeout;
 
     loop {
