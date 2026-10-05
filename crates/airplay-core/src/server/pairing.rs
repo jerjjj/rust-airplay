@@ -438,6 +438,45 @@ pub(crate) enum PairingReply {
     Disconnect,
 }
 
+/// What one connection established before it asked for a media session.
+///
+/// The levels are evidence, not permissions: even [`SessionAuth::Verified`] only
+/// proves that the peer holds the keys it presented, so a caller that needs an
+/// access decision asks its own registry (see
+/// [`PairingState::with_client_registered`]) or the password gate of `SETUP`.
+// The SETUP handler is the only production consumer and lands in the next step
+// of W5c; this allow goes away with it (the tests already exercise both items).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionAuth {
+    /// The connection authenticated nothing.
+    None,
+    /// `/pair-setup` completed; that flow authenticates neither side
+    /// (`upstream/UxPlay/lib/raop_handlers.h:440-460`).
+    LegacySetup,
+    /// `/pair-setup-pin` step 3 installed a client key after the PIN proof.
+    PinVerified,
+    /// The client signed the key exchange, so `/pair-verify` finished here.
+    Verified,
+}
+
+/// Key material of a connection that finished `/pair-verify`.
+///
+/// A media session derives its stream keys from these values, so they are only
+/// produced for a connection that completed the exchange, and only once
+/// ([`PairingSession::take_session_keys`]).
+#[allow(dead_code)]
+pub(crate) struct SessionKeys {
+    /// X25519 shared secret of the connection's key exchange.
+    pub(crate) ecdh_secret: [u8; X25519_KEY_SIZE],
+    /// Public key the client presented in the verified exchange.
+    ///
+    /// It is *claimed* rather than proven: the signature only shows that the
+    /// peer holds the matching private key. Whether that client may be served is
+    /// the caller's registration decision.
+    pub(crate) client_identity: Option<[u8; ED25519_KEY_SIZE]>,
+}
+
 /// Lifecycle of one connection's pairing exchange, the port of the status values
 /// of `upstream/UxPlay/lib/pairing.c:148-159`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +515,7 @@ pub(crate) struct PairingSession {
     ecdh_shared: Option<[u8; X25519_KEY_SIZE]>,
     registration_refused: bool,
     setup_pin_attempts: usize,
+    pin_verified: bool,
 }
 
 impl PairingSession {
@@ -492,6 +532,7 @@ impl PairingSession {
             ecdh_shared: None,
             registration_refused: false,
             setup_pin_attempts: 0,
+            pin_verified: false,
         }
     }
 
@@ -503,6 +544,41 @@ impl PairingSession {
     pub(crate) fn pin_start(&mut self) -> Result<PairingReply, PairingError> {
         self.shared.start_pin()?;
         Ok(PairingReply::Silence)
+    }
+
+    /// What this connection established, for a caller that has to branch on it.
+    #[allow(dead_code)]
+    pub(crate) fn authentication(&self) -> SessionAuth {
+        if self.status == Status::Finished {
+            return SessionAuth::Verified;
+        }
+        if self.pin_verified {
+            return SessionAuth::PinVerified;
+        }
+        if matches!(self.status, Status::Setup | Status::Handshake) {
+            return SessionAuth::LegacySetup;
+        }
+        SessionAuth::None
+    }
+
+    /// Takes the key material of a connection that finished `/pair-verify`.
+    ///
+    /// The material is handed out at most once, and only after the second
+    /// `/pair-verify` step verified the client's signature
+    /// (`upstream/UxPlay/lib/pairing.c:108-119` hands it out for any connection
+    /// that started a handshake, which this port deliberately narrows). A caller
+    /// that gets `None` has no verified session on this connection and must not
+    /// derive stream keys.
+    #[allow(dead_code)]
+    pub(crate) fn take_session_keys(&mut self) -> Option<SessionKeys> {
+        if self.status != Status::Finished {
+            return None;
+        }
+        let ecdh_secret = self.ecdh_shared.take()?;
+        Some(SessionKeys {
+            ecdh_secret,
+            client_identity: self.client_public_key,
+        })
     }
 
     /// `/pair-setup-pin`: `raop_handler_pairsetup_pin`.
@@ -644,6 +720,9 @@ impl PairingSession {
         self.client_public_key = client_public.try_into().ok();
         self.session_key = None;
         self.status = Status::Setup;
+        // The client proved the PIN, which is the strongest evidence this
+        // connection can carry until `/pair-verify` finishes.
+        self.pin_verified = true;
         // A client that just proved it knows the PIN is no longer a refused one,
         // which is what keeps a legitimate pairing able to verify afterwards.
         self.registration_refused = false;
@@ -1450,6 +1529,86 @@ mod tests {
             session.setup_pin(&step_one_request(username)),
             Err(PairingError::AuthenticationFailed)
         ));
+    }
+
+    #[test]
+    fn session_keys_are_handed_out_only_once_and_only_after_verification() {
+        let shared = state(PinMode::Fixed(1234));
+        let mut session = PairingSession::new(Arc::clone(&shared));
+        let client = VerifyClient::new();
+
+        // Nothing on this connection, nothing to hand out.
+        assert_eq!(session.authentication(), SessionAuth::None);
+        assert!(session.take_session_keys().is_none());
+
+        // The legacy setup opens the verify path but authenticates nobody, so it
+        // still must not produce stream material.
+        session.setup(&[0u8; 32]).expect("setup");
+        assert_eq!(session.authentication(), SessionAuth::LegacySetup);
+        assert!(session.take_session_keys().is_none());
+
+        // A started key exchange is not a finished one.
+        let reply = session.verify(&client.handshake_body()).expect("handshake");
+        let body = body_of(&reply).to_vec();
+        assert!(session.take_session_keys().is_none());
+
+        let finish = client.finish_body(&body);
+        assert!(matches!(
+            session.verify(&finish),
+            Ok(PairingReply::Octets(_))
+        ));
+        assert_eq!(session.authentication(), SessionAuth::Verified);
+        let keys = session.take_session_keys().expect("verified session");
+        assert_eq!(
+            keys.ecdh_secret,
+            airplay_core_shared_secret(&client, &body),
+            "the material is the shared secret of this connection's exchange"
+        );
+        // Handed out once: a second media session cannot reuse it.
+        assert!(session.take_session_keys().is_none());
+    }
+
+    /// Shared secret of the test client's exchange, computed from the client's
+    /// private key and the receiver's public key.
+    fn airplay_core_shared_secret(client: &VerifyClient, reply: &[u8]) -> [u8; X25519_KEY_SIZE] {
+        let server_ecdh: [u8; X25519_KEY_SIZE] = reply[..32].try_into().expect("server key");
+        x25519_shared(&client.private, &server_ecdh)
+    }
+
+    #[test]
+    fn session_keys_are_not_handed_out_to_a_connection_the_predicate_refused() {
+        let shared = Arc::new(
+            PairingState::with_random(
+                IDENTITY_SEED,
+                PinMode::Fixed(1234),
+                Box::new(FixedRandom::new()),
+            )
+            .with_client_registered(|_| false),
+        );
+        let mut session = PairingSession::new(Arc::clone(&shared));
+        let client = VerifyClient::new();
+        assert!(matches!(
+            session.verify(&client.handshake_body()),
+            Ok(PairingReply::Silence)
+        ));
+        assert_eq!(session.authentication(), SessionAuth::LegacySetup);
+        assert!(session.take_session_keys().is_none());
+    }
+
+    #[test]
+    fn pin_verification_is_visible_to_a_caller() {
+        let shared = state(PinMode::Fixed(1234));
+        let mut session = PairingSession::new(Arc::clone(&shared));
+        session.pin_start().expect("pin start");
+        let username = b"AA:BB:CC:DD:EE:FF";
+        let (exchange, _) = setup_pin_two_steps(&mut session, b"1234", username);
+        let (epk, auth_tag) = seal_step_three(&exchange.session_key, &[0x33; 32]);
+        session
+            .setup_pin(&step_three_request(epk, auth_tag))
+            .expect("step 3");
+        assert_eq!(session.authentication(), SessionAuth::PinVerified);
+        // Proving the PIN is not the same as verifying the exchange.
+        assert!(session.take_session_keys().is_none());
     }
 
     #[test]
