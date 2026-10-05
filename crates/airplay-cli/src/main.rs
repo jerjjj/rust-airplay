@@ -127,6 +127,14 @@ async fn run() -> Result<(), String> {
     }
 
     let advertisement = Advertisement::new(&identity, address.port(), protection);
+    // The same value answers `GET /info?txtAirPlay` and is registered below, so a
+    // client that reads the record from either place sees one advertisement.
+    let (txt_airplay, txt_raop) = advertisement.txt_records();
+    let identity = DeviceIdentity {
+        txt_airplay: Some(txt_airplay),
+        txt_raop: Some(txt_raop),
+        ..identity
+    };
     let advertiser = Advertiser::register(&advertisement)
         .map_err(|error| format!("cannot announce the receiver: {error}"))?;
     for fullname in advertiser.fullnames() {

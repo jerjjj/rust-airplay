@@ -170,7 +170,8 @@
   - **本机实测**：CLI 在 `0.0.0.0:47000` 起服务并注册成功；系统 Bonjour 浏览器 `dns-sd -B _raop._tcp local` 在多个接口上看到 `7A341A4E7FA3@Rust AirPlay Test` —— **`mdns-sd` 与 Apple Bonjour 服务可在同一台机器上共存**（两者都用 UDP 5353），这条 Windows 可用性记录补上了第 167 行的要求；入站防火墙规则（`rust-airplay` Allow ×2）已存在。
   - CLI（`crates/airplay-cli`）现在是可运行入口：`--name/--port/--pin [digits]/--no-pin/--password/--device-id/--seed/--help`；身份种子持久化在 `%LOCALAPPDATA%\rust-airplay\identity.seed`（库仍不碰文件系统，符合 ADR-0002），设备 ID 由种子派生（首字节为本地管理地址），PIN 出现时打印到控制台。
   - **Windows 端口注意**：`--port 7000` 在本机失败（`os error 10013`），因为 Hyper-V 保留了 TCP 6935–7034；端口可配置，广告用实际绑定端口，`--port 0` 自动挑空闲端口。
-  - **W6 剩余**：① `/info` 的 `txtAirPlay`/`txtRAOP` 仍返回空 data，需填入与广告一致的原始 TXT 记录；② 注册表接线（`with_client_registered` + `SetupRequest.client_identity` → 真实名单）；③ `Active-Remote`/`DACP-ID` 传递；④ `sf`/bit 27 与 `PinMode` 的映射已实现，待真机确认客户端实际选择哪条配对流程。
+  - **C2 已完成**：`Advertisement::txt_records()` 把两条记录编码成 RFC 6763 线格式（长度前缀 `key=value`，按 key 排序保证稳定，单个条目超过 255 字节则**省略**——上游 `TXTRecordSetValue` 同样拒绝）。CLI 用**同一个 `Advertisement` 值**既填 `DeviceIdentity::txt_airplay`/`txt_raop`（`/info?txtAirPlay` 的回答）又做 mDNS 注册，因此"广告说一套、`/info` 说另一套"在结构上不可能发生；单元测试用解码器做往返断言证明这一点。
+  - **W6 剩余**：① 注册表接线（`with_client_registered` + `SetupRequest.client_identity` → 真实名单）；② `Active-Remote`/`DACP-ID` 传递；③ `sf`/bit 27 与 `PinMode` 的映射已实现，待真机确认客户端实际选择哪条配对流程。
 
 ### W7 测试基建：集成层、上游差分 oracle、fuzz
 

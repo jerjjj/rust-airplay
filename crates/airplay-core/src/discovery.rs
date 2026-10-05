@@ -154,7 +154,48 @@ impl Advertisement {
             airplay_txt,
         }
     }
+
+    /// Encodes both records the way a client asks for them with `GET /info`: the
+    /// control record first, then the audio one.
+    ///
+    /// A receiver that answers `/info` with the same bytes it advertises cannot
+    /// tell a client two different things, which is why [`DeviceIdentity`]
+    /// carries them (`upstream/UxPlay/lib/raop_handlers.h:96-100` answers the
+    /// record a client names in its query).
+    pub fn txt_records(&self) -> (Vec<u8>, Vec<u8>) {
+        (encode_txt(&self.airplay_txt), encode_txt(&self.raop_txt))
+    }
 }
+
+/// Encodes properties in the text record wire format: a sequence of entries,
+/// each a length byte followed by `key=value` (RFC 6763 section 6.4).
+///
+/// Entries are written in key order so the same advertisement always produces
+/// the same bytes, and an entry that cannot fit into one length byte is left out
+/// — upstream's `TXTRecordSetValue` refuses those the same way
+/// (`upstream/UxPlay@3dbf7cee:lib/dns_sd/dns_sd.c:241-274`), and every value this
+/// module produces is far below the limit.
+fn encode_txt(properties: &HashMap<String, String>) -> Vec<u8> {
+    let mut entries: Vec<String> = properties
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    entries.sort();
+    let mut encoded = Vec::new();
+    for entry in entries {
+        let bytes = entry.as_bytes();
+        if bytes.len() + 1 > MAX_TXT_ENTRY {
+            continue;
+        }
+        encoded.push(bytes.len() as u8);
+        encoded.extend_from_slice(bytes);
+    }
+    encoded
+}
+
+/// Longest text record entry DNS-SD can carry: one length byte, so 255 bytes
+/// including the byte itself.
+const MAX_TXT_ENTRY: usize = 255;
 
 /// The `0x%X,0x%X` pair both records carry
 /// (`upstream/UxPlay@3dbf7cee:lib/dns_sd/dns_sd.c:238`).
@@ -401,6 +442,53 @@ mod tests {
         let pin = Advertisement::new(&identity(), 7000, Protection::Pin);
         assert_eq!(pin.raop_txt.get("sf").map(String::as_str), Some("0x8c"));
         assert_eq!(pin.airplay_txt.get("pw").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn text_records_encode_every_field_for_info() {
+        let advertisement = Advertisement::new(&identity(), 7000, Protection::Pin);
+        let (airplay, raop) = advertisement.txt_records();
+
+        // Decoding the wire format gives back exactly the maps, so `/info` and
+        // the advertisement cannot disagree.
+        assert_eq!(decode_txt(&airplay), advertisement.airplay_txt);
+        assert_eq!(decode_txt(&raop), advertisement.raop_txt);
+        // The encoding is stable and every entry fits one length byte.
+        assert_eq!(advertisement.txt_records().0, airplay);
+        assert_eq!(advertisement.txt_records().1, raop);
+        assert!(airplay.len() <= advertisement.airplay_txt.len() * (MAX_TXT_ENTRY + 1));
+    }
+
+    /// An entry that cannot fit into a length byte is left out rather than
+    /// truncated into something a client would misread.
+    #[test]
+    fn text_record_encoding_drops_what_cannot_fit() {
+        let mut properties = HashMap::new();
+        properties.insert("short".to_owned(), "value".to_owned());
+        properties.insert("long".to_owned(), "x".repeat(300));
+        let encoded = encode_txt(&properties);
+        let mut expected = Vec::new();
+        expected.push(11u8);
+        expected.extend_from_slice(b"short=value");
+        assert_eq!(encoded, expected);
+    }
+
+    /// Decodes the wire format, for the tests above and for anyone reading a
+    /// record off the network.
+    fn decode_txt(encoded: &[u8]) -> HashMap<String, String> {
+        let mut properties = HashMap::new();
+        let mut rest = encoded;
+        while let Some((&length, tail)) = rest.split_first() {
+            let length = usize::from(length);
+            let (entry, tail) = tail.split_at_checked(length).expect("entry fits");
+            let (key, value) = std::str::from_utf8(entry)
+                .expect("utf-8")
+                .split_once('=')
+                .expect("key=value");
+            properties.insert(key.to_owned(), value.to_owned());
+            rest = tail;
+        }
+        properties
     }
 
     #[test]
