@@ -240,8 +240,11 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 ### B. W7 测试基建（可与 C/D 并行）
 1. **fuzz/proptest**：覆盖 `wire.rs`（头部三项上限、`Transfer-Encoding`、重复/带符号 `Content-Length`、分片与粘包）、`plist.rs`（深度 ≥33、对象数 >4096、畸形 bplist/XML）、`control.rs::request_length` 与 `server/connection.rs` 的分帧。本轮新增的全部解析约束正是它的目标。
 2. **✅ oracle 纳入常规回归（已完成）**：新增 `tools/oracle/run.ps1` —— 若 oracle 未构建则先调用 `build.ps1`，然后设置 `AIRPLAY_UPSTREAM_ORACLE` 并运行 `cargo test --workspace --all-targets --no-fail-fast -- --ignored`，退出码即测试结果，可被流水线使用；支持 `-Rebuild` 与 `-Filter <名字>`。**这一步立刻暴露了一个真问题**：这些差分测试需要 `AIRPLAY_UPSTREAM_ORACLE` 环境变量指向 oracle，而之前没有任何地方设置它——也就是说"ignored 的差分"在常规操作下从来没被真正跑过。现在一条命令即可运行，本机实测 **7 条差分全部通过**（lib 内 3 条含 SRP 验证器接受本移植 proof、`upstream_oracle.rs` 3 条含 pair-verify 密钥流/pair-setup nonce 与 GCM/FairPlay、以及吞吐测量 1 条）。CI 里加了独立的 `oracle` job（ubuntu + `libssl-dev` + pwsh 调这两个脚本）；**诚实标注**：`build.ps1` 的 Linux 分支未在本机（Windows）验证过，CI 首次运行时需要确认，且该 job 只在本地存在 `upstream/UxPlay` 检出时才有意义。
-3. **控制层场景**：多连接并发配对（注册粘滞、nonce 单次、PIN 预算是本轮修的，需并发用例）、乱序/重复请求、`max_connections` 下的排队。
-4. **基准**：把 `#[ignore]` 的吞吐测量扩到 SETUP/配对路径，作为 S4 前的性能基线。
+3. **✅ 控制层场景（已完成）**：`server_spec.rs` 新增三条并发护栏 + 一条 SETUP 基准——
+   - `concurrent_connections_pair_independently`：4 条连接并发走 legacy setup + `/pair-verify` 握手，断言**接收端临时公钥两两不同**（每条连接的状态互不串扰，这是并发下才看得见的性质）。
+   - `password_failures_are_counted_across_connections`：6 条连接各错一次口令（最后一条用**正确**口令），全部 401，共享计数等于 5——证明上限跨连接生效，且过了上限连正确口令也拒绝（否则"上限"只是装饰）。
+   - `surplus_connections_wait_for_a_slot`：占满 `MAX_CONNECTIONS` 后第 13 条连接**被排队而不是被丢弃**（300 ms 内不应答、套接字不被关闭），释放一个槽位后立刻拿到 200——钉住 `max_connections` 的排队语义（此前修过的 panic 就在这条路径上）。
+4. **✅ 基准（已完成）**：新增 `measures_setup_throughput`（ignored 测量），走 FairPlay 握手后连发 300 次 SETUP。实测：**debug 2 130 req/s（469 µs），release 15 062 req/s（66.4 µs）**。对照 §7：OPTIONS release ≈74k、`/info` release ≈31k——SETUP 贵在 FairPlay 解密 + plist 解析 + plist 构造 + SHA-512，属预期量级，且它是**每会话一次**的操作，不在热路径上。
 
 ### C. W6 DNS-SD 与访问控制
 1. 引入 `mdns-sd`（[ADR-0001](ADR-0001-network-stack.md)），广播 `_airplay._tcp`/`_raop._tcp`，TXT 与 `dnssd.c`/`dnssdint.h` 对齐；**契约**：`pk` == `PairingState::identity_public()`、`sf`/bit 27 与 `PinMode` 一致。

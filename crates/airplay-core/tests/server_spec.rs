@@ -876,6 +876,217 @@ async fn a_trace_reports_what_a_request_asked_and_what_it_got() {
     server.shutdown();
 }
 
+/// Concurrent connections keep their own pairing state.
+///
+/// One client's key exchange must not touch another's, and two clients asking at
+/// the same time must get two different receiver keys: that is the property the
+/// per-connection state exists for, and it is only visible under concurrency.
+#[tokio::test]
+async fn concurrent_connections_pair_independently() {
+    let state = pairing_state(PinMode::Fixed(1234));
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+
+    let mut tasks = Vec::new();
+    for index in 0..4u8 {
+        let address = server.address;
+        tasks.push(tokio::spawn(async move {
+            let mut client = TcpStream::connect(address).await.expect("connect");
+            let mut pending = Vec::new();
+            client
+                .write_all(&request_with_body("POST /pair-setup", "", &[0u8; 32]))
+                .await
+                .expect("write");
+            read_response(&mut client, &mut pending, Duration::from_secs(5))
+                .await
+                .expect("setup response");
+            // Each client uses its own key pair, so the shared secret differs;
+            // what must differ here is the receiver's ephemeral key.
+            let private = [0x40 + index; 32];
+            let public = airplay_core::crypto::x25519_public(&private);
+            let identity_seed = [0x50 + index; 32];
+            let identity_public = airplay_core::crypto::ed25519_public_key(&identity_seed);
+            let mut handshake = vec![1u8, 0, 0, 0];
+            handshake.extend_from_slice(&public);
+            handshake.extend_from_slice(&identity_public);
+            client
+                .write_all(&request_with_body("POST /pair-verify", "", &handshake))
+                .await
+                .expect("write");
+            let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+                .await
+                .expect("handshake response");
+            assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+            let (_, body) = response_parts(&response);
+            (body[..32].to_vec(), identity_public)
+        }));
+    }
+
+    let mut receiver_keys = Vec::new();
+    for task in tasks {
+        let (key, _) = task.await.expect("task");
+        receiver_keys.push(key);
+    }
+    receiver_keys.sort();
+    receiver_keys.dedup();
+    assert_eq!(
+        receiver_keys.len(),
+        4,
+        "every connection must get its own receiver key"
+    );
+    server.shutdown();
+}
+
+/// Failed passwords add up across connections, and the bound stops the guessing
+/// even for a client that then presents the right password.
+#[tokio::test]
+async fn password_failures_are_counted_across_connections() {
+    let password = "secret";
+    let state = Arc::new(
+        PairingState::with_random(
+            [0x5a; 32],
+            PinMode::Disabled,
+            Box::new(FixedRandom { next: 1 }),
+        )
+        .with_password(password),
+    );
+    let server = TestServer::start_with(local_config(), pairing_handlers(Arc::clone(&state))).await;
+
+    for attempt in 0..6 {
+        let mut client = server.connect().await;
+        let mut pending = Vec::new();
+        client
+            .write_all(&request_with_body("SETUP /stream", "", b"bplist00"))
+            .await
+            .expect("write");
+        let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("challenge");
+        let (head, _) = response_parts(&response);
+        let nonce = header_value(head, "WWW-Authenticate")
+            .and_then(|challenge| challenge.split_once("nonce=\""))
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(nonce, _)| nonce.to_owned())
+            .expect("challenge nonce");
+        // The last attempt uses the right password: past the bound it must be
+        // refused like the others, which is what makes the bound a bound.
+        let offered = if attempt < 5 { "wrong" } else { password };
+        let digest = airplay_core::pairing::digest_auth_response(
+            "SETUP", "client", "raop", offered, &nonce, "/stream", None, None, None,
+        );
+        let authorization = format!(
+            "Authorization: Digest username=\"client\", realm=\"raop\", nonce=\"{nonce}\", uri=\"/stream\", response=\"{digest}\"\r\n"
+        );
+        client
+            .write_all(&request_with_body(
+                "SETUP /stream",
+                &authorization,
+                b"bplist00",
+            ))
+            .await
+            .expect("write");
+        let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("answer");
+        assert!(
+            response.starts_with(b"RTSP/1.0 401 Unauthorized\r\n"),
+            "attempt {attempt}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    assert_eq!(state.password_failures(), 5);
+    server.shutdown();
+}
+
+/// More connections than the receiver serves wait for a slot instead of being
+/// dropped, and are served as soon as one is free.
+#[tokio::test]
+async fn surplus_connections_wait_for_a_slot() {
+    let server = TestServer::start_with(local_config(), || RouteHandlers::new(identity())).await;
+    let limit = airplay_core::server::MAX_CONNECTIONS;
+
+    // Fill every slot and hold the connections open without sending anything.
+    let mut holding = Vec::new();
+    for _ in 0..limit {
+        holding.push(server.connect().await);
+    }
+    let mut surplus = server.connect().await;
+    surplus
+        .write_all(&request_with_body("OPTIONS *", "", b""))
+        .await
+        .expect("write");
+    // The connection is queued, not refused: no answer arrives while the slots
+    // are taken, and the socket is not closed.
+    let mut pending = Vec::new();
+    assert!(
+        timeout(
+            Duration::from_millis(300),
+            read_response(&mut surplus, &mut pending, Duration::from_secs(5))
+        )
+        .await
+        .is_err(),
+        "a queued connection must not be answered before a slot frees up"
+    );
+
+    drop(holding.pop());
+    let response = read_response(&mut surplus, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("the queued connection is served once a slot frees up");
+    assert!(response.starts_with(b"RTSP/1.0 200 OK\r\n"));
+    server.shutdown();
+}
+
+/// Measures the rate of `SETUP` requests on one connection, after the FairPlay
+/// handshake they need. Ignored like the other measurement: it asserts nothing
+/// and takes seconds.
+#[tokio::test]
+#[ignore = "measurement, not an assertion"]
+async fn measures_setup_throughput() {
+    let server = TestServer::start_with(local_config(), || RouteHandlers::new(identity())).await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+    let mut challenge = [0u8; 16];
+    challenge[4] = 0x03;
+    let mut handshake = [0u8; 164];
+    handshake[4] = 0x03;
+    for request in [&challenge[..], &handshake[..]] {
+        client
+            .write_all(&request_with_body("POST /fp-setup", "", request))
+            .await
+            .expect("write");
+        read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("fairplay response");
+    }
+    let body = binary_plist(vec![
+        ("ekey", plist::Value::Data(vec![0x11; 72])),
+        ("eiv", plist::Value::Data(vec![0x22; 16])),
+        (
+            "streams",
+            plist::Value::Array(vec![plist::dictionary([(
+                "type",
+                plist::Value::from(96u64),
+            )])]),
+        ),
+    ]);
+    let request = request_with_body("SETUP /stream", "", &body);
+    let iterations = 300;
+
+    let started = std::time::Instant::now();
+    for _ in 0..iterations {
+        client.write_all(&request).await.expect("write");
+        read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("setup response");
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "SETUP: {iterations} requests in {elapsed:?} -> {:.1} req/s ({:.1} µs each)",
+        f64::from(iterations) / elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() * 1e6 / f64::from(iterations)
+    );
+    server.shutdown();
+}
+
 /// Deterministic random source, so a pairing test can predict the PIN, the salt
 /// and the ephemeral keys.
 struct FixedRandom {
