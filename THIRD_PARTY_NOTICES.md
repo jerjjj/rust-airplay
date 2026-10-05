@@ -14,6 +14,8 @@ The network control service (`crates/airplay-core/src/server/`) depends on [`tok
 
 The pairing service (`crates/airplay-core/src/server/pairing.rs`) draws its random values — the one-time PIN, the SRP salt and private value, and the X25519 key pair of `/pair-verify` — from [`getrandom`](https://crates.io/crates/getrandom) 0.2.15 (MIT OR Apache-2.0). It was already pinned as a transitive dependency of `rand_core` before it was declared directly, so the dependency set of the product is unchanged; the decision and the identity rules around it are in `docs/ADR-0002-pairing-identity.md`.
 
+The differential oracle under `tools/oracle/` is a **test tool**: it compiles the upstream sources named above (`srp.c`, `crypto.c`, `pairing.c`, `fairplay_playfair.c`, `playfair/*`, `logger.c`, `compat.c`, `utils.c`) into one program that prints vectors, and the ignored Rust tests compare them with this port. It is built from the local `upstream/UxPlay` checkout, it is never linked into the Rust product, its binary is ignored by Git, and it inherits the upstream notices listed above — including the MIT notice of Tom Cocagne's SRP implementation, which `srp.c` carries. `tools/oracle/README.md` records how to build and run it and what each vector checks.
+
 To obtain the reference checkout on a new machine:
 
 ```powershell

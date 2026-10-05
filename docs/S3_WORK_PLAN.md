@@ -169,6 +169,12 @@
 - 出口：oracle harness 可复现至少 SRP 与 PlayFair 的固定对照；fuzz 目标能跑满一轮无 panic。
 - 依赖：可与 W3–W6 并行，但 W5 之后应覆盖服务器路径。
 - 可行性更新（2026-10-05）：本机存在 `C:\msys64\ucrt64\bin\{gcc,clang,cmake,pkg-config}.exe`，上游 `CMakeLists.txt` 有 `if (WIN32)` 分支、`lib/` 的 POSIX 依赖很少，因此**C oracle 大概率可在本机构建**（待验证）。若成立，可一次结清：SRP `B` 最小编码的 255/256 分歧、PlayFair 差分、以及配对 CTR/GCM nonce 的上游对照——这些目前都只能靠"与独立实现一致"来支撑。plist 深度闸门（本轮新增）也应在此用 fuzz 覆盖。
+- **状态（2026-10-05）：oracle 已建成并结清三项**。`tools/oracle/`（`oracle.c` + `build.ps1` + `README.md`）用 UCRT64 gcc 编译上游 `srp.c`/`crypto.c`/`pairing.c`/`fairplay_playfair.c`/`playfair/*`，仅作测试工具、不进入产品。对照结果（`cargo test -p airplay-core --test upstream_oracle -- --ignored` 3 项 + `--lib -- --ignored upstream_verifier` 1 项，全部通过）：
+  - **CTR 偏移**：上游 AES-CTR 上下文产生 128 字节密钥流，服务端签名用第 1 段 64 字节、客户端签名在第 2 段 —— 与本移植逐字节一致（此前只有"独立实现一致"）。
+  - **GCM nonce**：`Pair-Setup-AES-IV` 基准末字节 +1（请求）/ +2（回复），双向 `epk`/`authTag` 逐字节一致。
+  - **PlayFair**：142 字节 setup 回复、32 字节 handshake 回复、72→16 字节密钥解封，全部逐字节一致。
+  - **SRP 最小编码**：上游 verifier **接受**本移植算出的 proof（`authenticated = 1`），且 M2 与会话密钥一致；包括服务端公钥恰好 **255 字节**（首字节为 0）的那一档 —— 即"最小编码 vs 左填充"的分歧在本移植与上游之间**不存在**。仍待真机确认的是 Apple 客户端的行为（无设备/抓包）。
+  - 过程中的一个上游调用约定：`srp_verifier_new` 会无条件写 `bytes_B`/`len_B`，传 NULL 会崩溃（上游的调用者必须给真实指针）；本移植的 `server_public()` 无此失败模式。
 
 ### W8 S3 验收与文档
 

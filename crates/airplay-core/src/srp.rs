@@ -321,6 +321,103 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2)
+            .map(|index| u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// Runs the upstream oracle with `arguments` and returns its output.
+    fn run_oracle(arguments: &[&str]) -> String {
+        let path = std::env::var("AIRPLAY_UPSTREAM_ORACLE")
+            .expect("set AIRPLAY_UPSTREAM_ORACLE to the oracle built by tools/oracle/build.ps1");
+        let output = std::process::Command::new(&path)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("running {path}: {error}"));
+        assert!(
+            output.status.success(),
+            "{path} {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("the oracle prints ascii")
+    }
+
+    /// Value of one `key = value` line of the oracle output.
+    fn oracle_field(output: &str, key: &str) -> String {
+        output
+            .lines()
+            .find(|line| line.starts_with(key))
+            .and_then(|line| line.split_once(" = "))
+            .map(|(_, value)| value.trim().to_owned())
+            .unwrap_or_else(|| panic!("the oracle did not print {key} in:\n{output}"))
+    }
+
+    /// The port has to agree with upstream's own verifier, in the ordinary case
+    /// and in the case where the server public value is 255 bytes long: that is
+    /// where "minimal encoding" and "padded to the modulus size" differ, and the
+    /// two sides only authenticate each other if they hash the same bytes.
+    #[test]
+    #[ignore = "needs the upstream C oracle; see tools/oracle/README.md"]
+    fn upstream_verifier_accepts_our_proof() {
+        for mode in ["plain", "short"] {
+            let output = run_oracle(&["srp-init", mode]);
+            let salt = unhex(&oracle_field(&output, "srp.salt"));
+            let verifier = unhex(&oracle_field(&output, "srp.verifier"));
+            let private_b = unhex(&oracle_field(&output, "srp.private_b"));
+            let server_public = unhex(&oracle_field(&output, "srp.server_public"));
+            let expected = if mode == "short" { 255 } else { 256 };
+            assert_eq!(server_public.len(), expected, "mode {mode}");
+
+            let server = AppleSrpServer::from_verifier(
+                b"AA:BB:CC:DD:EE:FF",
+                &verifier,
+                &salt.clone().try_into().expect("salt"),
+                &private_b,
+            )
+            .expect("server");
+            assert_eq!(
+                server.server_public().expect("public value"),
+                server_public,
+                "mode {mode}"
+            );
+
+            let exchange = test_client::exchange(
+                b"AA:BB:CC:DD:EE:FF",
+                b"1234",
+                &salt,
+                &[0x07; 32],
+                &server_public,
+            );
+            let response = server.respond(&exchange.public_key).expect("response");
+            assert_eq!(response.expected_proof, exchange.proof);
+
+            let output = run_oracle(&[
+                "srp-verify",
+                &hex(&salt),
+                &hex(&verifier),
+                &hex(&private_b),
+                &hex(&exchange.public_key),
+                &hex(&exchange.proof),
+            ]);
+            assert_eq!(
+                oracle_field(&output, "srp.authenticated"),
+                "1",
+                "mode {mode}: upstream refused our proof"
+            );
+            assert_eq!(
+                unhex(&oracle_field(&output, "srp.server_proof")),
+                response.server_proof.to_vec(),
+                "mode {mode}"
+            );
+            assert_eq!(
+                unhex(&oracle_field(&output, "srp.session_key")),
+                response.session_key.to_vec(),
+                "mode {mode}"
+            );
+        }
+    }
+
     #[test]
     fn expands_secret_to_two_apple_blocks() {
         let key = apple_session_key(&[1, 2, 3]);

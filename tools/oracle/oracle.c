@@ -1,0 +1,334 @@
+/*
+ * Upstream differential oracle for the Rust port.
+ *
+ * Compiles the upstream C sources of UxPlay (lib/srp.c, lib/crypto.c,
+ * lib/pairing.c, lib/fairplay_playfair.c, lib/playfair/*) into one small test
+ * program. It never links into the product; it exists so that claims like "the
+ * client signature uses the second half of the keystream" or "the server public
+ * value is hashed without padding" are checked against the C implementation
+ * instead of against a second reading of it.
+ *
+ * Modes:
+ *   crypto                          pair-verify keystream, pair-setup GCM nonces
+ *   fairplay                        PlayFair setup/handshake/decrypt vectors
+ *   srp-init [plain|short]          salt, verifier, server public value
+ *   srp-verify <salt> <verifier> <b> <A> <M>
+ *                                   whether upstream's verifier accepts our
+ *                                   client public value and proof, and what it
+ *                                   derives from them (all arguments are hex)
+ *
+ * Build: tools/oracle/build.ps1
+ */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "crypto.h"
+#include "fairplay.h"
+#include "logger.h"
+#include "srp.h"
+
+/* The names upstream uses for the one hash and group it supports; `pairing.h`
+ * defines them for its own translation unit. */
+#ifndef SRP_SHA
+#define SRP_SHA SRP_SHA1
+#endif
+#ifndef SRP_NG
+#define SRP_NG SRP_NG_2048
+#endif
+
+#define SRP_SALT_SIZE 16
+#define SRP_HASH_SIZE 20
+#define SESSION_KEY_SIZE 40
+#define SIG_SIZE 64
+#define GCM_TAG_SIZE 16
+
+static logger_t *logger;
+
+static void emit(const char *key, const unsigned char *data, int length) {
+    printf("%s = ", key);
+    for (int index = 0; index < length; index++) {
+        printf("%02x", data[index]);
+    }
+    printf("\n");
+}
+
+static void emit_int(const char *key, int value) { printf("%s = %d\n", key, value); }
+
+static void sequence(unsigned char *out, int length) {
+    for (int index = 0; index < length; index++) {
+        out[index] = (unsigned char)index;
+    }
+}
+
+static void sha512_labelled(const char *label, const unsigned char *secret, int secret_length,
+                            unsigned char out[64]) {
+    sha_ctx_t *ctx = sha_init();
+    sha_update(ctx, (const uint8_t *)label, (int)strlen(label));
+    sha_update(ctx, secret, secret_length);
+    sha_final(ctx, out, NULL);
+    sha_destroy(ctx);
+}
+
+static int hex_value(char digit) {
+    if (digit >= '0' && digit <= '9') return digit - '0';
+    if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+    if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+    return -1;
+}
+
+/* Parses a hex argument into `out`, which must hold `capacity` bytes. */
+static int parse_hex(const char *text, unsigned char *out, int capacity, int *length) {
+    int written = 0;
+    for (const char *cursor = text; cursor[0] != '\0' && cursor[1] != '\0'; cursor += 2) {
+        int high = hex_value(cursor[0]);
+        int low = hex_value(cursor[1]);
+        if (high < 0 || low < 0 || written >= capacity) {
+            return -1;
+        }
+        out[written++] = (unsigned char)((high << 4) | low);
+    }
+    *length = written;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ SRP --- */
+
+static const char *srp_username = "AA:BB:CC:DD:EE:FF";
+static const char *srp_password = "1234";
+
+static void srp_init(int short_value) {
+    const unsigned char *salt = NULL;
+    int salt_length = 0;
+    const unsigned char *verifier = NULL;
+    int verifier_length = 0;
+    srp_create_salted_verification_key(SRP_SHA, SRP_NG, srp_username,
+                                      (const unsigned char *)srp_password,
+                                      (int)strlen(srp_password), &salt, &salt_length, &verifier,
+                                      &verifier_length, NULL, NULL);
+    if (salt == NULL || verifier == NULL) {
+        printf("srp.error = no verifier\n");
+        return;
+    }
+    emit("srp.salt", salt, salt_length);
+    emit("srp.verifier", verifier, verifier_length);
+
+    unsigned char private_b[32];
+    for (int index = 0; index < 32; index++) {
+        private_b[index] = 0x02;
+    }
+    const unsigned char *B = NULL;
+    int B_length = 0;
+    if (short_value) {
+        /* Find a private value whose server public value is 255 bytes, that is
+         * one with a leading zero byte: the case where "minimal encoding" and
+         * "left padded to the modulus size" disagree. */
+        for (unsigned int attempt = 0; attempt < 65536; attempt++) {
+            unsigned char candidate[32];
+            for (int index = 0; index < 32; index++) {
+                candidate[index] = 0x10;
+            }
+            candidate[0] = (unsigned char)(attempt >> 8);
+            candidate[1] = (unsigned char)attempt;
+            srp_create_server_ephemeral_key(SRP_SHA, SRP_NG, verifier, verifier_length, candidate,
+                                           (int)sizeof(candidate), &B, &B_length, NULL, NULL, 1);
+            if (B != NULL && B_length == 255) {
+                memcpy(private_b, candidate, sizeof(private_b));
+                break;
+            }
+            if (B != NULL) {
+                free((void *)B);
+                B = NULL;
+            }
+        }
+        if (B == NULL || B_length != 255) {
+            printf("srp.error = no 255 byte public value found\n");
+            return;
+        }
+    } else {
+        srp_create_server_ephemeral_key(SRP_SHA, SRP_NG, verifier, verifier_length, private_b,
+                                       (int)sizeof(private_b), &B, &B_length, NULL, NULL, 1);
+    }
+    emit("srp.private_b", private_b, sizeof(private_b));
+    emit("srp.server_public", B, B_length);
+    emit_int("srp.server_public_length", B_length);
+}
+
+static void srp_verify(int argc, char **argv) {
+    if (argc < 7) {
+        printf("srp.error = srp-verify needs salt, verifier, b, A and M\n");
+        return;
+    }
+    unsigned char salt[SRP_SALT_SIZE];
+    unsigned char verifier[1024];
+    unsigned char private_b[64];
+    unsigned char client_public[1024];
+    unsigned char proof[SRP_HASH_SIZE];
+    int salt_length = 0;
+    int verifier_length = 0;
+    int private_b_length = 0;
+    int client_public_length = 0;
+    int proof_length = 0;
+    if (parse_hex(argv[2], salt, sizeof(salt), &salt_length) < 0 ||
+        parse_hex(argv[3], verifier, sizeof(verifier), &verifier_length) < 0 ||
+        parse_hex(argv[4], private_b, sizeof(private_b), &private_b_length) < 0 ||
+        parse_hex(argv[5], client_public, sizeof(client_public), &client_public_length) < 0 ||
+        parse_hex(argv[6], proof, sizeof(proof), &proof_length) < 0) {
+        printf("srp.error = malformed hex argument\n");
+        return;
+    }
+    if (proof_length != SRP_HASH_SIZE) {
+        printf("srp.error = the proof has to be %d bytes\n", SRP_HASH_SIZE);
+        return;
+    }
+    printf("# lengths: salt %d, verifier %d, b %d, A %d, M %d\n", salt_length, verifier_length,
+           private_b_length, client_public_length, proof_length);
+    fflush(stdout);
+    /* The constructor writes its own server public value through these two, so
+     * they cannot be NULL: upstream dereferences them unconditionally. */
+    const unsigned char *B = NULL;
+    int B_length = 0;
+    struct SRPVerifier *state =
+        srp_verifier_new(SRP_SHA, SRP_NG, srp_username, salt, salt_length, verifier,
+                         verifier_length, client_public, client_public_length, private_b,
+                         private_b_length, &B, &B_length, NULL, NULL, 1);
+    if (state == NULL) {
+        printf("srp.error = no verifier\n");
+        return;
+    }
+    if (B != NULL) {
+        emit("srp.verifier_public", B, B_length);
+    }
+    printf("# verifier created\n");
+    fflush(stdout);
+    const unsigned char *M2 = NULL;
+    srp_verifier_verify_session(state, proof, &M2);
+    printf("# session verified\n");
+    fflush(stdout);
+    emit_int("srp.authenticated", srp_verifier_is_authenticated(state));
+    if (M2 != NULL) {
+        emit("srp.server_proof", M2, SRP_HASH_SIZE);
+    }
+    int session_key_length = 0;
+    const unsigned char *session_key = srp_verifier_get_session_key(state, &session_key_length);
+    if (session_key != NULL) {
+        emit("srp.session_key", session_key, session_key_length);
+    }
+    srp_verifier_delete(state);
+}
+
+/* --------------------------------------------------------- pair-verify --- */
+
+static void crypto_vectors(void) {
+    unsigned char shared[32];
+    sequence(shared, sizeof(shared));
+
+    unsigned char key_hash[64];
+    unsigned char iv_hash[64];
+    sha512_labelled("Pair-Verify-AES-Key", shared, sizeof(shared), key_hash);
+    sha512_labelled("Pair-Verify-AES-IV", shared, sizeof(shared), iv_hash);
+    emit("verify.shared", shared, sizeof(shared));
+    emit("verify.key", key_hash, 16);
+    emit("verify.iv", iv_hash, 16);
+
+    aes_ctx_t *cipher = aes_ctr_init(key_hash, iv_hash);
+    unsigned char keystream[128];
+    memset(keystream, 0, sizeof(keystream));
+    aes_ctr_encrypt(cipher, keystream, keystream, sizeof(keystream));
+    aes_ctr_destroy(cipher);
+    emit("verify.keystream0", keystream, SIG_SIZE);
+    emit("verify.keystream1", keystream + SIG_SIZE, SIG_SIZE);
+
+    unsigned char session_key[SESSION_KEY_SIZE];
+    sequence(session_key, sizeof(session_key));
+    emit("setup.session_key", session_key, sizeof(session_key));
+    sha512_labelled("Pair-Setup-AES-Key", session_key, sizeof(session_key), key_hash);
+    sha512_labelled("Pair-Setup-AES-IV", session_key, sizeof(session_key), iv_hash);
+    emit("setup.key", key_hash, 16);
+
+    unsigned char decrypt_iv[16];
+    unsigned char encrypt_iv[16];
+    memcpy(decrypt_iv, iv_hash, 16);
+    memcpy(encrypt_iv, iv_hash, 16);
+    decrypt_iv[15]++;
+    encrypt_iv[15] += 2;
+    emit("setup.decrypt_iv", decrypt_iv, sizeof(decrypt_iv));
+    emit("setup.encrypt_iv", encrypt_iv, sizeof(encrypt_iv));
+
+    unsigned char client_public[32];
+    sequence(client_public, sizeof(client_public));
+    unsigned char server_public[32];
+    for (int index = 0; index < 32; index++) {
+        server_public[index] = (unsigned char)(index + 0x20);
+    }
+
+    unsigned char ciphertext[32];
+    unsigned char tag[GCM_TAG_SIZE];
+    gcm_encrypt(client_public, sizeof(client_public), ciphertext, key_hash, decrypt_iv, tag);
+    emit("setup.request_epk", ciphertext, sizeof(ciphertext));
+    emit("setup.request_tag", tag, sizeof(tag));
+
+    gcm_encrypt(server_public, sizeof(server_public), ciphertext, key_hash, encrypt_iv, tag);
+    emit("setup.reply_epk", ciphertext, sizeof(ciphertext));
+    emit("setup.reply_tag", tag, sizeof(tag));
+
+    unsigned char opened[32];
+    int opened_length =
+        gcm_decrypt(ciphertext, sizeof(ciphertext), opened, key_hash, encrypt_iv, tag);
+    emit_int("setup.reply_opened_length", opened_length);
+    emit("setup.reply_opened", opened, opened_length > 0 ? opened_length : 0);
+}
+
+/* ------------------------------------------------------------ FairPlay --- */
+
+static void fairplay_vectors(void) {
+    fairplay_t *fairplay = fairplay_init(logger);
+    if (fairplay == NULL) {
+        printf("fairplay.error = no session\n");
+        return;
+    }
+
+    unsigned char request[16];
+    memset(request, 0, sizeof(request));
+    request[4] = 0x03;
+    unsigned char response[142];
+    memset(response, 0, sizeof(response));
+    emit_int("fairplay.setup", fairplay_setup(fairplay, request, response));
+    emit("fairplay.setup_response", response, sizeof(response));
+
+    unsigned char handshake[164];
+    memset(handshake, 0, sizeof(handshake));
+    handshake[4] = 0x03;
+    unsigned char handshake_response[32];
+    memset(handshake_response, 0, sizeof(handshake_response));
+    emit_int("fairplay.handshake", fairplay_handshake(fairplay, handshake, handshake_response));
+    emit("fairplay.handshake_response", handshake_response, sizeof(handshake_response));
+
+    unsigned char encrypted_key[72];
+    sequence(encrypted_key, sizeof(encrypted_key));
+    unsigned char decrypted_key[16];
+    memset(decrypted_key, 0, sizeof(decrypted_key));
+    emit_int("fairplay.decrypt", fairplay_decrypt(fairplay, encrypted_key, decrypted_key));
+    emit("fairplay.decrypted_key", decrypted_key, sizeof(decrypted_key));
+
+    fairplay_destroy(fairplay);
+}
+
+int main(int argc, char **argv) {
+    logger = logger_init();
+    const char *mode = argc > 1 ? argv[1] : "crypto";
+    if (strcmp(mode, "crypto") == 0) {
+        crypto_vectors();
+    } else if (strcmp(mode, "fairplay") == 0) {
+        fairplay_vectors();
+    } else if (strcmp(mode, "srp-init") == 0) {
+        srp_init(argc > 2 && strcmp(argv[2], "short") == 0);
+    } else if (strcmp(mode, "srp-verify") == 0) {
+        srp_verify(argc, argv);
+    } else {
+        printf("usage: oracle [crypto|fairplay|srp-init [short]|srp-verify <salt> <verifier> <b> <A> <M>]\n");
+    }
+    logger_destroy(logger);
+    return 0;
+}

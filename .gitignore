@@ -1,5 +1,6 @@
 /target/
 /upstream/
+/tools/oracle/oracle.exe
 *.pcap
 *.pcapng
 *.key
