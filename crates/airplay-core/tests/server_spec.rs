@@ -796,3 +796,81 @@ async fn pair_verify_without_a_pin_falls_back_to_the_legacy_setup() {
     assert!(body.is_empty());
     server.shutdown();
 }
+
+#[tokio::test]
+async fn rejects_a_head_that_breaks_the_upstream_field_bounds() {
+    let server = TestServer::start(local_config(), RouteHandlers::new(identity())).await;
+    let mut client = server.connect().await;
+    // Twenty-one fields stay far below the 64 KiB head bound, but upstream
+    // answers them with 431 (`upstream/UxPlay@3dbf7cee:lib/raop.c:225-238`).
+    let mut request = String::from("GET /info RTSP/1.0\r\n");
+    for index in 0..21 {
+        request.push_str(&format!("X-{index}: v\r\n"));
+    }
+    request.push_str("\r\n");
+    client.write_all(request.as_bytes()).await.expect("write");
+
+    let mut pending = Vec::new();
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("rejection");
+    let text = String::from_utf8_lossy(&response).to_string();
+    assert!(
+        text.starts_with("RTSP/1.0 431 Request Header Fields Too Large\r\n"),
+        "{text}"
+    );
+    // The rejection is bare, as it is upstream: it is written before the
+    // envelope headers.
+    assert!(!text.contains("Server:"));
+    let mut rest = Vec::new();
+    assert_eq!(client.read_to_end(&mut rest).await.expect("read"), 0);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn rejects_a_request_that_asks_for_a_transfer_encoding() {
+    let server = TestServer::start(local_config(), RouteHandlers::new(identity())).await;
+    let mut client = server.connect().await;
+    client
+        .write_all(b"POST /pair-setup RTSP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+        .await
+        .expect("write");
+
+    let mut pending = Vec::new();
+    let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+        .await
+        .expect("rejection");
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("RTSP/1.0 400 Bad Request\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let mut rest = Vec::new();
+    assert_eq!(client.read_to_end(&mut rest).await.expect("read"), 0);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pairing_routes_are_not_implemented_without_a_pairing_state() {
+    // The default handlers serve no pairing: a caller that wants it adds a
+    // `PairingState` with `RouteHandlers::with_pairing`.
+    let server = TestServer::start(local_config(), RouteHandlers::new(identity())).await;
+    let mut client = server.connect().await;
+    let mut pending = Vec::new();
+    for request in [
+        &b"POST /pair-pin-start RTSP/1.0\r\nCSeq: 1\r\n\r\n"[..],
+        b"POST /pair-setup RTSP/1.0\r\nCSeq: 2\r\n\r\n",
+        b"POST /pair-verify RTSP/1.0\r\nCSeq: 3\r\n\r\n",
+    ] {
+        client.write_all(request).await.expect("write");
+        let response = read_response(&mut client, &mut pending, Duration::from_secs(5))
+            .await
+            .expect("response");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("RTSP/1.0 501 Not Implemented\r\n"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    server.shutdown();
+}

@@ -33,6 +33,16 @@
 //!   used (`raop_handlers.h:366`, `:408-409`), and the steps whose missing state
 //!   upstream dereferences as a null pointer (`pairing.c:560`, `:603`) answer
 //!   `470` instead.
+//! * A `/pair-verify` step 1 that the injected registration predicate refuses
+//!   stays refused for the rest of the connection, and only a `/pair-setup-pin`
+//!   that proves the PIN lifts it. Upstream stops consulting the list once the
+//!   connection is in its setup state (`raop_handlers.h:470-477`), so a client it
+//!   has just turned away only has to ask a second time, which would make an
+//!   injected list useless as access control.
+//! * A key exchange key that yields an all-zero shared secret is refused. A
+//!   low-order point would let the peer derive the keystream without holding a
+//!   private key, and upstream's OpenSSL derive fails where the port has to
+//!   check for itself (`crypto.c:245-265`).
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -436,6 +446,7 @@ pub(crate) struct PairingSession {
     ecdh_public: Option<[u8; X25519_KEY_SIZE]>,
     ecdh_client_public: Option<[u8; X25519_KEY_SIZE]>,
     ecdh_shared: Option<[u8; X25519_KEY_SIZE]>,
+    registration_refused: bool,
 }
 
 impl PairingSession {
@@ -450,6 +461,7 @@ impl PairingSession {
             ecdh_public: None,
             ecdh_client_public: None,
             ecdh_shared: None,
+            registration_refused: false,
         }
     }
 
@@ -596,6 +608,9 @@ impl PairingSession {
         self.client_public_key = client_public.try_into().ok();
         self.session_key = None;
         self.status = Status::Setup;
+        // A client that just proved it knows the PIN is no longer a refused one,
+        // which is what keeps a legitimate pairing able to verify afterwards.
+        self.registration_refused = false;
         self.shared.record_success();
         Ok(PairingReply::Plist(plist::dictionary([
             ("epk", plist::Value::Data(sealed)),
@@ -628,6 +643,14 @@ impl PairingSession {
             }
             self.status = Status::Setup;
             register_check = true;
+        } else if self.registration_refused {
+            // Upstream stops checking the client as soon as the connection is in
+            // its setup state (`:470-477`), so a client it just refused only has
+            // to ask again. A refusal therefore stays for the rest of this
+            // connection, which is what makes an injected registration list an
+            // access control rather than a single-shot gate; a client that
+            // authenticates with the PIN clears it below.
+            register_check = true;
         }
         if body.len() < 4 {
             return Ok(PairingReply::Silence);
@@ -656,6 +679,7 @@ impl PairingSession {
                 // (`raop_handlers.h:504-516`); a caller that needs the check
                 // injects one.
                 if !check(&client_identity) {
+                    self.registration_refused = true;
                     return Ok(PairingReply::Silence);
                 }
             }
@@ -1295,11 +1319,47 @@ mod tests {
         );
         let mut session = PairingSession::new(Arc::clone(&shared));
         let client = VerifyClient::new();
-        assert!(matches!(
-            session.verify(&client.handshake_body()),
-            Ok(PairingReply::Silence)
-        ));
+        // Upstream stops checking the list once the connection reaches its setup
+        // state, so a refused client would only have to ask again; the refusal
+        // has to survive the retry.
+        for attempt in 0..2 {
+            assert!(
+                matches!(
+                    session.verify(&client.handshake_body()),
+                    Ok(PairingReply::Silence)
+                ),
+                "attempt {attempt} must be refused"
+            );
+        }
         assert_eq!(session.status, Status::Setup);
+
+        // Proving the PIN is what lifts the refusal, so a client that pairs on
+        // this connection can still verify on it afterwards.
+        session.pin_start().expect("pin start");
+        let username = b"AA:BB:CC:DD:EE:FF";
+        let (exchange, _) = setup_pin_two_steps(&mut session, b"1234", username);
+        let (epk, auth_tag) = seal_step_three(&exchange.session_key, &client.identity_public);
+        session
+            .setup_pin(&step_three_request(epk, auth_tag))
+            .expect("step 3");
+        let reply = session.verify(&client.handshake_body()).expect("handshake");
+        assert_eq!(body_of(&reply).len(), 96);
+    }
+
+    #[test]
+    fn pair_verify_accepts_a_registered_client() {
+        let shared = Arc::new(
+            PairingState::with_random(
+                IDENTITY_SEED,
+                PinMode::Fixed(1234),
+                Box::new(FixedRandom::new()),
+            )
+            .with_client_registered(|_| true),
+        );
+        let mut session = PairingSession::new(Arc::clone(&shared));
+        let client = VerifyClient::new();
+        let reply = session.verify(&client.handshake_body()).expect("handshake");
+        assert_eq!(body_of(&reply).len(), 96);
     }
 
     #[test]

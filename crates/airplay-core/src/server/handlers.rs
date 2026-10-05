@@ -82,10 +82,14 @@ pub struct DeviceIdentity {
     pub name: String,
     /// `model` value, [`DEFAULT_MODEL`] unless the caller overrides it.
     pub model: String,
-    /// Curve25519 public key for pairing, sent as the `pk` data value.
-    /// Upstream reads it from its persistent key file
-    /// (`upstream/UxPlay/lib/raop_handlers.h:126-131`); pairing itself has not
-    /// been ported, so a caller supplies it.
+    /// Ed25519 public key of the receiver, sent as the `pk` data value
+    /// (`upstream/UxPlay/lib/raop_handlers.h:126-131`).
+    ///
+    /// [`RouteHandlers::with_pairing`] replaces it with
+    /// [`PairingState::identity_public`], so that a client can never cache one
+    /// identity from `/info` and be authenticated with another one from the
+    /// pairing exchange (see `docs/ADR-0002-pairing-identity.md`). A caller that
+    /// advertises a key here without pairing has to keep that invariant itself.
     pub public_key: Vec<u8>,
     /// `features` bitmap, [`DEFAULT_FEATURES`] unless the caller overrides it.
     pub features: u64,

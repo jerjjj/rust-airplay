@@ -17,7 +17,7 @@
 //! * At most [`ServerConfig::max_connections`] connections are served at once.
 //!   Like upstream, the listener stops accepting while the limit is reached
 //!   instead of rejecting a client, so further connections wait in the kernel
-//!   backlog (`upstream/UxPlay/lib/httpd.c:389-402`).
+//!   backlog (`upstream/UxPlay@3dbf7cee:lib/httpd.c:453-462`).
 //! * A connection that is idle for [`ServerConfig::idle_timeout`] is closed, and
 //!   bytes that continue an unfinished request do not refresh that deadline.
 //!   Upstream added the same limit later than the port started
@@ -33,7 +33,7 @@
 //!
 //! * Upstream peeks the first eight bytes of every new request and treats
 //!   `HTTP/1.1` and `EVENT/1.0` as the response on a *reverse* connection it
-//!   opened itself (`upstream/UxPlay/lib/httpd.c:498-556`). The reverse
+//!   opened itself (`upstream/UxPlay@3dbf7cee:lib/httpd.c:505-540`). The reverse
 //!   connection belongs to the event channel work, so the port does not open or
 //!   recognise one yet.
 //! * Upstream answers a request whose route it does not implement with its
@@ -67,7 +67,7 @@ pub use pairing::{
 };
 
 /// Connections upstream serves at the same time
-/// (`upstream/UxPlay/lib/httpd.c:154`), which is the default of
+/// (`upstream/UxPlay@3dbf7cee:lib/httpd.c:157`), which is the default of
 /// [`ServerConfig::max_connections`].
 pub const MAX_CONNECTIONS: usize = 12;
 
@@ -170,7 +170,7 @@ impl Server {
     ///
     /// Returns the listener error. A connection that fails while it is served is
     /// not an error of the service: upstream logs it and keeps accepting
-    /// (`upstream/UxPlay/lib/httpd.c:359-618`), and so does the port.
+    /// (`upstream/UxPlay@3dbf7cee:lib/httpd.c:371-640`), and so does the port.
     ///
     /// # Examples
     ///

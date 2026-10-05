@@ -655,7 +655,7 @@ pub enum ControlOutcome {
     /// (`upstream/UxPlay/lib/raop.c:247-250`) and a request without `CSeq` while
     /// HLS support is off and the request is not a BLE beacon response
     /// (`upstream/UxPlay/lib/raop.c:263-266`). Its httpd then sends no response
-    /// at all (`upstream/UxPlay/lib/httpd.c:587-612`).
+    /// at all (`upstream/UxPlay@3dbf7cee:lib/httpd.c:588-625`).
     Ignored,
 }
 

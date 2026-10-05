@@ -21,6 +21,8 @@
 
 结论：S3 已移植的可观测行为在上游 `3dbf7cee` 下**只有空闲超时一处需要对齐**（已改）；其余差异都落在尚未移植的区域，已登记为 W6/S4 的输入。
 
+**引用约定与失效审计**：本仓库的行号引用有两种形式——老引用写成 `upstream/UxPlay/lib/x.c:1-2`（按基线 `57ea8341` 解释），新引用一律写成 `upstream/UxPlay@<hash>:lib/x.c:1-2`。本次逐文件审计了哪些老引用在 `3dbf7cee` 下仍然成立：`httpd.c` 的 8 处已全部改为带 hash 的新行号；`raop.c` 的改动只发生在第 94 行（空格）与第 885 行之后（新增 `get_codec_string`），因此我们引用的 `raop.c` 行号（均 < 885）仍成立；`raop_handlers.h` 的唯一 hunk 在第 1141 行之后，我们引用的行号（均 < 1141）仍成立；`pairing.c`、`srp.c`、`crypto.c`、`http_response.c`、`global.h`、`dnssdint.h`、`playfair/*` 未改动；`http_handlers.h` 有改动但我们只按文件名引用、不带行号。带行号的老引用因此**不需要批量重写**，但新增引用必须带 hash。
+
 ## 1. 基线快照
 
 - 工作区：`crates/airplay-core` + `crates/airplay-cli`；`resolver = "3"`、edition 2024、MSRV 1.85、GPL-3.0-or-later、`publish = false`。
@@ -163,7 +165,7 @@
 | 3 | ~~W3~~ → ~~W5a~~ → ~~W5b~~ | W3、W5a、W5b 已完成；配对身份密钥来源见 [ADR-0002](ADR-0002-pairing-identity.md) |
 | 4 | W6、W7、W8 | W6/W7 可并行，W8 收尾；D9 剩余（`pairing.rs` 签名往返已随 W5b 补齐，仍缺 `verify_pair_signature` 的独立向量）与 D10（其余 7 个模块的 `missing_docs`）可并入 |
 
-写作用域互不重叠：W3 独占 `control.rs`，W4 新建 `plist.rs`，W5 新建 `server/`，W6 新建 `discovery.rs`，W7 只碰 `tests/` 与 fuzz 目标。
+写作用域：W4 新建 `plist.rs`，W5a 新建 `server/`，W6 新建 `discovery.rs`，W7 只碰 `tests/` 与 fuzz 目标。**W3 之后 `control.rs` 不再由任何工作包独占**：W5b 起它随需要改动（`RouteReply::closing`、`ControlResponse::close_after_reply`、`request_length`/`parse_first` 与 wire 上限的映射），W5b 还改动了 `crypto.rs`、`pairing.rs`、`srp.rs`；改动 `control.rs`/`wire.rs` 这类共享文件时必须在提交信息里写明影响面与对应回归用例。
 
 ## 6. 需要用户决策
 
@@ -202,6 +204,7 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 | 2026-09-20 | W4 | `8e72227` | `plist.rs` + `plistlib` 双向夹具（`tests/plist_spec.rs`、`tools/plist_fixtures.py`）；51 单元 + 7 + 5 集成；`plist 1.8.0` 落地 |
 | 2026-09-20 | W3 | `833d8c4` | `control.rs` 无状态路由 + 有状态会话：`ControlOutcome`、`X-Apple-Session-ID` 绑定、可选 `CSeq`、协议回显、`Audio-Latency`、`Connection: close`、431/400 映射；`tests/control_spec.rs` 改 15 个正向断言；58 单元 + 15 + 5 集成 |
 | 2026-09-20 | W5a | `322e01b` | `server/` 三层 + `RouteHandler` 委派 + `request_length`；`/info`、`/feedback`、`/fp-setup`；`tests/server_spec.rs` 9 个真实 socket 用例（含修掉「缓冲区已有完整请求仍阻塞 read」的缺陷）；67 单元 + 15 + 5 + 9 集成 |
-| 2026-09-20 | W5b | 本次提交 | 配对路由 `/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify`（`server/pairing.rs`）；修掉 `/pair-verify` 第二步 CTR 偏移、补 GCM 加密原语与 `AppleSrpServer::server_public()`、`RouteReply::closing`；拒绝上游「跳过 proof 校验即可完成配对的」Critical 缺陷；83 单元 + 15 + 5 + 15 集成 |
+| 2026-09-20 | W5b | `7466e03` `53d9362` | 配对路由 `/pair-pin-start`、`/pair-setup-pin`、`/pair-setup`、`/pair-verify`（`server/pairing.rs`）；修掉 `/pair-verify` 第二步 CTR 偏移、补 GCM 加密原语与 `AppleSrpServer::server_public()`、`RouteReply::closing`；拒绝上游「跳过 proof 校验即可完成配对的」Critical 缺陷；83 单元 + 15 + 5 + 15 集成 |
+| 2026-10-05 | 阶段性验收 | `f55e633` `5dad9a4` 本次提交 | 上游核对到 `3dbf7cee`（§0）＋空闲超时对齐 60 s（§7 性能基线）；评审团（架构/安全/验收）发现并修掉：`check_register` 谓词可被重发 `/pair-verify` 绕过（阻断，端到端复现）、缺上游三个头部上限（21 字段/65 字节字段名/1025 字节值应 431）、`Transfer-Encoding` 被忽略导致分帧错位、超长 protocol/version 被接受并回显、重复与带符号 `Content-Length` 被接受、`max_connections` 超上限时 `Server::bind` panic；**本次提交**含这些修复与 89 单元 + 15 + 5 + 18 集成（另 1 个默认忽略的性能测量用例） |
 
 提交与工作包对应：D1 `3fc20c0`；D2 `95fbf37`；D5 `c9467ca`；D6 `323ce83`；D3/D4 `7888a64`；D7/D8 `5a97d8b`。

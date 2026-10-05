@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One accepted control connection.
 //!
-//! The loop is the port of `upstream/UxPlay/lib/httpd.c:359-618`: read bytes,
+//! The loop is the port of `upstream/UxPlay@3dbf7cee:lib/httpd.c:371-640`: read bytes,
 //! frame them into requests, answer each one, and stop when the peer closes or
 //! when the connection stops making progress.
 
@@ -112,7 +112,7 @@ pub(super) async fn serve<H: RouteHandler>(
 ///
 /// A rejected request cannot be framed, so the bytes after it cannot be trusted
 /// either: upstream removes the connection when its parser rejects a request
-/// (`upstream/UxPlay/lib/httpd.c:559-569`), and the port answers once and then
+/// (`upstream/UxPlay@3dbf7cee:lib/httpd.c:574-585`), and the port answers once and then
 /// closes instead of guessing where the next request starts.
 async fn reject<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
@@ -126,7 +126,7 @@ async fn reject<W: AsyncWriteExt + Unpin>(
 }
 
 /// Half-closes the write side, which is what upstream does before it closes a
-/// connection (`upstream/UxPlay/lib/httpd.c:207-246`).
+/// connection (`upstream/UxPlay@3dbf7cee:lib/httpd.c:214-254`).
 async fn close_connection<W: AsyncWriteExt + Unpin>(writer: &mut W) -> Result<()> {
     match writer.shutdown().await {
         Ok(()) => Ok(()),
