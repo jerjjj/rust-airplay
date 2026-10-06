@@ -337,16 +337,24 @@ pub fn into_annex_b(payload: &mut [u8]) -> Result<usize, NalError> {
 /// there), and this type is that position, with [`StreamCipher::restart`] for the
 /// re-key.
 ///
-/// # One rule is deliberately missing
+/// # This is not the rule upstream follows, and must not be wired up
 ///
-/// Upstream also accounts for a packet whose length is not a whole number of
-/// blocks, because the cipher it drives advances by blocks: the leftover bytes of
-/// the last block have to be skipped before the next packet starts. This type does
-/// not do that yet, and the reason is that the exact rule has to be read out of
-/// `mirror_buffer.c` rather than guessed - a guess here shows up as video that
-/// decodes into noise from the second packet on, which is far harder to notice
-/// than an error. `docs/S4_WORK_PLAN.md` records it as the next step of this
-/// slice, and nothing wires this cipher into a stream before it lands.
+/// Reading `mirror_buffer.c` after this was written showed that upstream does
+/// **not** run one continuous keystream across packets, which is what this type
+/// models. It restarts the counter at the beginning of every packet
+/// (`aes_ctr_start_fresh_block`), decrypts the whole blocks from there, and treats
+/// the packet's tail separately: the remaining bytes are decrypted as one whole
+/// block, the bytes the packet uses are taken from it, and the **unused keystream
+/// bytes of that block are kept** (upstream's `og` buffer and `nextDecryptCount`)
+/// to be XORed into the head of the next packet.
+///
+/// So a correct implementation carries `16 - (length % 16)` keystream bytes from
+/// one packet to the next *and* restarts the counter per packet, which is a
+/// different mechanism from the `advanced` counter below. Until that lands, this
+/// type is a placeholder: it is not wired into any stream, and the test that
+/// "two packets equal one payload" only states what this placeholder does, not
+/// what a client's video needs. `docs/S4_WORK_PLAN.md` records the rule above as
+/// the next step of this slice.
 pub struct StreamCipher {
     state: crate::crypto::Aes128CtrState,
     advanced: usize,
