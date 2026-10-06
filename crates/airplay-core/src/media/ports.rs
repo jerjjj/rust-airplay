@@ -149,6 +149,87 @@ impl MediaSockets {
         let length = self.timing.recv(&mut buffer).await?;
         Ok(buffer[..length].to_vec())
     }
+
+    /// Sends the clock exchange's request to a client.
+    ///
+    /// The receiver starts this exchange, not the client: upstream sends its first
+    /// request as soon as `SETUP` is answered and keeps sending them
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_ntp.c:614-618`, `:839-841`). A session
+    /// that waits to be asked never ticks, and a client with no clock to agree on
+    /// has no reason to send its media.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error when the request cannot be sent.
+    pub async fn send_timing_request(
+        &self,
+        client: SocketAddr,
+        request: &[u8],
+    ) -> std::io::Result<usize> {
+        self.timing.send_to(request, client).await
+    }
+}
+
+/// One audio session's sockets, and what has arrived on them.
+///
+/// The counters exist because "no sound" has two very different causes — a client
+/// that never sent anything, and a receiver that threw everything away — and a
+/// session that cannot tell them apart cannot be diagnosed. They are read by a
+/// caller that logs, not by the receive path itself.
+#[derive(Debug, Default)]
+pub struct Received {
+    timing: std::sync::atomic::AtomicU64,
+    control: std::sync::atomic::AtomicU64,
+    data: std::sync::atomic::AtomicU64,
+    unusable: std::sync::atomic::AtomicU64,
+    last_error: std::sync::Mutex<Option<String>>,
+}
+
+impl Received {
+    /// Datagrams that arrived on the timing port.
+    pub fn timing(&self) -> u64 {
+        self.timing.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Datagrams that arrived on the control port.
+    pub fn control(&self) -> u64 {
+        self.control.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Datagrams that arrived on the data port.
+    pub fn data(&self) -> u64 {
+        self.data.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Datagrams that arrived and could not be used.
+    pub fn unusable(&self) -> u64 {
+        self.unusable.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The most recent reason a datagram was thrown away.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records a datagram that could not be used, keeping the first reason.
+    ///
+    /// The first one is kept rather than the last: a stream that has gone wrong
+    /// usually keeps saying the same thing, and the first is the one that was not
+    /// caused by the stream already being wrong.
+    fn reject(&self, reason: String) {
+        self.unusable
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut slot = self
+            .last_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+    }
 }
 
 impl MediaSockets {
@@ -157,8 +238,9 @@ impl MediaSockets {
     ///
     /// The three sockets are watched together, because a session that read them
     /// one after another would stop draining audio while it waited for a control
-    /// packet. A datagram this session cannot use is ignored rather than fatal:
-    /// a client that sends something unexpected does not end the session.
+    /// packet. A datagram this session cannot use is counted in `received` and
+    /// then ignored rather than being fatal: a client that sends something
+    /// unexpected does not end the session.
     ///
     /// # Errors
     ///
@@ -169,8 +251,10 @@ impl MediaSockets {
     pub async fn serve(
         &self,
         session: &mut AudioSession,
+        received: &Received,
         mut on_frame: impl FnMut(AudioFrame),
     ) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
         use tokio::select;
         let mut audio = [0u8; MAX_DATAGRAM];
         let mut control = [0u8; MAX_DATAGRAM];
@@ -179,18 +263,26 @@ impl MediaSockets {
             select! {
                 result = self.data.recv(&mut audio) => {
                     let length = result?;
-                    if let Ok(frames) = session.receive(&audio[..length]) {
-                        for frame in frames {
-                            on_frame(frame);
+                    received.data.fetch_add(1, Ordering::Relaxed);
+                    match session.receive(&audio[..length]) {
+                        Ok(frames) => {
+                            for frame in frames {
+                                on_frame(frame);
+                            }
                         }
+                        Err(error) => received.reject(error.to_string()),
                     }
                 }
                 result = self.control.recv(&mut control) => {
                     let length = result?;
-                    if let Ok(frames) = session.receive_control(&control[..length]) {
-                        for frame in frames {
-                            on_frame(frame);
+                    received.control.fetch_add(1, Ordering::Relaxed);
+                    match session.receive_control(&control[..length]) {
+                        Ok(frames) => {
+                            for frame in frames {
+                                on_frame(frame);
+                            }
                         }
+                        Err(error) => received.reject(error.to_string()),
                     }
                 }
                 result = self.timing.recv(&mut timing) => {
@@ -198,6 +290,7 @@ impl MediaSockets {
                     // `receive_timing`; the loop only keeps the socket drained
                     // until the clock arithmetic lands (`S4-1b-3`).
                     let _ = result?;
+                    received.timing.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -541,7 +634,7 @@ mod tests {
             let mut session = session(key, iv);
             tokio::spawn(async move {
                 sockets
-                    .serve(&mut session, move |frame| {
+                    .serve(&mut session, &Received::default(), move |frame| {
                         collected.lock().expect("lock").push(frame.sequence);
                     })
                     .await

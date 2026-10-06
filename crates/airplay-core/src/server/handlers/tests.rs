@@ -18,7 +18,11 @@ fn parse(method_target: &str, extra: &str, body: &[u8]) -> (MessageHead, Vec<u8>
 }
 
 fn info_reply(handlers: &RouteHandlers, head: &MessageHead, body: &[u8]) -> RouteReply {
-    handlers.info(&RouteRequest { head, body })
+    handlers.info(&RouteRequest {
+        head,
+        body,
+        peer: None,
+    })
 }
 
 #[test]
@@ -97,6 +101,7 @@ fn fairplay_setup_rejects_unknown_versions_and_lengths() {
     let rejected = handlers.fairplay_setup(&RouteRequest {
         head: &head,
         body: &body,
+        peer: None,
     });
     // Version byte 4 is 0, which is not the FairPlay version upstream accepts.
     assert_eq!(rejected.status, 501);
@@ -105,6 +110,7 @@ fn fairplay_setup_rejects_unknown_versions_and_lengths() {
     let ignored = handlers.fairplay_setup(&RouteRequest {
         head: &head,
         body: &body,
+        peer: None,
     });
     assert_eq!(ignored.status, 200);
     assert!(ignored.body.is_empty());

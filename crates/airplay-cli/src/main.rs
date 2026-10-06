@@ -386,6 +386,12 @@ async fn run() -> Result<(), String> {
     let audio_stop = stopping.clone();
     let (media_key, media_ready) = tokio::sync::oneshot::channel::<([u8; 16], [u8; 16])>();
     let media_key = Arc::new(Mutex::new(Some(media_key)));
+    // Where the clock exchange goes: the timing port a client named in its `SETUP`,
+    // at the address its control connection came from. The receiver starts that
+    // exchange, so a session that never learns this never ticks
+    // (`raop_ntp.c:614-618`).
+    let (timing_target, timing_ready) = tokio::sync::oneshot::channel::<std::net::SocketAddr>();
+    let timing_target = Arc::new(Mutex::new(Some(timing_target)));
     // The mirror stream is keyed by the connection identifier a client sends in its
     // `type: 110` stream entry, so its keys can only be derived once that `SETUP`
     // has been accepted.
@@ -393,9 +399,10 @@ async fn run() -> Result<(), String> {
         tokio::sync::oneshot::channel::<airplay_core::media::mirror::StreamKeys>();
     let mirror_keys = Arc::new(Mutex::new(Some(mirror_keys)));
     let audio_sockets = Arc::clone(&media);
+    let audio_stop = audio_stop.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = stopped(audio_stop) => {}
+            _ = stopped(audio_stop.clone()) => {}
             ready = media_ready => {
                 let Ok((key, iv)) = ready else {
                     return;
@@ -403,13 +410,87 @@ async fn run() -> Result<(), String> {
                 let stream = open_audio(&audio_renderer, audio_codec);
                 let stream = stream.as_ref();
                 let mut session = airplay_core::media::ports::session(key, iv);
+                // The clock exchange runs beside the audio, on its own socket: the
+                // receiver is the one that starts it, and upstream keeps it going
+                // for as long as the session does.
+                let timing_sockets = Arc::clone(&audio_sockets);
+                let timing_stop = audio_stop.clone();
+                tokio::spawn(async move {
+                    let Ok(target) = timing_ready.await else {
+                        return;
+                    };
+                    println!("media     clock exchange with {target}");
+                    let mut sent: u64 = 0;
+                    let mut stop = timing_stop;
+                    loop {
+                        // `build_request` takes Unix nanoseconds and puts the NTP form
+                        // of them where upstream puts the send time
+                        // (`raop_ntp.c:615-616`).
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|since| since.as_nanos() as u64)
+                            .unwrap_or(0);
+                        let Ok(request) = airplay_core::media::timing::build_request(now) else {
+                            eprintln!("rust-airplay: cannot build a timing request");
+                            return;
+                        };
+                        match timing_sockets.send_timing_request(target, &request).await {
+                            Ok(_) => sent += 1,
+                            Err(error) => {
+                                eprintln!("rust-airplay: cannot send a timing request: {error}");
+                                return;
+                            }
+                        }
+                        tokio::select! {
+                            _ = stop.changed() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                        }
+                        if sent % 10 == 0 {
+                            println!("media     {sent} timing requests sent");
+                        }
+                    }
+                });
                 let mut frames: u64 = 0;
                 let mut played: u64 = 0;
                 let mut refused = 0u64;
+                // What arrived, so "the client is not sending" and "we are throwing it
+                // away" cannot be confused in a log. A session that never reaches the
+                // frame counter still says which sockets were written to.
+                let received = std::sync::Arc::new(airplay_core::media::ports::Received::default());
+                let watching = std::sync::Arc::clone(&received);
+                tokio::spawn(async move {
+                    let mut last = (0u64, 0u64, 0u64, 0u64);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let now = (
+                            watching.data(),
+                            watching.control(),
+                            watching.timing(),
+                            watching.unusable(),
+                        );
+                        if now != last {
+                            println!(
+                                "media     received: data {}, control {}, timing {}, unusable {}",
+                                now.0, now.1, now.2, now.3
+                            );
+                            if let Some(reason) = watching.last_error() {
+                                println!("media     first datagram that did not fit: {reason}");
+                            }
+                            last = now;
+                        }
+                    }
+                });
                 let outcome = audio_sockets
-                    .serve(&mut session, |frame| {
+                    .serve(&mut session, &received, |frame| {
                         frames += 1;
-                        if frames % 500 == 0 {
+                        if frames == 1 {
+                            println!(
+                                "media     first audio frame: {} bytes, seq {}, ts {}",
+                                frame.payload.len(),
+                                frame.sequence,
+                                frame.timestamp
+                            );
+                        } else if frames % 500 == 0 {
                             println!("media     {frames} audio frames received");
                         }
                         let Some(stream) = stream else {
@@ -548,7 +629,51 @@ async fn run() -> Result<(), String> {
                 let clients_path = clients_path.clone();
                 let media_key = Arc::clone(&media_key);
                 let mirror_keys = Arc::clone(&mirror_keys);
+                let timing_target = Arc::clone(&timing_target);
                 handlers.set_setup_callback(move |request| {
+                    // Which streams a client asked for is what decides whether the
+                    // mirror listener will ever see a connection, so it is part of
+                    // what a session log has to say.
+                    let asked: Vec<String> = request
+                        .streams
+                        .iter()
+                        .map(|stream| match stream.stream_connection_id {
+                            Some(id) => format!("type {} (id {id})", stream.kind),
+                            None => format!("type {}", stream.kind),
+                        })
+                        .collect();
+                    println!(
+                        "media     SETUP asked for [{}], audio key {}, iv {}",
+                        asked.join(", "),
+                        if request.audio_key.is_some() {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                        if request.audio_iv.is_some() {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    );
+                    // The clock exchange needs the address the client's control
+                    // connection came from, at the port its `SETUP` named. A client
+                    // that names no port is the AirPlay 2 "Remote Control" protocol
+                    // upstream does not serve (`raop_handlers.h:902-907`), and one
+                    // whose request had no transport at all cannot be reached.
+                    match (request.client_address, request.client_timing_port) {
+                        (Some(address), Some(port)) => {
+                            if let Some(sender) = lock(&timing_target).take() {
+                                let target = std::net::SocketAddr::new(address.ip(), port);
+                                let _ = sender.send(target);
+                            }
+                        }
+                        (address, port) => println!(
+                            "media     no clock exchange: address {}, timingPort {}",
+                            address.map_or("unknown".to_owned(), |a| a.ip().to_string()),
+                            port.map_or("absent".to_owned(), |p| p.to_string())
+                        ),
+                    }
                     // The session key starts the receive loop, once, however many
                     // connections a client opens.
                     if let (Some(key), Some(iv)) = (request.audio_key, request.audio_iv) {

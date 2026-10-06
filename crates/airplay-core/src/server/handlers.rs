@@ -41,6 +41,12 @@ pub struct SetupPorts {
     pub timing_port: Option<u16>,
     /// Port of the event channel, sent as `eventPort` (upstream sends `0`,
     /// because neither audio nor mirror mode uses it).
+    ///
+    /// Upstream puts this key in every `SETUP` response whether or not a client
+    /// asked for it (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:931-936`), so
+    /// a response that leaves it out is not the shape a client expects. `None`
+    /// therefore means "not known yet" rather than "omit", and
+    /// [`SetupPorts::event_port_or_zero`] is what a response uses.
     pub event_port: Option<u16>,
     /// Audio data port, sent in the `type: 96` stream entry.
     pub data_port: Option<u16>,
@@ -48,6 +54,17 @@ pub struct SetupPorts {
     pub control_port: Option<u16>,
     /// Mirror data port, sent in the `type: 110` stream entry.
     pub mirror_data_port: Option<u16>,
+}
+
+impl SetupPorts {
+    /// The event port a response carries, which upstream always answers.
+    ///
+    /// It is `0` when the port does not exist, and that is not a placeholder: a
+    /// client reads the key's presence, and upstream's own value is `0` for both
+    /// of the modes this receiver serves.
+    pub fn event_port_or_zero(&self) -> u16 {
+        self.event_port.unwrap_or(0)
+    }
 }
 
 /// One stream a client asked for in `SETUP`.
@@ -76,6 +93,22 @@ pub struct SetupRequest {
     pub audio_iv: Option<[u8; 16]>,
     /// Streams the client asked for, in request order.
     pub streams: Vec<SetupStream>,
+    /// Port the client listens on for the clock exchange, from `timingPort`.
+    ///
+    /// The exchange is the receiver's to start: upstream sends its first timing
+    /// request as soon as `SETUP` is answered, to this port
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_ntp.c:614-618`), and a client that never
+    /// receives one has no reason to send its media. `None` is a client that did
+    /// not name a port, which upstream logs as the AirPlay 2 "Remote Control"
+    /// protocol it does not serve (`raop_handlers.h:902-907`).
+    pub client_timing_port: Option<u16>,
+    /// Address the client's control connection came from.
+    ///
+    /// The clock exchange goes to [`SetupRequest::client_timing_port`] at this
+    /// address, which is the only place a receiver can learn it from
+    /// (`raop_ntp.c:617-618`). `None` is a request served without a transport, as a
+    /// unit test serves one.
+    pub client_address: Option<std::net::SocketAddr>,
     /// Client key of the verified pairing exchange, when this connection had one.
     pub client_identity: Option<[u8; 32]>,
     /// How far the pairing exchange of this connection got.
@@ -272,6 +305,9 @@ pub struct RouteHandlers {
     feedback: Option<Box<dyn FnMut() + Send>>,
     pairing: Option<PairingSession>,
     setup_ports: SetupPorts,
+    /// The peer of the connection whose `SETUP` is being served, which is where
+    /// the clock exchange has to go.
+    peer: Option<std::net::SocketAddr>,
     setup: Option<Box<dyn FnMut(SetupRequest) + Send>>,
     parameter: Option<Box<dyn FnMut(SetParameter) + Send>>,
     trace: Option<TraceCallback>,
@@ -292,6 +328,7 @@ impl RouteHandlers {
             feedback: None,
             pairing: None,
             setup_ports: SetupPorts::default(),
+            peer: None,
             setup: None,
             parameter: None,
             trace: None,
@@ -446,6 +483,10 @@ impl RouteHandlers {
     /// handler starts (`:910-929`); a receiver without them answers the ports it
     /// actually has.
     fn setup(&mut self, request: &RouteRequest<'_>) -> RouteReply {
+        // The clock exchange goes to the address a client's control connection came
+        // from, so the request has to say which that was
+        // (`raop_ntp.c:614-618`).
+        self.peer = request.peer;
         // The password gate comes first, before any of the body is looked at:
         // upstream parses the property list before it challenges
         // (`raop_handlers.h:601-648`), and a receiver should not spend work on a
@@ -505,6 +546,16 @@ impl RouteHandlers {
             _ => return RouteReply::new(400, "Bad Request"),
         };
 
+        // `raop_handlers.h:897-901`: the port the client listens on for the clock
+        // exchange, which the receiver has to send its requests to. The receiver
+        // starts that exchange, so a session that never learns this port never
+        // ticks.
+        let client_timing_port = body
+            .get("timingPort")
+            .and_then(plist::Value::as_unsigned_integer)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0);
+
         // `raop_handlers.h:942-1060`: every requested stream is answered with
         // the port the receiver listens on, in request order.
         let mut streams = Vec::new();
@@ -542,9 +593,13 @@ impl RouteHandlers {
         if let Some(port) = self.setup_ports.timing_port {
             dictionary.insert("timingPort".to_owned(), u64::from(port).into());
         }
-        if let Some(port) = self.setup_ports.event_port {
-            dictionary.insert("eventPort".to_owned(), u64::from(port).into());
-        }
+        // Upstream answers `eventPort` unconditionally, with `0` when there is no
+        // event channel (`raop_handlers.h:931-936`). A response that omitted the
+        // key is a different shape from the one a client was written against.
+        dictionary.insert(
+            "eventPort".to_owned(),
+            u64::from(self.setup_ports.event_port_or_zero()).into(),
+        );
         if !streams.is_empty() {
             let answer = streams
                 .iter()
@@ -577,6 +632,8 @@ impl RouteHandlers {
             audio_key,
             audio_iv,
             streams,
+            client_timing_port,
+            client_address: self.peer,
             client_identity,
             authentication,
         });

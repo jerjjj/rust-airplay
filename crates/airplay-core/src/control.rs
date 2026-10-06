@@ -35,6 +35,8 @@
 
 use std::fmt;
 
+use std::net::SocketAddr;
+
 use crate::wire::{
     DEFAULT_MAX_HEAD, MessageHead, ParseError, parse_request_head_with_maximum, split_body,
 };
@@ -447,6 +449,12 @@ pub struct RouteRequest<'a> {
     pub head: &'a MessageHead,
     /// Complete request body, empty when the request declared no body.
     pub body: &'a [u8],
+    /// The peer this request arrived from, when the transport knows it.
+    ///
+    /// A `SETUP` needs it: the clock exchange is the receiver's to start, and it
+    /// goes to the address the request came from (`raop_ntp.c:617-618`). A request
+    /// built without a transport — a unit test, a replay — has none.
+    pub peer: Option<SocketAddr>,
 }
 
 /// Reply a [`RouteHandler`] produces for a route it serves.
@@ -708,6 +716,8 @@ pub struct ControlSession {
     session_id: Option<String>,
     hls_support: bool,
     audio_delay_micros: u32,
+    /// The peer the connection this session serves belongs to, when it has one.
+    peer: Option<SocketAddr>,
 }
 
 impl Default for ControlSession {
@@ -725,6 +735,7 @@ impl ControlSession {
             session_id: None,
             hls_support: false,
             audio_delay_micros: DEFAULT_AUDIO_DELAY_MICROS,
+            peer: None,
         }
     }
 
@@ -745,6 +756,15 @@ impl ControlSession {
     /// `501 Not Implemented` for [`Route::Hls`].
     pub fn set_hls_support(&mut self, enabled: bool) {
         self.hls_support = enabled;
+    }
+
+    /// Tells the session which peer it is serving.
+    ///
+    /// A `SETUP` needs it to know where to send the clock exchange, which the
+    /// receiver starts (`raop_ntp.c:617-618`). A session with no peer serves
+    /// requests whose routes do not need one.
+    pub fn set_peer(&mut self, peer: SocketAddr) {
+        self.peer = Some(peer);
     }
 
     /// Sets the audio delay reported by `RECORD` in `Audio-Latency`.
@@ -839,7 +859,14 @@ impl ControlSession {
             // serve it also gives the route its lifecycle meaning, which is why
             // the state is observed here and not for a 501.
             Dispatch::NotImplemented(route) => {
-                match handler.handle(route, &RouteRequest { head: &head, body }) {
+                match handler.handle(
+                    route,
+                    &RouteRequest {
+                        head: &head,
+                        body,
+                        peer: self.peer,
+                    },
+                ) {
                     Some(reply) => {
                         self.observe(route);
                         reply

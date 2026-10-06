@@ -28,6 +28,7 @@ const PROTOCOL_SNIFF_BYTES: usize = 512;
 /// request cannot be framed.
 pub(super) async fn serve<H: RouteHandler>(
     socket: TcpStream,
+    peer: std::net::SocketAddr,
     mut handlers: H,
     idle_timeout: Duration,
 ) -> Result<()> {
@@ -37,6 +38,9 @@ pub(super) async fn serve<H: RouteHandler>(
     socket.set_nodelay(true)?;
     let (mut reader, mut writer) = socket.into_split();
     let mut session = ControlSession::new();
+    // A `SETUP` on this connection needs to know where to send the clock exchange,
+    // which is the address the connection came from (`raop_ntp.c:617-618`).
+    session.set_peer(peer);
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; READ_CHUNK];
     // Upstream removes a connection that has been silent for longer than its
@@ -182,9 +186,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
+            let (socket, peer) = listener.accept().await.unwrap();
             serve(
                 socket,
+                peer,
                 RouteHandlers::new(DeviceIdentity::default()),
                 Duration::from_secs(5),
             )
@@ -215,9 +220,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let idle_timeout = Duration::from_millis(50);
         let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
+            let (socket, peer) = listener.accept().await.unwrap();
             serve(
                 socket,
+                peer,
                 RouteHandlers::new(DeviceIdentity::default()),
                 idle_timeout,
             )

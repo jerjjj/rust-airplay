@@ -204,7 +204,7 @@ impl Server {
             let Ok(slot) = Arc::clone(&self.slots).acquire_owned().await else {
                 return Ok(());
             };
-            let (socket, _peer) = match self.listener.accept().await {
+            let (socket, peer) = match self.listener.accept().await {
                 Ok(accepted) => accepted,
                 // A connection can fail between the backlog and `accept`, which
                 // says nothing about the next one.
@@ -215,7 +215,7 @@ impl Server {
             tokio::spawn(async move {
                 let _slot = slot;
                 // Upstream logs this failure and drops the connection.
-                let _ = connection::serve(socket, handlers, idle_timeout).await;
+                let _ = connection::serve(socket, peer, handlers, idle_timeout).await;
             });
         }
     }
