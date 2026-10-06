@@ -386,6 +386,16 @@ async fn run() -> Result<(), String> {
     let audio_stop = stopping.clone();
     let (media_key, media_ready) = tokio::sync::oneshot::channel::<([u8; 16], [u8; 16])>();
     let media_key = Arc::new(Mutex::new(Some(media_key)));
+    // The audio key of the session, kept where every control connection can see it.
+    //
+    // A device sends its audio key in one `SETUP` and its `type: 110` stream entry in a
+    // later one without repeating the key — and those two need not be served by the same
+    // control connection, because the receiver builds a handler set per connection
+    // (`Server::run`'s `new_handlers`). A remembered key that lives inside one of those
+    // handler sets is therefore not a key the session has: it is a key that connection
+    // saw, and the connection that needs it is the one that never had it. That is why
+    // this is shared rather than local.
+    let session_audio_key: Arc<Mutex<Option<[u8; 16]>>> = Arc::new(Mutex::new(None));
     // Where the clock exchange goes: the timing port a client named in its `SETUP`,
     // at the address its control connection came from. The receiver starts that
     // exchange, so a session that never learns this never ticks
@@ -688,10 +698,10 @@ async fn run() -> Result<(), String> {
                 let media_key = Arc::clone(&media_key);
                 let mirror_keys = Arc::clone(&mirror_keys);
                 let timing_target = Arc::clone(&timing_target);
-                // A device sends its audio key in one `SETUP` and its `type: 110`
-                // stream entry in a later one, so the key has to outlive the
-                // request that carried it.
-                let mut remembered_key: Option<[u8; 16]> = None;
+                // The audio key has to outlive the request that carried it *and* the
+                // connection that served it, so it is the session's rather than this
+                // handler set's.
+                let session_audio_key = Arc::clone(&session_audio_key);
                 handlers.set_setup_callback(move |request| {
                     // Which streams a client asked for is what decides whether the
                     // mirror listener will ever see a connection, so it is part of
@@ -742,7 +752,7 @@ async fn run() -> Result<(), String> {
                     // sends its `type: 110` stream entry in a later request without
                     // repeating the key that stream is encrypted under.
                     if let (Some(key), Some(iv)) = (request.audio_key, request.audio_iv) {
-                        remembered_key = Some(key);
+                        *lock(&session_audio_key) = Some(key);
                         if let Some(sender) = lock(&media_key).take() {
                             let _ = sender.send((key, iv));
                             println!("*** media session keyed, audio can arrive ***");
@@ -758,26 +768,38 @@ async fn run() -> Result<(), String> {
                     // that splits them never got a mirror stream at all: the
                     // listener below waits for keys that were never derived, so a
                     // client that connects is not even accepted.
-                    let mirror_id = request
+                    let mirror_stream = request
                         .streams
                         .iter()
-                        .find(|stream| stream.kind == MIRROR_STREAM_TYPE)
-                        .and_then(|stream| stream.stream_connection_id);
-                    if let Some(id) = mirror_id {
-                        let key = request.audio_key.or(remembered_key);
-                        let Some(key) = key else {
-                            eprintln!(
-                                "rust-airplay: a mirror stream was asked for before any \
-                                 audio key arrived, so its bytes cannot be decrypted"
-                            );
-                            return;
-                        };
-                        // The keys are published where the listener reads them, so a
-                        // connection that is already waiting is released and one that
-                        // arrives later finds them.
-                        let keys = airplay_core::media::mirror::stream_keys(id, &key);
-                        println!("*** mirror stream keyed (id {id}), video can arrive ***");
-                        lock(&mirror_keys).send_replace(Some(keys));
+                        .find(|stream| stream.kind == MIRROR_STREAM_TYPE);
+                    match mirror_stream.and_then(|stream| stream.stream_connection_id) {
+                        Some(id) => {
+                            let key = request.audio_key.or(*lock(&session_audio_key));
+                            let Some(key) = key else {
+                                eprintln!(
+                                    "rust-airplay: a mirror stream was asked for before any \
+                                     audio key arrived, so its bytes cannot be decrypted"
+                                );
+                                return;
+                            };
+                            // The keys are published where the listener reads them, so a
+                            // connection that is already waiting is released and one that
+                            // arrives later finds them.
+                            let keys = airplay_core::media::mirror::stream_keys(id, &key);
+                            println!("*** mirror stream keyed (id {id}), video can arrive ***");
+                            lock(&mirror_keys).send_replace(Some(keys));
+                        }
+                        // A `type: 110` entry with no identifier is a session this
+                        // receiver cannot key, and the listener would otherwise wait for
+                        // keys nothing will ever derive. Saying so is the difference
+                        // between a stream that never arrived and one that arrived and
+                        // could not be read — the two looked identical in the last two
+                        // sessions, which is what made them slow to tell apart.
+                        None if mirror_stream.is_some() => eprintln!(
+                            "rust-airplay: the client asked for a mirror stream without \
+                             naming its connection id, so its keys cannot be derived"
+                        ),
+                        None => {}
                     }
                     let Some(client) = request.client_identity else {
                         return;
