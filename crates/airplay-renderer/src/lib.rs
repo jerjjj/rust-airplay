@@ -222,6 +222,28 @@ pub trait VideoStream: fmt::Debug + Send + Sync {
     /// Returns [`RenderError`] when the backend cannot take it.
     fn push(&self, frame: VideoFrame) -> Result<(), RenderError>;
 
+    /// Says when the next frame belongs, so a backend can play at the rate a
+    /// client sent rather than as fast as it can read.
+    ///
+    /// This matters more than it looks. A mirror stream is one key frame followed
+    /// by frames that only describe how the picture *changed*, so a receiver that
+    /// decodes faster than real time loses frames the rest of the stream depends
+    /// on, and nothing in a later frame can repair that — the picture stays partly
+    /// wrong for the whole session. A backend that simply reads as fast as it can
+    /// therefore shows a picture that is only partly decoded, which is exactly what
+    /// one did until this existed.
+    ///
+    /// The default does nothing, because a backend that decodes on its own schedule
+    /// (or plays nothing) has no use for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError`] when the backend cannot apply it.
+    fn set_pace(&self, until_next_seconds: f64) -> Result<(), RenderError> {
+        let _ = until_next_seconds;
+        Ok(())
+    }
+
     /// Drops what has not been played.
     ///
     /// # Errors

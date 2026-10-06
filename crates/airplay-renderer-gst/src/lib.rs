@@ -54,6 +54,14 @@ pub const VIDEO_SINKS: &[&str] = &["autovideosink", "d3d11videosink", "glimagesi
 /// Environment variable naming the audio sink to use.
 pub const AUDIO_SINK_ENV: &str = "AIRPLAY_GST_AUDIO_SINK";
 
+/// Longest a backend waits between two frames.
+///
+/// A gap longer than this is not a frame that is late, it is a client that stopped
+/// and started again — a screen waking up — and a receiver that waited out the gap
+/// would appear to hang. One second is longer than any frame interval a client
+/// sends.
+pub const MAX_PACE_SECONDS: f64 = 1.0;
+
 /// Environment variable naming the video sink to use.
 pub const VIDEO_SINK_ENV: &str = "AIRPLAY_GST_VIDEO_SINK";
 
@@ -255,6 +263,20 @@ struct GstVideo {
 impl VideoStream for GstVideo {
     fn push(&self, frame: VideoFrame) -> Result<(), RenderError> {
         self.pipeline.write(&frame.data).map_err(unavailable)
+    }
+
+    fn set_pace(&self, until_next_seconds: f64) -> Result<(), RenderError> {
+        // GStreamer would do this itself if the sink were allowed to synchronise,
+        // but a pipeline fed through a pipe has nothing to synchronise against: the
+        // source is a descriptor, and its idea of time is when the bytes arrived.
+        // So the caller's clock is applied here, between frames, which is also the
+        // shape a future A/V sync needs — one place decides when the next frame is
+        // due, and both streams are handed the same answer.
+        let seconds = until_next_seconds.clamp(0.0, MAX_PACE_SECONDS);
+        if seconds > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+        }
+        Ok(())
     }
 
     fn flush(&self) -> Result<(), RenderError> {

@@ -162,6 +162,16 @@ fn open_audio(
     }
 }
 
+/// Where to write the first video frames, when a session is being diagnosed.
+///
+/// `AIRPLAY_DUMP_VIDEO=<path>` names a file the frames are appended to as
+/// Annex-B, which is what makes "the picture is incomplete" a question about
+/// bytes rather than about a window: a second decoder reading that file says
+/// whether the stream is well formed, and where it stops being.
+fn dump_video_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("AIRPLAY_DUMP_VIDEO").map(std::path::PathBuf::from)
+}
+
 /// A future that is ready when the receiver is stopping.
 ///
 /// A receiver ends with Ctrl+C, and its receive loops need to be told: a loop that outlived
@@ -630,6 +640,13 @@ async fn run() -> Result<(), String> {
             let mut frames: u64 = 0;
             let mut shown: u64 = 0;
             let mut refused = 0u64;
+            // When the frame being pushed belongs, from the client's own timestamps.
+            // A mirror stream is one key frame followed by frames that describe only
+            // what changed, so decoding faster than real time loses frames the rest of
+            // the stream depends on and leaves the picture partly wrong for the rest of
+            // the session. The rate is the client's to state, and this is where it is
+            // read.
+            let mut previous: Option<u64> = None;
             let outcome = stream
                 .serve(&mut session, |frame| {
                     frames += 1;
@@ -647,6 +664,44 @@ async fn run() -> Result<(), String> {
                     let Some(video) = video.as_ref() else {
                         return;
                     };
+                    // The bytes handed to a decoder are what a picture is diagnosed
+                    // from, and nothing else can say whether a stream is malformed or
+                    // merely hard to follow: `AIRPLAY_DUMP_VIDEO=<path>` writes the
+                    // first frames as an Annex-B stream a second decoder can read.
+                    if let Some(path) = dump_video_path() {
+                        if frames <= 30 {
+                            use std::io::Write;
+                            if let Ok(mut file) =
+                                std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                            {
+                                let _ = file.write_all(&frame.data);
+                                println!(
+                                    "media     dumped frame {frames} ({} bytes, {} units, idr={}) to {}",
+                                    frame.data.len(),
+                                    frame.units,
+                                    frame.idr,
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                    // The gap to the previous frame, in seconds, from the Q32.32
+                    // timestamps a client stamps a mirror stream with.
+                    if let Some(previous) = previous.replace(frame.timestamp) {
+                        let gap = frame.timestamp.wrapping_sub(previous);
+                        // A stream that restarts, or a screen that wakes, jumps rather
+                        // than advances; the backend caps what it will wait anyway.
+                        if gap < u64::MAX / 2 {
+                            let seconds =
+                                (gap >> 32) as f64 + f64::from(gap as u32) / 4_294_967_296.0;
+                            if let Err(error) = video.set_pace(seconds) {
+                                refused += 1;
+                                if refused == 1 {
+                                    eprintln!("rust-airplay: the renderer cannot pace: {error}");
+                                }
+                            }
+                        }
+                    }
                     if let Err(error) = video.push(airplay_renderer::VideoFrame {
                         data: frame.data,
                         timestamp: frame.timestamp,
