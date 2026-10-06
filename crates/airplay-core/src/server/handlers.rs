@@ -599,46 +599,7 @@ impl RouteHandlers {
                 else {
                     return RouteReply::new(400, "Bad Request");
                 };
-                // A device that names its mirror stream sometimes does and sometimes
-                // does not send `streamConnectionID`, and the value is what the
-                // stream's AES-CTR keys are derived from, so it must not be missed
-                // because it arrived as another numeric type. `plist` can hold a
-                // number as an integer or as a real, and a client that wrote it as a
-                // real would otherwise leave the mirror stream unkeyable with nothing
-                // said anywhere.
-                let id_value = stream.get("streamConnectionID");
-                let connection_id = id_value.and_then(|value| {
-                    value
-                        .as_unsigned_integer()
-                        .or_else(|| {
-                            value
-                                .as_signed_integer()
-                                .and_then(|signed| signed.try_into().ok())
-                        })
-                        .or_else(|| {
-                            // A real is how a client writes a number it computed, and an
-                            // identifier that is not a whole number is not one this
-                            // receiver can use: the conversion refuses it rather than
-                            // rounding a key input into a different key.
-                            value
-                                .as_real()
-                                .and_then(|real| (real.is_finite() && real >= 0.0).then_some(real))
-                                .and_then(|real| {
-                                    #[allow(
-                                        clippy::cast_possible_truncation,
-                                        clippy::cast_sign_loss
-                                    )]
-                                    let whole = real as u64;
-                                    (whole as f64 == real).then_some(whole)
-                                })
-                        })
-                });
-                if stream.contains_key("streamConnectionID") && connection_id.is_none() {
-                    eprintln!(
-                        "rust-airplay: streamConnectionID is present but not a usable \
-                         identifier: {id_value:?}"
-                    );
-                }
+                let connection_id = stream_connection_id(stream);
                 // What the entry actually carried, for a device that names its mirror
                 // stream in one session and not in the next: the difference is either in
                 // the request or in this reader, and only the keys can say which. A
@@ -1123,4 +1084,37 @@ fn describe_plist(plist: &Plist) -> String {
         }
         None => "  (not a dictionary)\n".to_owned(),
     }
+}
+
+/// The `streamConnectionID` of one `SETUP` stream entry, if it names a usable one.
+///
+/// The value is a 64-bit identifier a client may write as a *signed* number, and a
+/// device does: one sent `Integer(-4578581632668906207)`, which is
+/// `0xc0759c4371a44d21`. Upstream formats it with `%llu`
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:963`), which prints those same bits
+/// as unsigned, so the value is **reinterpreted** rather than converted: a negative
+/// number is not an out-of-range identifier, it is the same identifier written down
+/// differently, and converting it instead makes the stream unkeyable in a session
+/// where the client named it all along.
+///
+/// A real is read too, because that is another way a client writes a number, but only
+/// when it is a whole one: this value is a key input, and a rounded one derives a
+/// stream nobody can read.
+fn stream_connection_id(stream: &plist::Dictionary) -> Option<u64> {
+    let value = stream.get("streamConnectionID")?;
+    if let Some(unsigned) = value.as_unsigned_integer() {
+        return Some(unsigned);
+    }
+    if let Some(signed) = value.as_signed_integer() {
+        return Some(u64::from_ne_bytes(signed.to_ne_bytes()));
+    }
+    let real = value.as_real()?;
+    if !real.is_finite() || real.fract() != 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let signed = real as i64;
+    #[allow(clippy::cast_precision_loss)]
+    let round_trips = (signed as f64) == real;
+    round_trips.then(|| u64::from_ne_bytes(signed.to_ne_bytes()))
 }

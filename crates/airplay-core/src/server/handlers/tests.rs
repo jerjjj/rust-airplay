@@ -115,3 +115,53 @@ fn fairplay_setup_rejects_unknown_versions_and_lengths() {
     assert_eq!(ignored.status, 200);
     assert!(ignored.body.is_empty());
 }
+
+#[test]
+fn reads_the_mirror_identifier_a_device_actually_sent() {
+    // A real session sent this, and refusing it cost the whole video stream:
+    // `streamConnectionID` as a *signed* 64-bit number, negative because its high bit
+    // is set. Upstream prints it with `%llu` (`raop_handlers.h:963`), so those same
+    // bits are the identifier, and the keys are derived from their decimal form.
+    let mut stream = plist::Dictionary::new();
+    stream.insert("type".to_owned(), 110u64.into());
+    stream.insert(
+        "streamConnectionID".to_owned(),
+        plist::Value::from(-4_578_581_632_668_906_207i64),
+    );
+    assert_eq!(
+        super::stream_connection_id(&stream),
+        Some(0xc075_9c43_71a4_4d21),
+        "the bits are the identifier, not the signed value"
+    );
+    // The decimal form is what the key derivation hashes, so the round trip matters:
+    // a port that hashed `-4578...` would derive a stream the client cannot read.
+    assert_eq!(
+        super::stream_connection_id(&stream).unwrap().to_string(),
+        "13868162441040645409"
+    );
+}
+
+#[test]
+fn reads_a_positive_or_fractional_identifier_the_way_a_client_wrote_it() {
+    let identifier = |value: plist::Value| {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("streamConnectionID".to_owned(), value);
+        super::stream_connection_id(&stream)
+    };
+    // The shape most sessions send.
+    assert_eq!(
+        identifier(plist::Value::from(10_139_102_790_113_880_880_u64)),
+        Some(10_139_102_790_113_880_880_u64)
+    );
+    // A real that is whole is a way of writing the same number.
+    assert_eq!(identifier(plist::Value::from(4096.0f64)), Some(4096));
+    // One that is not whole would derive a stream nobody can read, so it is refused
+    // rather than rounded.
+    assert_eq!(identifier(plist::Value::from(4096.5f64)), None);
+    assert_eq!(identifier(plist::Value::from(f64::NAN)), None);
+    // An entry with no identifier at all is `None`, which is what a client that has
+    // not named its stream sends.
+    let mut bare = plist::Dictionary::new();
+    bare.insert("type".to_owned(), 110u64.into());
+    assert_eq!(super::stream_connection_id(&bare), None);
+}
