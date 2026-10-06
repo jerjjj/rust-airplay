@@ -362,13 +362,14 @@ impl MirrorStream {
         }
         let header = match crate::media::mirror::parse_header(&header) {
             Ok(header) => header,
-            // Something that is not a packet ends this stream: a receiver that
-            // guessed at a wrong length would read the rest of the connection as
-            // if it were video.
+            // A header this receiver cannot read says what the bytes actually were:
+            // a wrong length is read once and then everything after it is read from
+            // the wrong place, so the bytes are the only thing that says whether the
+            // framing was wrong or the stream simply was not a mirror stream.
             Err(error) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    error.to_string(),
+                    format!("{error} (first bytes: {})", hex_preview(&header)),
                 ));
             }
         };
@@ -672,4 +673,14 @@ mod tests {
             response.to_vec()
         );
     }
+}
+
+/// The first bytes of a packet, for a header that could not be read.
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

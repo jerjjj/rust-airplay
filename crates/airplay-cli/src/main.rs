@@ -643,7 +643,14 @@ async fn run() -> Result<(), String> {
             match outcome {
                 // The client closing the connection is how a mirror session ends.
                 Ok(()) => println!("media     the mirror stream ended after {frames} frames"),
-                Err(error) => eprintln!("rust-airplay: the mirror stream stopped: {error}"),
+                // A connection that comes apart ends that connection, not the session:
+                // a client reconnects after a mirror stream goes wrong, and a receiver
+                // that dropped its listener because of one bad packet would never see
+                // it again. The loop goes back to accepting.
+                Err(error) => eprintln!(
+                    "rust-airplay: the mirror stream stopped after {frames} frames: {error}\n\
+                     rust-airplay: waiting for the client to connect again"
+                ),
             }
         }
     });
