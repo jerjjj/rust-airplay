@@ -186,11 +186,12 @@ fn audio_pipeline(caps: &str, sink: &str) -> String {
 
 /// The pipeline one video stream runs.
 ///
-/// The parser is named rather than left to `decodebin` because a mirror stream arrives
-/// as Annex-B units with no container around them, which a parser needs to be told
-/// about before a decoder can see frames in them.
+/// A mirror stream carries H.264 or H.265 depending on what the device sends and
+/// what the receiver advertised, and the two need different parsers and decoders.
+/// `decodebin` picks them from what arrives, which is what makes one pipeline serve
+/// both: a device that switches coding mid-session is then not a special case.
 fn video_pipeline(sink: &str) -> String {
-    format!("fdsrc ! h264parse ! avdec_h264 ! videoconvert ! {sink} sync=false")
+    format!("fdsrc ! decodebin ! videoconvert ! {sink} sync=false")
 }
 
 impl Renderer for GstRenderer {

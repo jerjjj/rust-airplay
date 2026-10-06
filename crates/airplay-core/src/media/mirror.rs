@@ -229,10 +229,20 @@ pub fn parse_header(datagram: &[u8]) -> Result<MirrorHeader, MirrorError> {
         });
     }
     let header = MirrorHeader {
-        payload_size: u32::from_be_bytes(datagram[0..4].try_into().expect("four bytes")),
+        // The payload size and the timestamp are read in the host's byte order,
+        // which on every machine this runs on is little endian: upstream reads them
+        // through `byteutils_get_int(packet, 0)` and `byteutils_get_long(packet, 8)`,
+        // and those are a plain `*((uint32_t *)(b + offset))` rather than the `_be`
+        // helpers beside them (`byteutils.c`). Reading them big endian turns a
+        // thirty-seven byte HEVC parameter-set packet into one that promises
+        // 620756992 bytes, which is how a device's first mirror packet was refused.
+        payload_size: u32::from_le_bytes(datagram[0..4].try_into().expect("four bytes")),
         kind: MirrorKind::from_header(datagram[4], datagram[5]),
+        // The option is kept as the two bytes were written, because that is how
+        // upstream compares it: `packet[6] == 0x16`, `packet[6] == 0x56`
+        // (`raop_rtp_mirror.c:580-586`), not as a number.
         option: u16::from_be_bytes(datagram[6..8].try_into().expect("two bytes")),
-        timestamp: u64::from_be_bytes(datagram[8..16].try_into().expect("eight bytes")),
+        timestamp: u64::from_le_bytes(datagram[8..16].try_into().expect("eight bytes")),
     };
     let promised = header.payload_size as usize;
     if promised > MAX_PAYLOAD {
@@ -871,11 +881,11 @@ mod tests {
     /// A mirror packet with `payload` after the header upstream reads.
     fn packet(first: u8, second: u8, option: u16, timestamp: u64, payload: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes.push(first);
         bytes.push(second);
         bytes.extend_from_slice(&option.to_be_bytes());
-        bytes.extend_from_slice(&timestamp.to_be_bytes());
+        bytes.extend_from_slice(&timestamp.to_le_bytes());
         bytes.resize(HEADER_LEN, 0);
         bytes.extend_from_slice(payload);
         bytes
@@ -1586,7 +1596,7 @@ mod tests {
         );
         // And one that promises more than a receiver reads, before allocating.
         let mut huge = vec![0u8; HEADER_LEN];
-        huge[0..4].copy_from_slice(&(MAX_PAYLOAD as u32 + 1).to_be_bytes());
+        huge[0..4].copy_from_slice(&(MAX_PAYLOAD as u32 + 1).to_le_bytes());
         assert_eq!(
             parse_packet(&huge),
             Err(MirrorError::TooLarge {

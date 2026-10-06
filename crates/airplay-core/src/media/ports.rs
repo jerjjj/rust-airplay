@@ -375,6 +375,19 @@ impl MirrorStream {
         };
         let mut payload = vec![0u8; header.payload_size as usize];
         self.stream.read_exact(&mut payload).await?;
+        // What the first packets are, for a device whose codec data has to be read
+        // rather than assumed: a mirror stream carries either coding and the packet
+        // that announces which one is the one worth seeing.
+        if std::env::var("AIRPLAY_DEBUG_MIRROR").is_ok() {
+            eprintln!(
+                "MIRROR packet kind={:?} payload={} option=0x{:04x} ts={} bytes: {}",
+                header.kind,
+                payload.len(),
+                header.option,
+                header.timestamp,
+                hex_preview(&payload)
+            );
+        }
         Ok(Some((header, payload)))
     }
 }
@@ -575,11 +588,11 @@ mod tests {
     fn mirror_packet(kind: (u8, u8), payload: &[u8]) -> Vec<u8> {
         use crate::media::mirror::HEADER_LEN;
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes.push(kind.0);
         bytes.push(kind.1);
         bytes.extend_from_slice(&[0, 0]);
-        bytes.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+        bytes.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
         bytes.resize(HEADER_LEN, 0);
         bytes.extend_from_slice(payload);
         bytes
