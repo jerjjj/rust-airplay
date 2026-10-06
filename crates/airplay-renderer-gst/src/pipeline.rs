@@ -100,7 +100,7 @@ pub fn find_launcher() -> Result<String, LaunchError> {
 ///
 /// It holds the program and the pipe into it, behind a lock because a pipe has one writer
 /// and a session's media can arrive on more than one thread. What the program says goes to
-/// a file rather than into this process: see [`open_stderr`].
+/// a file rather than into this process, for the reason the function that opens it gives.
 #[derive(Debug)]
 pub struct Pipeline {
     program: String,

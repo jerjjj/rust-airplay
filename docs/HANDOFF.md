@@ -4,7 +4,7 @@
 
 ## 0. 一句话状态
 
-协议核心已完成到 **S3 收口**（发现、控制面、配对、SETUP 密钥派生、Digest 口令；**真机 iPad 已实测发现与配对**），**S4 进行中**：音频收包/解密/重排序/控制通道/端口绑定已完成并接线，**镜像通道整条已完成（CTR 规则 / SPS+PPS 拼装 / 接线，与上游 C 差分通过）**，**渲染边界与 GStreamer 后端已落地**（接口 + 子进程接入，六个集成测试对真 GStreamer 通过，但**尚未接进 CLI**）——**目前仍不出声、不出画**。
+协议核心已完成到 **S3 收口**（发现、控制面、配对、SETUP 密钥派生、Digest 口令；**真机 iPad 已实测发现与配对**），**S4 进行中**：音频收包/解密/重排序/控制通道/端口绑定已完成并接线，**镜像通道整条已完成（CTR 规则 / SPS+PPS 拼装 / 接线，与上游 C 差分通过）**，**渲染边界与 GStreamer 后端已落地并接进 CLI**（接口 + 子进程接入，六个集成测试对真 GStreamer 通过，`--render gst` 起得来、端口与 sink 都报出来了）——**目前仍不出声、不出画，因为还没在真机上验过**。
 
 ## 1. 接手第一步：跑这三条命令
 
@@ -28,9 +28,18 @@ cargo test -- --ignored --test-threads=1            # 6 条，需要真 GStreame
 
 ## 2. 直接接手的工作
 
-### 2a. 把渲染后端接进 CLI（S4-2 的最后一段）
+### 2a. 真机出声出画（S4-2 的最后一段）
 
-接口在 `crates/airplay-renderer`（`Renderer`/`AudioStream`/`VideoStream`，零依赖），后端在 `crates/airplay-renderer-gst`（子进程驱动 `gst-launch-1.0`）。缺的是 CLI 用**一个 feature** 把后端接上（默认构建不带它，这样没有 GStreamer 的机器仍然全绿），以及把 `media::audio` 的 `AudioFrame`、`media::mirror` 的 `VideoFrame` 送进渲染器。真机出声出画要在那之后测。
+接口在 `crates/airplay-renderer`（`Renderer`/`AudioStream`/`VideoStream`，零依赖），后端在 `crates/airplay-renderer-gst`（子进程驱动 `gst-launch-1.0`），CLI 已用一个 feature 接上：
+
+```powershell
+$env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+cargo run -p airplay-cli --features gst -- --name "Rust AirPlay Test" --port 47000 --render gst
+```
+
+启动时会打印它选了什么（`render    gst    gst-launch-1.0.exe -> audio wasapisink, video autovideosink`）。**缺的就是真机验证**：iPad 投屏 + 音频，确认画面出来、声音出来、日志里 `N media     N audio frames played` / `N video frames shown` 在涨。若某台机器没有 `wasapisink`，用 `AIRPLAY_GST_AUDIO_SINK` 换（`fakesink` 不挑环境）。
+
+**已知未做**：`set_volume` 只记在内存里（改运行中管线的属性要 S4-3）；`flush` 是空操作；音频编码要手动指定 `--audio-codec`（`SETUP` 不说它，上游是从流里的 compression type 读的，本移植还没读）。
 
 ### 2b. S4-1b-3 时钟算术（有意未做，见第 7 节）
 

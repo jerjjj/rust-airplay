@@ -188,7 +188,7 @@ pub trait Renderer: fmt::Debug + Send + Sync {
 }
 
 /// An open audio stream.
-pub trait AudioStream: fmt::Debug + Send {
+pub trait AudioStream: fmt::Debug + Send + Sync {
     /// Hands one frame to the backend.
     ///
     /// # Errors
@@ -214,7 +214,7 @@ pub trait AudioStream: fmt::Debug + Send {
 }
 
 /// An open video stream.
-pub trait VideoStream: fmt::Debug + Send {
+pub trait VideoStream: fmt::Debug + Send + Sync {
     /// Hands one frame to the backend.
     ///
     /// # Errors

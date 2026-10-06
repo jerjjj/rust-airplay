@@ -24,6 +24,7 @@ use airplay_core::discovery::{Advertisement, Advertiser, Protection};
 use airplay_core::server::{
     DeviceIdentity, PairingState, PinMode, RouteHandlers, Server, ServerConfig, SetupPorts,
 };
+use airplay_renderer::{AudioCodec, AudioConfig};
 
 /// The stream type a mirroring client asks for, whose entry carries the
 /// `streamConnectionID` the mirror keys are derived from
@@ -44,11 +45,19 @@ Options:
   --device-id <address>  Advertised hardware address (default: from the seed)
   --seed <hex>           Identity seed, 32 bytes of hex (default: stored file)
   --log <file>           Append the request trace to a file, for archiving a session
+  --render <backend>     What plays the media: null (default) or gst
+  --audio-codec <codec>  alac or aac-eld, what the client's frames are
   --help                 Print this text
 
 The receiver answers the control plane: /info, /fp-setup, /feedback, the pairing
-routes and SETUP with its key derivation. It does not play media yet, so a client
-that completes SETUP will not hear anything.";
+routes and SETUP with its key derivation, and it receives the media a client
+sends. `--render null` reads that media, decrypts and orders it, and plays
+nothing, which is what a session is checked with; `--render gst` hands it to
+GStreamer, and only a build with the `gst` feature has that backend.
+
+Which audio coding a client sends is not something `SETUP` says, so it is given
+here: `aac-eld` is what a current client sends, `alac` is what an AirPlay 1 one
+does.";
 
 /// Everything the receiver needs before it starts.
 struct Options {
@@ -59,6 +68,17 @@ struct Options {
     device_id: Option<String>,
     seed: Option<[u8; 32]>,
     log: Option<String>,
+    render: RenderBackend,
+    audio_codec: AudioCodec,
+}
+
+/// What plays the media a client sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderBackend {
+    /// Read it, decrypt it, order it, and play nothing.
+    Null,
+    /// Hand it to GStreamer, in a build that has the backend.
+    Gst,
 }
 
 impl Default for Options {
@@ -73,8 +93,100 @@ impl Default for Options {
             device_id: None,
             seed: None,
             log: None,
+            render: RenderBackend::Null,
+            // AirPlay 2 clients send AAC-ELD, which is what an iPhone or iPad paired
+            // with this receiver sends.
+            audio_codec: AudioCodec::AacEld,
         }
     }
+}
+
+/// The renderer a session plays through, chosen from the options.
+///
+/// `--render gst` in a build without the feature is refused rather than quietly downgraded:
+/// a receiver that plays nothing while its user believes it should be playing is worse than
+/// one that says which build it is.
+fn renderer(backend: RenderBackend) -> Result<Arc<dyn airplay_renderer::Renderer>, String> {
+    match backend {
+        RenderBackend::Null => Ok(Arc::new(airplay_renderer::NullRenderer::new())),
+        RenderBackend::Gst => open_gst(),
+    }
+}
+
+/// The GStreamer backend, when this build has it.
+#[cfg(feature = "gst")]
+fn open_gst() -> Result<Arc<dyn airplay_renderer::Renderer>, String> {
+    let renderer = airplay_renderer_gst::GstRenderer::new()
+        .map_err(|error| format!("--render gst: {error}"))?;
+    println!(
+        "render    gst    {} -> audio {}, video {}",
+        renderer.program(),
+        renderer.audio_sink(),
+        renderer.video_sink()
+    );
+    Ok(Arc::new(renderer))
+}
+
+/// The GStreamer backend, which this build does not have.
+#[cfg(not(feature = "gst"))]
+fn open_gst() -> Result<Arc<dyn airplay_renderer::Renderer>, String> {
+    Err("--render gst needs a build with the `gst` feature: cargo run -p airplay-cli --features gst"
+        .to_owned())
+}
+
+/// Opens an audio stream on the renderer, reporting why when it cannot.
+///
+/// A session without audio is not a reason to drop the client: the protocol half still
+/// works, and what is wrong is the machine's media stack rather than the session.
+fn open_audio(
+    renderer: &Arc<dyn airplay_renderer::Renderer>,
+    codec: AudioCodec,
+) -> Option<Box<dyn airplay_renderer::AudioStream + '_>> {
+    let config = AudioConfig {
+        codec,
+        ..AudioConfig::default()
+    };
+    match renderer.open_audio(config) {
+        Ok(stream) => {
+            println!(
+                "media     audio stream open, {} at {}",
+                codec.name(),
+                config.sample_rate
+            );
+            Some(stream)
+        }
+        Err(error) => {
+            eprintln!("rust-airplay: cannot play audio: {error}");
+            None
+        }
+    }
+}
+
+/// A future that is ready when the receiver is stopping.
+///
+/// A receiver ends with Ctrl+C, and its receive loops need to be told: a loop that outlived
+/// the control plane would hold a sound card or a window open with nothing to play into it.
+/// One that cannot install signal handling waits forever instead, which is the same receiver
+/// it was before this existed.
+type Stopping = tokio::sync::watch::Receiver<bool>;
+
+/// A signal that says the receiver is stopping, and a way to watch it.
+fn shutdown_signal() -> Stopping {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "gst")]
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        println!("\nstopping");
+        let _ = sender.send(true);
+    });
+    #[cfg(not(feature = "gst"))]
+    let _ = sender;
+    receiver
+}
+
+/// Waits for the signal, or forever for a receiver that has none.
+async fn stopped(mut signal: Stopping) {
+    let _ = signal.changed().await;
 }
 
 fn main() -> ExitCode {
@@ -101,6 +213,13 @@ async fn run() -> Result<(), String> {
         Some(seed) => seed,
         None => load_or_create_seed()?,
     };
+    // The renderer is chosen before anything is advertised, because a backend this build
+    // or this machine cannot provide is something to say now rather than when a client is
+    // already waiting for sound.
+    let renderer = renderer(options.render)?;
+    if options.render == RenderBackend::Null {
+        println!("render    null   media is read and played nowhere");
+    }
     let device_id = options
         .device_id
         .clone()
@@ -259,6 +378,12 @@ async fn run() -> Result<(), String> {
     // The three datagram sockets and the mirror listener are shared by the audio loop
     // and the mirror loop, which watch different ones of them.
     let media = Arc::new(media);
+    let audio_renderer = Arc::clone(&renderer);
+    let audio_codec = options.audio_codec;
+    // The control plane runs until Ctrl+C, and a receive loop that outlived it would keep a
+    // sound card or a window open with nothing to play into it.
+    let stopping = shutdown_signal();
+    let audio_stop = stopping.clone();
     let (media_key, media_ready) = tokio::sync::oneshot::channel::<([u8; 16], [u8; 16])>();
     let media_key = Arc::new(Mutex::new(Some(media_key)));
     // The mirror stream is keyed by the connection identifier a client sends in its
@@ -269,21 +394,52 @@ async fn run() -> Result<(), String> {
     let mirror_keys = Arc::new(Mutex::new(Some(mirror_keys)));
     let audio_sockets = Arc::clone(&media);
     tokio::spawn(async move {
-        let Ok((key, iv)) = media_ready.await else {
-            return;
-        };
-        let mut session = airplay_core::media::ports::session(key, iv);
-        let mut frames: u64 = 0;
-        let outcome = audio_sockets
-            .serve(&mut session, |_frame| {
-                frames += 1;
-                if frames % 500 == 0 {
-                    println!("media     {frames} audio frames received");
+        tokio::select! {
+            _ = stopped(audio_stop) => {}
+            ready = media_ready => {
+                let Ok((key, iv)) = ready else {
+                    return;
+                };
+                let stream = open_audio(&audio_renderer, audio_codec);
+                let stream = stream.as_ref();
+                let mut session = airplay_core::media::ports::session(key, iv);
+                let mut frames: u64 = 0;
+                let mut played: u64 = 0;
+                let mut refused = 0u64;
+                let outcome = audio_sockets
+                    .serve(&mut session, |frame| {
+                        frames += 1;
+                        if frames % 500 == 0 {
+                            println!("media     {frames} audio frames received");
+                        }
+                        let Some(stream) = stream else {
+                            return;
+                        };
+                        if let Err(error) = stream.push(airplay_renderer::AudioFrame {
+                            data: frame.payload,
+                            timestamp: u64::from(frame.timestamp),
+                        }) {
+                            refused += 1;
+                            if refused == 1 {
+                                eprintln!("rust-airplay: the renderer refused a frame: {error}");
+                            }
+                            return;
+                        }
+                        played += 1;
+                    })
+                    .await;
+                if let Some(stream) = stream {
+                    // A last frame already handed over is played out rather than cut off,
+                    // which is what an end of stream means to a backend.
+                    match stream.close() {
+                        Ok(()) => println!("media     {played} audio frames played of {frames}"),
+                        Err(error) => eprintln!("rust-airplay: the audio stream ended badly: {error}"),
+                    }
                 }
-            })
-            .await;
-        if let Err(error) = outcome {
-            eprintln!("rust-airplay: the media session stopped: {error}");
+                if let Err(error) = outcome {
+                    eprintln!("rust-airplay: the media session stopped: {error}");
+                }
+            }
         }
     });
 
@@ -291,18 +447,23 @@ async fn run() -> Result<(), String> {
     // there is nothing to read from. Each connection gets a session of its own: a
     // client that reconnects starts its stream over.
     let mirror_sockets = Arc::clone(&media);
+    let mirror_renderer = Arc::clone(&renderer);
+    let mirror_stop = stopping.clone();
     tokio::spawn(async move {
         let Ok(keys) = mirror_ready.await else {
             return;
         };
         println!("*** mirror stream keyed, video can arrive ***");
         loop {
-            let mut stream = match mirror_sockets.accept_mirror().await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    eprintln!("rust-airplay: the mirror listener stopped: {error}");
-                    return;
-                }
+            let mut stream = tokio::select! {
+                _ = stopped(mirror_stop.clone()) => return,
+                accepted = mirror_sockets.accept_mirror() => match accepted {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        eprintln!("rust-airplay: the mirror listener stopped: {error}");
+                        return;
+                    }
+                },
             };
             let mut session = match airplay_core::media::mirror::MirrorSession::new(&keys) {
                 Ok(session) => session,
@@ -311,7 +472,22 @@ async fn run() -> Result<(), String> {
                     return;
                 }
             };
+            // A mirror stream carries its own codec data, so what it needs from the
+            // renderer is a video stream and nothing else; the size is whatever the client
+            // sends, which is not something `SETUP` says.
+            let video = match mirror_renderer.open_video(airplay_renderer::VideoConfig {
+                width: None,
+                height: None,
+            }) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    eprintln!("rust-airplay: cannot show video: {error}");
+                    None
+                }
+            };
             let mut frames: u64 = 0;
+            let mut shown: u64 = 0;
+            let mut refused = 0u64;
             let outcome = stream
                 .serve(&mut session, |frame| {
                     frames += 1;
@@ -326,8 +502,29 @@ async fn run() -> Result<(), String> {
                     } else if frames % 200 == 0 {
                         println!("media     {frames} video frames received");
                     }
+                    let Some(video) = video.as_ref() else {
+                        return;
+                    };
+                    if let Err(error) = video.push(airplay_renderer::VideoFrame {
+                        data: frame.data,
+                        timestamp: frame.timestamp,
+                        keyframe: frame.idr,
+                    }) {
+                        refused += 1;
+                        if refused == 1 {
+                            eprintln!("rust-airplay: the renderer refused a frame: {error}");
+                        }
+                        return;
+                    }
+                    shown += 1;
                 })
                 .await;
+            if let Some(video) = video {
+                match video.close() {
+                    Ok(()) => println!("media     {shown} video frames shown of {frames}"),
+                    Err(error) => eprintln!("rust-airplay: the video stream ended badly: {error}"),
+                }
+            }
             match outcome {
                 // The client closing the connection is how a mirror session ends.
                 Ok(()) => println!("media     the mirror stream ended after {frames} frames"),
@@ -459,6 +656,28 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Opt
             "--device-id" => options.device_id = Some(next_value(&mut arguments, "--device-id")?),
             "--seed" => options.seed = Some(parse_seed(&next_value(&mut arguments, "--seed")?)?),
             "--log" => options.log = Some(next_value(&mut arguments, "--log")?),
+            "--render" => {
+                let name = next_value(&mut arguments, "--render")?;
+                options.render = match name.as_str() {
+                    "null" => RenderBackend::Null,
+                    "gst" => RenderBackend::Gst,
+                    other => {
+                        return Err(format!("--render: {other} is not a backend (null or gst)"));
+                    }
+                };
+            }
+            "--audio-codec" => {
+                let name = next_value(&mut arguments, "--audio-codec")?;
+                options.audio_codec = match name.as_str() {
+                    "alac" => AudioCodec::Alac,
+                    "aac-eld" => AudioCodec::AacEld,
+                    other => {
+                        return Err(format!(
+                            "--audio-codec: {other} is not a coding (alac or aac-eld)"
+                        ));
+                    }
+                };
+            }
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }

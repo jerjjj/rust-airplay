@@ -11,12 +11,6 @@ publish = false
 name = "airplay_renderer_gst"
 path = "src/lib.rs"
 
-# A workspace of its own, on purpose: this crate needs a GStreamer runtime to be useful,
-# and a machine without one must still be able to run the default workspace's gates.
-# `docs/ADR-0003-media-backend.md` records the decision and `README.md` in this directory
-# says how to build and test it.
-[workspace]
-
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

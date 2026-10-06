@@ -1,9 +1,15 @@
 [workspace]
-members = ["crates/airplay-core", "crates/airplay-cli", "crates/airplay-renderer"]
-# The GStreamer backend is a member of a workspace of its own: it needs a GStreamer
-# runtime to be useful, and a machine without one must still be able to run this
-# workspace's gates. `crates/airplay-renderer-gst/README.md` says how to build it and
-# `docs/ADR-0003-media-backend.md` records why it is shaped this way.
+# The GStreamer backend is a member so that the CLI can depend on it behind a feature
+# ("gst", off by default): a machine with no GStreamer still builds, tests and lints this
+# workspace unchanged, and a machine that has one asks for it explicitly. That is the
+# isolation `docs/ADR-0003-media-backend.md` requires, and the crate's README says how to
+# run what needs a runtime.
+members = [
+    "crates/airplay-core",
+    "crates/airplay-cli",
+    "crates/airplay-renderer",
+    "crates/airplay-renderer-gst",
+]
 resolver = "3"
 
 [workspace.package]
@@ -19,4 +25,3 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = "warn"
-
