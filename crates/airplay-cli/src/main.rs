@@ -393,11 +393,16 @@ async fn run() -> Result<(), String> {
     let (timing_target, timing_ready) = tokio::sync::oneshot::channel::<std::net::SocketAddr>();
     let timing_target = Arc::new(Mutex::new(Some(timing_target)));
     // The mirror stream is keyed by the connection identifier a client sends in its
-    // `type: 110` stream entry, so its keys can only be derived once that `SETUP`
-    // has been accepted.
+    // `type: 110` stream entry, which arrives in a *different* `SETUP` from the audio
+    // key the stream is derived from — and a device may open the mirror connection
+    // before either. So the keys live in one place that is written whenever a `SETUP`
+    // derives them and read whenever a connection needs them, rather than in a channel
+    // that can only hand them over once: a one-shot delivery loses them entirely if
+    // the first `SETUP` of a session is the one that consumes it, which is exactly what
+    // a device that splits its session across two requests does.
     let (mirror_keys, mirror_ready) =
-        tokio::sync::oneshot::channel::<airplay_core::media::mirror::StreamKeys>();
-    let mirror_keys = Arc::new(Mutex::new(Some(mirror_keys)));
+        tokio::sync::watch::channel::<Option<airplay_core::media::mirror::StreamKeys>>(None);
+    let mirror_keys = Arc::new(Mutex::new(mirror_keys));
     let audio_sockets = Arc::clone(&media);
     let audio_stop = audio_stop.clone();
     tokio::spawn(async move {
@@ -541,33 +546,14 @@ async fn run() -> Result<(), String> {
             "media     mirror listener ready on port {}",
             mirror_sockets.mirror_port().unwrap_or_default()
         );
+        // The keys a connection needs are whatever the last `SETUP` derived, so each
+        // connection reads them here rather than being handed them once. A connection
+        // that arrives first waits for them beside the accept, and a later `SETUP` that
+        // re-keys the stream is picked up without the listener having to restart.
+        let mut keys = mirror_ready;
         let mut pending = None;
-        let mut mirror_ready = mirror_ready;
-        let keys = loop {
-            tokio::select! {
-                _ = stopped(mirror_stop.clone()) => return,
-                ready = &mut mirror_ready => match ready {
-                    Ok(keys) => {
-                        println!("*** mirror stream keyed, video can arrive ***");
-                        break keys;
-                    }
-                    Err(_) => return,
-                },
-                accepted = mirror_sockets.accept_mirror(), if pending.is_none() => match accepted {
-                    Ok(stream) => {
-                        println!("media     a mirror connection arrived before its keys");
-                        pending = Some(stream);
-                    }
-                    Err(error) => {
-                        eprintln!("rust-airplay: the mirror listener stopped: {error}");
-                        return;
-                    }
-                },
-            }
-        };
-        let mut waiting = pending;
         loop {
-            let mut stream = match waiting.take() {
+            let mut stream = match pending.take() {
                 Some(stream) => stream,
                 None => tokio::select! {
                     _ = stopped(mirror_stop.clone()) => return,
@@ -580,6 +566,37 @@ async fn run() -> Result<(), String> {
                     },
                 },
             };
+            // A mirror stream cannot be read without its keys, so a connection that got
+            // here first waits for the `SETUP` that derives them. The wait is beside the
+            // accept rather than in front of it, so a second connection is still taken.
+            let current = loop {
+                if let Some(current) = *keys.borrow() {
+                    break current;
+                }
+                tokio::select! {
+                    _ = stopped(mirror_stop.clone()) => return,
+                    changed = keys.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    accepted = mirror_sockets.accept_mirror(), if pending.is_none() => match accepted {
+                        Ok(stream) => {
+                            println!("media     another mirror connection is waiting for its keys");
+                            pending = Some(stream);
+                        }
+                        Err(error) => {
+                            eprintln!("rust-airplay: the mirror listener stopped: {error}");
+                            return;
+                        }
+                    },
+                }
+            };
+            println!(
+                "*** mirror stream keyed, reading the connection ({} waiting)",
+                usize::from(pending.is_some())
+            );
+            let keys = current;
             let mut session = match airplay_core::media::mirror::MirrorSession::new(&keys) {
                 Ok(session) => session,
                 Err(error) => {
@@ -755,11 +772,12 @@ async fn run() -> Result<(), String> {
                             );
                             return;
                         };
-                        if let Some(sender) = lock(&mirror_keys).take() {
-                            let keys = airplay_core::media::mirror::stream_keys(id, &key);
-                            println!("*** mirror stream keyed, video can arrive ***");
-                            let _ = sender.send(keys);
-                        }
+                        // The keys are published where the listener reads them, so a
+                        // connection that is already waiting is released and one that
+                        // arrives later finds them.
+                        let keys = airplay_core::media::mirror::stream_keys(id, &key);
+                        println!("*** mirror stream keyed (id {id}), video can arrive ***");
+                        lock(&mirror_keys).send_replace(Some(keys));
                     }
                     let Some(client) = request.client_identity else {
                         return;
