@@ -205,6 +205,10 @@ async fn run() -> Result<(), String> {
 
     let handlers_state = Arc::clone(&state);
     println!("waiting for a client (Ctrl+C to stop)");
+    // Every line carries the time since the receiver started serving, because
+    // "the client takes ages to connect" is a question about elapsed time and a
+    // log without timestamps cannot answer it.
+    let started = std::time::Instant::now();
     let trace_log = log.clone();
     let result = server
         .run(move || {
@@ -241,7 +245,8 @@ async fn run() -> Result<(), String> {
                     }
                 };
                 let line = format!(
-                    "  -> {:<14} {:<24} cseq={:<6} body={:<6} {}{}{} => {}{}",
+                    "[{:>7}ms] -> {:<14} {:<40} cseq={:<6} body={:<6} {}{}{} => {}{}",
+                    started.elapsed().as_millis(),
                     trace.method,
                     trace.target,
                     trace

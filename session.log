@@ -1,0 +1,24 @@
+  -> POST           /pair-verify             cseq=0      body=68     application/octet-stream ua=AirPlay/980.77.1 => 200 remote=2908193675/8E494E6A0A62F877
+  -> GET            /info                    cseq=1      body=70     application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=2908193675/8E494E6A0A62F877
+  -> POST           /pair-pin-start          cseq=2      body=0      - ua=AirPlay/980.77.1 => 200 remote=2908193675/8E494E6A0A62F877
+  -> POST           /pair-setup-pin          cseq=0      body=86     application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=2908193675/8E494E6A0A62F877
+  -> POST           /pair-setup-pin          cseq=1      body=347    application/x-apple-binary-plist ua=AirPlay/980.77.1 ! => 470 remote=2908193675/8E494E6A0A62F877
+  -> POST           /pair-verify             cseq=0      body=68     application/octet-stream ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> GET            /info                    cseq=1      body=70     application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /pair-pin-start          cseq=2      body=0      - ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /pair-setup-pin          cseq=0      body=86     application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /pair-setup-pin          cseq=1      body=347    application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /pair-setup-pin          cseq=2      body=116    application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /pair-verify             cseq=3      body=68     application/octet-stream ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /pair-verify             cseq=4      body=68     application/octet-stream ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /fp-setup                cseq=5      body=16     application/octet-stream ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /fp-setup                cseq=6      body=164    application/octet-stream ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> SETUP          rtsp://192.168.1.7/2765102747429192913 cseq=7      body=755    application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> GET            /info                    cseq=8      body=0      - ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> RECORD         rtsp://192.168.1.7/2765102747429192913 cseq=9      body=0      - ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> SETUP          rtsp://192.168.1.7/2765102747429192913 cseq=10     body=204    application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /feedback                cseq=11     body=0      - ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /feedback                cseq=12     body=0      - ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /feedback                cseq=13     body=0      - ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> POST           /feedback                cseq=14     body=0      - ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
+  -> TEARDOWN       rtsp://192.168.1.7/2765102747429192913 cseq=15     body=42     application/x-apple-binary-plist ua=AirPlay/980.77.1 => 200 remote=251703541/EDEDB9348AA5E2F9
