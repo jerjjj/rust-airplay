@@ -36,7 +36,7 @@
 | **S4-1b-2** NTP 时序服务 | 🟡 **报文层已完成**（`src/media/timing.rs`）：按上游 `raop_ntp.c:578-700` 构造 32 字节请求（`0x80 0xd2 0x00 0x07`，偏移 24 放本机 NTP 时间戳，复用 `ntp::unix_nanos_to_timestamp`）并读回应答的三个 32 位值（偏移 8/16/24 = t1/t2/t3，类型 `0x53`）。**时钟算术仍未做**：上游用 `raop_ntp_adjust_remote_timestamp_offset` 调整远端值、拒绝重复与伪造包、并叠加 `sync_delay`，这些必须通读 `raop_ntp.c`(1027 行) 才能忠实实现——不猜 | `lib/raop_ntp.c`（待通读） | 3 条报文层测试（请求字节与上游一致、时间戳往返在格式精度内、请求/短包/错类型被拒） |
 | **S4-1b-3** 时钟同步算术 | 偏差与延迟计算、`sync_delay`、重复/伪造包拒绝、`recv_time_kernel` 可能为 NULL 的分支 | `lib/raop_ntp.c` 的 `t1..t4` 段落 | 偏差固定向量 + 与上游对照 |
 | **S4-1c** 镜像通道 | 镜像 TCP 连接、H.264 分片重组、由 `streamConnectionID` 派生 AES-CTR 密钥与 IV、分片头解析 | `lib/raop_rtp_mirror.c`(966) + `lib/mirror_buffer.c`(133) | 分片乱序/重复/截断/超长有界；密钥派生与上游一致（可用 oracle 差分）；重组后的访问单元边界正确 |
-| **S4-1d** 端口声明 | 上述端口真实绑定后写进 `SetupPorts`，SETUP 才开始声明 `dataPort`/`controlPort`/`timingPort` | `lib/raop_handlers.h` 的 SETUP 分支（已移植，只需接上真实端口） | 真机 SETUP 响应含端口；`netstat`/`ss` 可见监听；真机开始真的发包（抓包确认） |
+| **S4-1d** 端口与收包 | 🟡 **套接字层已完成**（`src/media/ports.rs`）：`MediaSockets::bind` 绑定 timing/control/data 三个 UDP 端口（上游 `raop_rtp.c:236-244` 同样是这三个），`receive_audio`/`receive_control`/`receive_timing` 驱动收包；socket 级测试证明**真 UDP 上**乱序被正确重排序、重发在控制口补上缺口、时序口把报文交给调用方。**仍待**：① 收包循环的编排（tokio task + 帧回调和背压）；② 镜像 TCP 监听（随 S4-1c）；③ 把绑定端口写进 `SetupPorts` 并接进 CLI（之后真机 SETUP 才声明端口） | `lib/raop_rtp.c:236-244` + `lib/raop_handlers.h` 的 SETUP 分支 | 已有 4 条 socket 测试；接线后需真机确认 SETUP 响应含端口且真有包进来 |
 
 **实现中被新单测抓出的两个自身缺陷**（记录在案以免重犯）：
 

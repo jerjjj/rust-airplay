@@ -18,4 +18,5 @@
 
 pub mod audio;
 pub mod control;
+pub mod ports;
 pub mod timing;
