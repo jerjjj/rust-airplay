@@ -11,6 +11,7 @@
  * Modes:
  *   crypto                          pair-verify keystream, pair-setup GCM nonces
  *   fairplay                        PlayFair setup/handshake/decrypt vectors
+ *   mirror                          the mirror stream's keys and its CTR rule
  *   srp-init [plain|short]          salt, verifier, server public value
  *   srp-verify <salt> <verifier> <b> <A> <M>
  *                                   whether upstream's verifier accepts our
@@ -19,6 +20,7 @@
  *
  * Build: tools/oracle/build.ps1
  */
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +29,7 @@
 #include "crypto.h"
 #include "fairplay.h"
 #include "logger.h"
+#include "mirror_buffer.h"
 #include "srp.h"
 
 /* The names upstream uses for the one hash and group it supports; `pairing.h`
@@ -50,6 +53,7 @@ static void emit(const char *key, const unsigned char *data, int length) {
     printf("%s = ", key);
     for (int index = 0; index < length; index++) {
         printf("%02x", data[index]);
+        fflush(stdout);
     }
     printf("\n");
 }
@@ -315,6 +319,132 @@ static void fairplay_vectors(void) {
     fairplay_destroy(fairplay);
 }
 
+/* ------------------------------------------------------------ mirror --- */
+
+/* The audio key and stream connection identifier the mirror vectors use. They are
+ * fixed so the differential test can derive the same stream keys itself. */
+static const uint64_t mirror_connection_id = 2765102747429192913ULL;
+static const unsigned char mirror_audio_key[16] = {
+    0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+    0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+};
+
+/* Packet lengths the vectors walk. The first two are the fixed vector from the
+ * handoff: 40 bytes leaves eight keystream bytes of its tail block behind, and the
+ * 24-byte packet that follows starts with them. */
+static const int mirror_lengths[] = {40, 24, 33, 47, 1, 64, 5, 128};
+static const int mirror_length_count =
+    (int)(sizeof(mirror_lengths) / sizeof(mirror_lengths[0]));
+
+/* Encrypts one packet with the keystream `model` says upstream's decryptor reads for
+ * it: `mirror_buffer_decrypt` is an XOR with a keystream, so the bytes it XORs a
+ * packet with are what any client has to have encrypted with. */
+static void mirror_encrypt(const unsigned char *plaintext, int length,
+                           const unsigned char *model, unsigned char *ciphertext) {
+    for (int index = 0; index < length; index++) {
+        ciphertext[index] = (unsigned char)(plaintext[index] ^ model[index]);
+    }
+}
+
+static void mirror_vectors(void) {
+    mirror_buffer_t *buffer = mirror_buffer_init(logger, mirror_audio_key);
+    if (buffer == NULL) {
+        printf("mirror.error = no buffer\n");
+        return;
+    }
+    mirror_buffer_init_aes(buffer, &mirror_connection_id);
+
+    /* The same key and IV the port derives, so the test can compare them. */
+    unsigned char key_material[64] = {0};
+    unsigned char iv_material[64] = {0};
+    snprintf((char *)key_material, sizeof(key_material), "AirPlayStreamKey%" PRIu64,
+             mirror_connection_id);
+    snprintf((char *)iv_material, sizeof(iv_material), "AirPlayStreamIV%" PRIu64,
+             mirror_connection_id);
+    unsigned char key_hash[64];
+    unsigned char iv_hash[64];
+    sha512_labelled((const char *)key_material, mirror_audio_key, 16, key_hash);
+    /* `sha512_labelled` hashes a label and a secret; the IV label is its own. */
+    sha_ctx_t *ctx = sha_init();
+    sha_update(ctx, (const uint8_t *)iv_material, (int)strlen((const char *)iv_material));
+    sha_update(ctx, mirror_audio_key, 16);
+    sha_final(ctx, iv_hash, NULL);
+    sha_destroy(ctx);
+    emit("mirror.key", key_hash, 16);
+    emit("mirror.iv", iv_hash, 16);
+    printf("mirror.connection_id = %" PRIu64 "\n", mirror_connection_id);
+
+    /* The keystream blocks from the IV, so the test can check the port's own
+     * generator block for block. */
+    {
+        aes_ctx_t *probe = aes_ctr_init(key_hash, iv_hash);
+        unsigned char blocks[0x80 * 16];
+        memset(blocks, 0, sizeof(blocks));
+        aes_ctr_decrypt(probe, blocks, blocks, (int)sizeof(blocks));
+        emit("mirror.keystream", blocks, sizeof(blocks));
+        aes_ctr_destroy(probe);
+    }
+
+    /* `mirror_buffer_decrypt` XORs a packet with keystream bytes, so decrypting a
+     * packet of zeros prints exactly the bytes it reads — where in the stream they
+     * are, for every packet length. That is the rule this port has to reproduce, and
+     * the oracle emits it for the lengths the test walks. Each length gets a stream
+     * of its own, so a vector is one packet and not a sequence. */
+    for (int step = 0; step < mirror_length_count; step++) {
+        int length = mirror_lengths[step];
+        unsigned char input[512];
+        unsigned char model[512];
+        char label[64];
+        memset(input, 0, sizeof(input));
+        memset(model, 0, sizeof(model));
+        mirror_buffer_t *reader = mirror_buffer_init(logger, mirror_audio_key);
+        mirror_buffer_init_aes(reader, &mirror_connection_id);
+        mirror_buffer_decrypt(reader, input, model, length);
+        mirror_buffer_destroy(reader);
+        snprintf(label, sizeof(label), "mirror.model%d", step);
+        emit(label, model, length);
+        snprintf(label, sizeof(label), "mirror.length%d", step);
+        emit_int(label, length);
+    }
+
+    /* And the round trip: a packet encrypted with that keystream has to come back
+     * out of upstream's own decrypt unchanged. This is what says the keystream
+     * above is the one a client's ciphertext is read with. */
+    for (int step = 0; step < mirror_length_count; step++) {
+        int length = mirror_lengths[step];
+        unsigned char plaintext[512];
+        unsigned char input[512];
+        unsigned char ciphertext[512];
+        unsigned char decrypted[512];
+        unsigned char model[512];
+        char label[64];
+        sequence(plaintext, length);
+        /* A buffer of its own for each call, so the model is read from a stream that
+         * starts where the vectors start. Its input buffer is separate from its
+         * output one, because upstream decrypts in place on the tail. */
+        mirror_buffer_t *fresh = mirror_buffer_init(logger, mirror_audio_key);
+        mirror_buffer_init_aes(fresh, &mirror_connection_id);
+        memset(input, 0, sizeof(input));
+        memset(model, 0, sizeof(model));
+        mirror_buffer_decrypt(fresh, input, model, length);
+        mirror_buffer_destroy(fresh);
+
+        mirror_encrypt(plaintext, length, model, ciphertext);
+        mirror_buffer_t *reader = mirror_buffer_init(logger, mirror_audio_key);
+        mirror_buffer_init_aes(reader, &mirror_connection_id);
+        memset(decrypted, 0, sizeof(decrypted));
+        memset(input, 0, sizeof(input));
+        memcpy(input, ciphertext, (size_t)length);
+        mirror_buffer_decrypt(reader, input, decrypted, length);
+        mirror_buffer_destroy(reader);
+        snprintf(label, sizeof(label), "mirror.plaintext%d", step);
+        emit(label, decrypted, length);
+        snprintf(label, sizeof(label), "mirror.ciphertext%d", step);
+        emit(label, ciphertext, length);
+    }
+    mirror_buffer_destroy(buffer);
+}
+
 int main(int argc, char **argv) {
     logger = logger_init();
     const char *mode = argc > 1 ? argv[1] : "crypto";
@@ -322,12 +452,14 @@ int main(int argc, char **argv) {
         crypto_vectors();
     } else if (strcmp(mode, "fairplay") == 0) {
         fairplay_vectors();
+    } else if (strcmp(mode, "mirror") == 0) {
+        mirror_vectors();
     } else if (strcmp(mode, "srp-init") == 0) {
         srp_init(argc > 2 && strcmp(argv[2], "short") == 0);
     } else if (strcmp(mode, "srp-verify") == 0) {
         srp_verify(argc, argv);
     } else {
-        printf("usage: oracle [crypto|fairplay|srp-init [short]|srp-verify <salt> <verifier> <b> <A> <M>]\n");
+        printf("usage: oracle [crypto|fairplay|mirror|srp-init [short]|srp-verify <salt> <verifier> <b> <A> <M>]\n");
     }
     logger_destroy(logger);
     return 0;

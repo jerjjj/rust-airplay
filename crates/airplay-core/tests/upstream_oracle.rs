@@ -20,6 +20,7 @@ use std::process::Command;
 
 use airplay_core::crypto::{Aes128CtrState, aes128_gcm16_decrypt, aes128_gcm16_encrypt};
 use airplay_core::fairplay::FairPlaySession;
+use airplay_core::media::mirror::{MirrorDecryptor, stream_keys};
 use airplay_core::pairing::{
     derive_pair_setup_keys, derive_pair_verify_keys, pair_setup_gcm_nonces,
 };
@@ -166,4 +167,105 @@ fn fairplay_matches_upstream() {
     let encrypted = sequence::<72>();
     let key = session.decrypt(&encrypted).expect("decrypt");
     assert_eq!(hex(&key), field(&fields, "fairplay.decrypted_key"));
+}
+
+/// The mirror stream: the keys its two hashes derive, and the CTR rule its packets
+/// follow.
+///
+/// The mirror stream: the keys its two hashes derive, and the CTR rule its packets
+/// follow.
+///
+/// `mirror_buffer_decrypt` XORs a packet with keystream bytes, so the oracle decrypts
+/// all-zero packets of the lengths the port walks and prints exactly the bytes
+/// upstream read — where in the stream they are. It also checks that upstream's own
+/// decrypt gives back a plaintext encrypted with those bytes, so the vector says
+/// what upstream does rather than what this file believes it does. On this side the
+/// port has to read the same keystream bytes for the same packets, recover the
+/// ciphertext, and carry the right number of bytes between packets.
+///
+/// The first two lengths are the fixed vector the slice was judged on: 40 bytes
+/// followed by 24, which is where a receiver that loses the tail block's unused
+/// keystream goes wrong.
+#[test]
+#[ignore = "needs the upstream C oracle; see tools/oracle/README.md"]
+fn mirror_stream_matches_upstream() {
+    let fields = oracle("mirror");
+    let connection_id: u64 = field(&fields, "mirror.connection_id")
+        .parse()
+        .expect("the oracle prints the connection identifier");
+    assert_eq!(connection_id, 2_765_102_747_429_192_913);
+    let audio_key = [0x5a; 16];
+
+    let keys = stream_keys(connection_id, &audio_key);
+    assert_eq!(keys.key, bytes::<16>(&fields, "mirror.key"));
+    assert_eq!(keys.iv, bytes::<16>(&fields, "mirror.iv"));
+
+    let decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+    // The keystream from the IV, block for block, as upstream's own CTR context
+    // generates it.
+    let upstream = hex_of(&fields, "mirror.keystream");
+    assert_eq!(
+        decryptor.keystream(0, upstream.len() / 16),
+        upstream,
+        "the keystream from the IV"
+    );
+
+    // The lengths the oracle walks: the fixed vector, a length that is never block
+    // aligned, a whole number of blocks, and small packets.
+    let lengths = [40usize, 24, 33, 47, 1, 64, 5, 128];
+    for (step, length) in lengths.into_iter().enumerate() {
+        assert_eq!(
+            field(&fields, &format!("mirror.length{step}")),
+            length.to_string(),
+            "the oracle and this test walk the same lengths"
+        );
+        let model = hex_of(&fields, &format!("mirror.model{step}"));
+        assert_eq!(
+            model.len(),
+            length,
+            "the keystream a packet of {length} reads"
+        );
+
+        // Every packet is read from a stream that starts at the IV: they are not a
+        // sequence, so how far the counter had moved is not part of the vector.
+        let mut decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+        let mut read = vec![0u8; length];
+        decryptor
+            .decrypt(&vec![0u8; length], &mut read)
+            .unwrap_or_else(|error| panic!("packet of {length}: {error}"));
+        assert_eq!(
+            read, model,
+            "a packet of {length} reads different keystream bytes than upstream"
+        );
+        assert_eq!(
+            decryptor.carried(),
+            (16 - length % 16) % 16,
+            "the bytes a packet of {length} leaves for the next one"
+        );
+
+        // And the plaintext the oracle encrypted with those bytes comes back.
+        let expected = hex_of(&fields, &format!("mirror.plaintext{step}"));
+        let ciphertext = hex_of(&fields, &format!("mirror.ciphertext{step}"));
+        assert_eq!(expected.len(), length);
+        assert_eq!(ciphertext.len(), length);
+        assert_eq!(
+            ciphertext
+                .iter()
+                .zip(&expected)
+                .zip(&model)
+                .map(|((c, p), k)| c ^ p ^ k)
+                .collect::<Vec<u8>>(),
+            vec![0u8; length],
+            "the oracle's ciphertext is its plaintext XOR its keystream"
+        );
+        let mut plaintext = vec![0u8; length];
+        let mut decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+        decryptor
+            .decrypt(&ciphertext, &mut plaintext)
+            .unwrap_or_else(|error| panic!("packet of {length}: {error}"));
+        assert_eq!(
+            plaintext, expected,
+            "packet of {length} decrypted differently from upstream"
+        );
+    }
 }

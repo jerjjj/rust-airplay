@@ -20,6 +20,24 @@
 //! stream, so the AES-CTR keystream restarts at offset zero. Nothing here holds
 //! state across streams, so that is a property of how a caller uses
 //! [`StreamKeys`] rather than of the type.
+//!
+//! # How the payload is encrypted
+//!
+//! The video payload is AES-128-CTR, but not as one continuous stream: upstream
+//! calls `aes_ctr_start_fresh_block` at the start of every packet
+//! (`upstream/UxPlay@3dbf7cee:lib/mirror_buffer.c:104`), and OpenSSL's CTR context
+//! keeps a *block offset* rather than a byte position. Decrypting a length that is
+//! not a multiple of sixteen therefore leaves the context part-way into a block,
+//! and "start a fresh block" throws the rest of that block's keystream away. What
+//! upstream does with it instead is to decrypt the packet's tail as **one whole
+//! block** and keep the bytes the packet did not use
+//! (`mirror_buffer.c:111-123`), so the next packet's first bytes are XORed with
+//! them ([`MirrorDecryptor`] is that state).
+//!
+//! Upstream also sends the codec configuration (an H.264 SPS and PPS) in a packet
+//! of its own, *unencrypted*, and prepends it to the next video packet because a
+//! decoder needs it before the first frame
+//! (`raop_rtp_mirror.c:420-450`, [`CodecConfig`]).
 
 use crate::crypto::sha512_concat;
 
@@ -131,6 +149,20 @@ pub enum MirrorError {
         /// Bytes a receiver accepts.
         maximum: usize,
     },
+    /// The state holds more keystream bytes than the packet has.
+    Carry {
+        /// Keystream bytes being carried.
+        carried: usize,
+        /// Bytes of payload the packet has.
+        length: usize,
+    },
+    /// The output buffer is not as long as the payload.
+    OutputLength {
+        /// Bytes of payload.
+        length: usize,
+        /// Bytes of output.
+        output: usize,
+    },
 }
 
 impl std::fmt::Display for MirrorError {
@@ -147,6 +179,14 @@ impl std::fmt::Display for MirrorError {
             Self::TooLarge { promised, maximum } => write!(
                 formatter,
                 "the header promises {promised} bytes of payload, more than the {maximum} a receiver reads"
+            ),
+            Self::Carry { carried, length } => write!(
+                formatter,
+                "{carried} keystream bytes are carried but the packet has {length}"
+            ),
+            Self::OutputLength { length, output } => write!(
+                formatter,
+                "the payload is {length} bytes but the output holds {output}"
             ),
         }
     }
@@ -330,77 +370,356 @@ pub fn into_annex_b(payload: &mut [u8]) -> Result<usize, NalError> {
 }
 /// The keystream of one mirror stream.
 ///
-/// Video packets are decrypted with AES-128-CTR, and the counter does **not**
-/// restart at each packet: a packet continues where the previous one left the
-/// keystream. Upstream keeps that position in `mirror_buffer` and throws it away
-/// when the stream is re-keyed (`mirror_buffer.c`, which sets its counter to zero
-/// there), and this type is that position, with [`StreamCipher::restart`] for the
-/// re-key.
+/// This is upstream's `mirror_buffer` state: the key and IV, where in the stream the
+/// counter has come to, and the bytes of a partly used keystream block that the
+/// previous packet left behind. The rule it follows is written out in
+/// `mirror_buffer_decrypt` (`upstream/UxPlay@3dbf7cee:lib/mirror_buffer.c:94-124`) and
+/// is not what a plain CTR stream would do, so it is repeated here in the order the C
+/// code performs it:
 ///
-/// # This is not the rule upstream follows, and must not be wired up
+/// 1. the first `carry` bytes of the packet are XORed with the **end** of the previous
+///    packet's tail block, which that packet did not use
+///    (`output[i] = input[i] ^ og[16 - carry + i]`);
+/// 2. the counter is moved to a block boundary (`aes_ctr_start_fresh_block`, which is
+///    the block after the tail block), and the whole blocks after the carry —
+///    `((len - carry) / 16) * 16` bytes — are decrypted from there;
+/// 3. the remaining `rest = (len - carry) % 16` bytes are decrypted as one whole block
+///    (zero padded), of which the packet keeps the first `rest`; the other
+///    `16 - rest` keystream bytes are the carry for the next packet.
 ///
-/// Reading `mirror_buffer.c` after this was written showed that upstream does
-/// **not** run one continuous keystream across packets, which is what this type
-/// models. It restarts the counter at the beginning of every packet
-/// (`aes_ctr_start_fresh_block`), decrypts the whole blocks from there, and treats
-/// the packet's tail separately: the remaining bytes are decrypted as one whole
-/// block, the bytes the packet uses are taken from it, and the **unused keystream
-/// bytes of that block are kept** (upstream's `og` buffer and `nextDecryptCount`)
-/// to be XORed into the head of the next packet.
+/// So a packet's first bytes are keystream the previous packet left behind, and its
+/// body is the stream's own blocks from the counter, which is what makes this
+/// different from one continuous keystream: two packets of the same length read the
+/// same blocks. The counter advances by the blocks a packet used, its tail's
+/// included, because the next packet starts one block past the carry's block.
 ///
-/// So a correct implementation carries `16 - (length % 16)` keystream bytes from
-/// one packet to the next *and* restarts the counter per packet, which is a
-/// different mechanism from the `advanced` counter below. Until that lands, this
-/// type is a placeholder: it is not wired into any stream, and the test that
-/// "two packets equal one payload" only states what this placeholder does, not
-/// what a client's video needs. `docs/S4_WORK_PLAN.md` records the rule above as
-/// the next step of this slice.
-pub struct StreamCipher {
-    state: crate::crypto::Aes128CtrState,
-    advanced: usize,
+/// The rule is pinned against upstream's own code in `tests/upstream_oracle.rs`,
+/// which reads where upstream's decryptor takes its keystream bytes from, packet by
+/// packet.
+#[derive(Clone)]
+pub struct MirrorDecryptor {
+    /// The stream's key and IV: a mirror packet's keystream is a function of the
+    /// packet's position in the stream, so nothing about the previous packet other
+    /// than the bytes it carried is kept.
+    key: [u8; STREAM_KEY_LEN],
+    iv: [u8; STREAM_KEY_LEN],
+    /// Whole blocks the packets decrypted so far had, which is how far into the
+    /// stream the next packet's fresh block is.
+    blocks: u64,
+    /// Bytes of the previous packet's tail block that it did not use,
+    /// `og[16 - carry..]` in upstream.
+    carry: [u8; 16],
+    /// How many of them there are, upstream's `nextDecryptCount`.
+    carried: usize,
 }
 
-impl StreamCipher {
-    /// Starts the keystream of a stream at its beginning.
+impl std::fmt::Debug for MirrorDecryptor {
+    /// Reports the position in the stream and nothing derived from the keys, so a
+    /// session log can record where decryption is without recording secrets.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MirrorDecryptor")
+            .field("blocks", &self.blocks)
+            .field("carried", &self.carried)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MirrorDecryptor {
+    /// Starts a stream at its first packet.
     ///
     /// # Errors
     ///
     /// Returns [`crate::crypto::CryptoError`] when the keys have the wrong shape.
     pub fn new(keys: &StreamKeys) -> Result<Self, crate::crypto::CryptoError> {
+        // The shape check is what `Aes128CtrState` does for the rest of this crate;
+        // the arrays here are already sixteen bytes, so it cannot fail.
+        let _ = crate::crypto::Aes128CtrState::new(&keys.key, &keys.iv)?;
         Ok(Self {
-            state: crate::crypto::Aes128CtrState::new(&keys.key, &keys.iv)?,
-            advanced: 0,
+            key: keys.key,
+            iv: keys.iv,
+            blocks: 0,
+            carry: [0; 16],
+            carried: 0,
         })
     }
 
-    /// Decrypts one payload in place, continuing the keystream.
+    /// Starts a new stream, as a re-key does.
+    ///
+    /// Upstream clears its carry buffer here (`mirror_buffer_init_aes`,
+    /// `mirror_buffer.c:66-70`): a re-key means a new stream, and bytes held back
+    /// from the previous one are the wrong keystream for the first packet of this
+    /// one.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::crypto::CryptoError`] when the cipher refuses the input.
-    pub fn decrypt(&mut self, payload: &mut [u8]) -> Result<(), crate::crypto::CryptoError> {
-        self.state.apply(payload);
-        self.advanced += payload.len();
+    /// Returns [`crate::crypto::CryptoError`] when the keys have the wrong shape.
+    pub fn rekey(&mut self, keys: &StreamKeys) -> Result<(), crate::crypto::CryptoError> {
+        *self = Self::new(keys)?;
         Ok(())
     }
 
-    /// Bytes the keystream has advanced, which is what a caller reports when it
-    /// wants to know how far into a stream it is.
-    pub fn advanced(&self) -> usize {
-        self.advanced
+    /// How many keystream bytes the previous packet left for the next one,
+    /// upstream's `nextDecryptCount`.
+    pub fn carried(&self) -> usize {
+        self.carried
     }
 
-    /// Starts the keystream over, as a re-key does.
+    /// The block the next packet's counter starts on, which is how far into the
+    /// stream this receiver has come.
+    pub fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    /// The keystream of `blocks` blocks starting at block `first` of the stream.
+    ///
+    /// Upstream reaches this through OpenSSL's CTR context, whose counter block is
+    /// incremented per block. Generating the blocks here keeps the position
+    /// explicit: which block a packet starts on is the whole of the rule
+    /// (`mirror_buffer.c:94-124`), and it must not depend on any state a cipher
+    /// implementation keeps for itself.
+    ///
+    /// It is public because it is also the clearest way to check this port against
+    /// upstream's own context, block for block, in the differential test.
+    #[must_use]
+    pub fn keystream(&self, first: u64, blocks: usize) -> Vec<u8> {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        let cipher = aes::Aes128::new(self.key[..].into());
+        let mut out = Vec::with_capacity(blocks * 16);
+        for index in 0..blocks as u64 {
+            let mut counter = self.iv;
+            // The counter is the IV plus the block index, big-endian, the way
+            // OpenSSL's CTR mode counts.
+            let mut carry = first + index;
+            for byte in counter.iter_mut().rev() {
+                let (next, wrapped) = byte.overflowing_add((carry & 0xff) as u8);
+                *byte = next;
+                carry >>= 8;
+                if carry == 0 && !wrapped {
+                    break;
+                }
+            }
+            let mut block = aes::Block::clone_from_slice(&counter);
+            cipher.encrypt_block(&mut block);
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+
+    /// Decrypts one payload into `output`, which has to be as long as `input`.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::crypto::CryptoError`] when the cipher refuses to reset.
-    pub fn restart(&mut self) -> Result<(), crate::crypto::CryptoError> {
-        self.state.reset()?;
-        self.advanced = 0;
+    /// Returns [`MirrorError::Carry`] when the state holds more keystream bytes
+    /// than the packet has, which no packet sequence from a client produces: it
+    /// means the caller skipped or mis-split a packet, and continuing would
+    /// decrypt the rest of the stream at the wrong offset. Returns
+    /// [`MirrorError::OutputLength`] for an output buffer of a different length.
+    pub fn decrypt(&mut self, input: &[u8], output: &mut [u8]) -> Result<(), MirrorError> {
+        if output.len() != input.len() {
+            return Err(MirrorError::OutputLength {
+                length: input.len(),
+                output: output.len(),
+            });
+        }
+        if self.carried > input.len() {
+            return Err(MirrorError::Carry {
+                carried: self.carried,
+                length: input.len(),
+            });
+        }
+        let carried = self.carried;
+        let whole = ((input.len() - carried) / 16) * 16;
+        let rest = (input.len() - carried) % 16;
+        // Step 1: the first `carried` bytes are XORed with the keystream bytes the
+        // previous packet's tail block did not use (`mirror_buffer.c:96-100`).
+        for (index, byte) in input[..carried].iter().enumerate() {
+            output[index] = byte ^ self.carry[index];
+        }
+        // Steps 2 and 3: the counter starts a fresh block, which is the block after
+        // the ones the packets so far had (`aes_ctr_start_fresh_block`,
+        // `mirror_buffer.c:102-107`). The whole blocks come from it directly, and
+        // the tail is decrypted as one whole block on top of zero padding
+        // (`:111-123`), of which the packet keeps the first `rest` bytes.
+        let fresh = self.keystream(self.blocks, (whole + rest) / 16 + usize::from(rest > 0));
+        for (index, byte) in input[carried..carried + whole].iter().enumerate() {
+            output[carried + index] = byte ^ fresh[index];
+        }
+        self.carried = 0;
+        // The counter advances by the packet's whole blocks and, when the packet did
+        // not end on a block boundary, by the block its tail sat in: the carry it
+        // leaves comes from the front of the **next** block, which is where the next
+        // packet's fresh counter starts. `tests/upstream_oracle.rs` pins this against
+        // upstream's own `mirror_buffer_decrypt`.
+        self.blocks += (whole / 16) as u64;
+        if rest > 0 {
+            let start = input.len() - rest;
+            for index in 0..rest {
+                output[start + index] = input[start + index] ^ fresh[whole + index];
+            }
+            // The bytes the packet did not use are the next packet's keystream, kept
+            // from the front of this buffer; the ones it did use are plaintext, so
+            // they are not carried at all.
+            self.carry = [0; 16];
+            self.carry[..16 - rest].copy_from_slice(&fresh[whole + rest..whole + 16]);
+            self.carried = 16 - rest;
+            self.blocks += 1;
+        }
         Ok(())
     }
 }
+
+/// The codec configuration a mirroring client sends before it starts video.
+///
+/// The packet is unencrypted and carries an H.264 sequence parameter set and a
+/// picture parameter set, which a decoder needs before the first frame. Upstream
+/// does not hand it on where it arrives: it keeps the two units with start codes
+/// in front of them and prepends them to the **next video packet**, which carries
+/// the same timestamp (`upstream/UxPlay@3dbf7cee:lib/raop_rtp_mirror.c:420-450`
+/// and `:754-763`). This type is that rule, and a caller feeds it by calling
+/// [`CodecConfig::codec_data`] for a codec packet and
+/// [`CodecConfig::prepend_to`] for every video packet, in arrival order.
+///
+/// The payload of a codec packet is not a plain sequence of units: it starts with
+/// six bytes of image size, then the two sizes and their sets
+/// (`raop_rtp_mirror.c:560-572` describes the header, `:725-728` reads the sets).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CodecConfig {
+    /// The units with start codes, waiting for the video packet they belong to.
+    pending: Option<Pending>,
+}
+
+/// An SPS and PPS waiting for their video packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pending {
+    /// Client timestamp of the codec packet, which the video packet has to share
+    /// (`raop_rtp_mirror.c:426`).
+    timestamp: u64,
+    /// `00 00 00 01` + SPS + `00 00 00 01` + PPS.
+    units: Vec<u8>,
+}
+
+/// Why a codec configuration packet could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecDataError {
+    /// Fewer bytes than the six-byte header the two sizes live in.
+    TooShort {
+        /// Length it has.
+        length: usize,
+    },
+    /// The sizes do not leave room for both units in the payload.
+    SizeOutOfRange {
+        /// Size the payload claims for the sequence parameter set.
+        sps: usize,
+        /// Size it claims for the picture parameter set.
+        pps: usize,
+        /// Bytes actually there.
+        length: usize,
+    },
+}
+
+impl std::fmt::Display for CodecDataError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort { length } => write!(
+                formatter,
+                "the codec packet is {length} bytes, shorter than its header"
+            ),
+            Self::SizeOutOfRange { sps, pps, length } => write!(
+                formatter,
+                "the codec packet claims {sps} + {pps} bytes of parameter sets in {length}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CodecDataError {}
+
+impl CodecConfig {
+    /// An empty configuration: nothing is waiting to be prepended.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads a codec packet (`packet[4] == 0x01`) and keeps what it carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecDataError`] for a payload that is not a pair of sized
+    /// parameter sets, which is dropped rather than prepended to a frame: a
+    /// decoder fed a wrong byte stream does not fail cleanly.
+    pub fn codec_data(&mut self, timestamp: u64, payload: &[u8]) -> Result<(), CodecDataError> {
+        // The size of the first parameter set sits at offset six, the sequence
+        // parameter set itself at eight, and the second set's size after the first
+        // (`raop_rtp_mirror.c:725-728`: `payload[6]`, `payload + 8`, and
+        // `payload[sps_size + 9]`, which is the two size bytes starting one byte
+        // before the set's last one).
+        let sps_size = read_size(payload, 6).ok_or(CodecDataError::TooShort {
+            length: payload.len(),
+        })?;
+        let sps_at = 8;
+        let pps_size_at = sps_size + 8;
+        let pps_at = sps_size + 10;
+        let pps_size = read_size(payload, pps_size_at).ok_or(CodecDataError::SizeOutOfRange {
+            sps: sps_size,
+            pps: pps_size_or_zero(payload, pps_size_at),
+            length: payload.len(),
+        })?;
+        let (Some(sps), Some(pps)) = (
+            payload.get(sps_at..sps_at + sps_size),
+            payload.get(pps_at..pps_at + pps_size),
+        ) else {
+            return Err(CodecDataError::SizeOutOfRange {
+                sps: sps_size,
+                pps: pps_size,
+                length: payload.len(),
+            });
+        };
+        // A later codec packet replaces an earlier one that was never used, the
+        // way upstream frees the buffer it was holding (`:622-625`).
+        let mut units = Vec::with_capacity(sps.len() + pps.len() + 8);
+        units.extend_from_slice(&START_CODE);
+        units.extend_from_slice(sps);
+        units.extend_from_slice(&START_CODE);
+        units.extend_from_slice(pps);
+        self.pending = Some(Pending { timestamp, units });
+        Ok(())
+    }
+
+    /// Whether a configuration is waiting for its video packet.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The configuration waiting for the video packet whose client timestamp is
+    /// `timestamp`.
+    ///
+    /// A video packet with a different timestamp means the codec packet that is
+    /// waiting belongs to a stream that is no longer arriving, so it is discarded
+    /// and `None` is returned (`raop_rtp_mirror.c:426-433`). Calling this for
+    /// every video packet in arrival order is what makes the rule upstream's:
+    /// whatever is prepended is prepended exactly once.
+    #[must_use]
+    pub fn prepend_to(&mut self, timestamp: u64) -> Option<Vec<u8>> {
+        match self.pending.take() {
+            Some(pending) if pending.timestamp == timestamp => Some(pending.units),
+            _ => None,
+        }
+    }
+}
+
+/// Reads a big-endian sixteen-bit size at `offset`, if the payload has it.
+fn read_size(payload: &[u8], offset: usize) -> Option<usize> {
+    let end = offset.checked_add(2)?;
+    let bytes = payload.get(offset..end)?;
+    Some(u16::from_be_bytes(bytes.try_into().expect("two bytes")) as usize)
+}
+
+/// The size field at `offset` for an error report, or zero when it is not there.
+fn pps_size_or_zero(payload: &[u8], offset: usize) -> usize {
+    read_size(payload, offset).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,51 +747,404 @@ mod tests {
         payload
     }
 
-    #[test]
-    fn the_keystream_continues_from_one_packet_to_the_next() {
-        let keys = stream_keys(7, &[0x31; STREAM_KEY_LEN]);
-        let first = [0x11u8; 40];
-        let second = [0x22u8; 24];
-
-        // Two packets in sequence are the same as one payload of their length,
-        // which is what "the counter does not restart per packet" means.
-        let mut cipher = StreamCipher::new(&keys).expect("cipher");
-        let mut one = first;
-        let mut two = second;
-        cipher.decrypt(&mut one).expect("first");
-        cipher.decrypt(&mut two).expect("second");
-        assert_eq!(cipher.advanced(), 64);
-
-        let mut whole = Vec::new();
-        whole.extend_from_slice(&first);
-        whole.extend_from_slice(&second);
-        let mut expected_a = [0x11u8; 40];
-        let mut expected_b = [0x22u8; 24];
-        let mut reference = StreamCipher::new(&keys).expect("cipher");
-        let mut joined = Vec::new();
-        joined.extend_from_slice(&expected_a);
-        joined.extend_from_slice(&expected_b);
-        reference.decrypt(&mut joined).expect("joined");
-        expected_a.copy_from_slice(&joined[..40]);
-        expected_b.copy_from_slice(&joined[40..]);
-        assert_eq!(one, expected_a);
-        assert_eq!(two, expected_b);
+    /// A codec payload the way upstream reads one: two bytes, the source width and
+    /// height as big-endian sixteen-bit values, then a sixteen-bit size and the
+    /// sequence parameter set, then a sixteen-bit size and the picture parameter
+    /// set (`raop_rtp_mirror.c:725-728`; the header around them is what
+    /// `:560-572` describes).
+    fn codec_payload(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0u8; 6];
+        payload[2..4].copy_from_slice(&1920u16.to_be_bytes());
+        payload[4..6].copy_from_slice(&1080u16.to_be_bytes());
+        payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        payload.extend_from_slice(sps);
+        payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        payload.extend_from_slice(pps);
+        payload
     }
 
     #[test]
-    fn a_rekey_starts_the_keystream_over() {
-        let keys = stream_keys(9, &[0x41; STREAM_KEY_LEN]);
-        let mut cipher = StreamCipher::new(&keys).expect("cipher");
-        let mut payload = [0x55u8; 32];
-        cipher.decrypt(&mut payload).expect("first");
-        assert_eq!(cipher.advanced(), 32);
-        // The same bytes again: without the restart they would decrypt to
-        // something else, because the keystream has moved on.
-        cipher.restart().expect("restart");
-        assert_eq!(cipher.advanced(), 0);
-        let mut again = [0x55u8; 32];
-        cipher.decrypt(&mut again).expect("again");
-        assert_eq!(again, payload, "the stream began again");
+    fn keeps_the_codec_configuration_for_the_next_video_packet() {
+        let sps = [0x67, 0x42, 0x00, 0x1e];
+        let pps = [0x68, 0xce];
+        let mut config = CodecConfig::new();
+        assert!(!config.is_pending());
+        config
+            .codec_data(0x1122, &codec_payload(&sps, &pps))
+            .expect("codec data");
+        assert!(config.is_pending());
+
+        // Upstream prepends the two units with start codes in front of them, and
+        // only to a packet with the codec packet's own timestamp.
+        let units = config.prepend_to(0x1122).expect("prepended");
+        assert_eq!(
+            units,
+            [
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce
+            ]
+        );
+        assert!(!config.is_pending(), "it is prepended once");
+        assert!(config.prepend_to(0x1122).is_none(), "not twice");
+    }
+
+    #[test]
+    fn drops_a_configuration_whose_timestamp_does_not_match() {
+        // A video packet with another timestamp means the configuration belongs
+        // to a stream that is no longer arriving (raop_rtp_mirror.c:426-433), and
+        // a decoder fed it would see parameter sets for the wrong picture.
+        let mut config = CodecConfig::new();
+        config
+            .codec_data(0x1122, &codec_payload(&[0x67, 0x01], &[0x68, 0x02]))
+            .expect("codec data");
+        assert!(config.prepend_to(0x3344).is_none(), "discarded");
+        assert!(!config.is_pending(), "and not kept for the next packet");
+        assert!(config.prepend_to(0x1122).is_none());
+    }
+
+    #[test]
+    fn a_later_configuration_replaces_one_that_was_never_used() {
+        let mut config = CodecConfig::new();
+        config
+            .codec_data(1, &codec_payload(&[0x67, 0xaa], &[0x68, 0xbb]))
+            .expect("first");
+        config
+            .codec_data(2, &codec_payload(&[0x67, 0xcc], &[0x68, 0xdd]))
+            .expect("second");
+        assert_eq!(
+            config.prepend_to(2).expect("prepended"),
+            [
+                0x00, 0x00, 0x00, 0x01, 0x67, 0xcc, 0x00, 0x00, 0x00, 0x01, 0x68, 0xdd
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_a_codec_payload_that_does_not_hold_two_parameter_sets() {
+        let mut config = CodecConfig::new();
+        assert_eq!(
+            config.codec_data(1, &[0, 0, 0, 0, 0]),
+            Err(CodecDataError::TooShort { length: 5 })
+        );
+        // The sizes claim more than the payload has: a 25-byte sequence parameter
+        // set whose size field sits past the end of a 30-byte payload.
+        let mut payload = vec![0u8; 30];
+        payload[6..8].copy_from_slice(&25u16.to_be_bytes());
+        assert_eq!(
+            config.codec_data(1, &payload),
+            Err(CodecDataError::SizeOutOfRange {
+                sps: 25,
+                pps: 0,
+                length: 30
+            })
+        );
+        assert!(!config.is_pending(), "nothing was kept");
+
+        // A length that would overflow the offset arithmetic is refused before
+        // anything is read with it.
+        let mut huge = vec![0u8; 10];
+        huge[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            config.codec_data(1, &huge),
+            Err(CodecDataError::SizeOutOfRange { sps: 65535, .. })
+        ));
+    }
+
+    /// The keystream a stream generates from its IV, computed here rather than by
+    /// the type under test: block `index` is the AES-128 encryption of `IV + index`,
+    /// and the keystream is those blocks one after another.
+    fn keystream(keys: &StreamKeys, blocks: usize) -> Vec<u8> {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        let cipher = aes::Aes128::new(keys.key[..].into());
+        let mut counter = keys.iv;
+        let mut out = Vec::with_capacity(blocks * 16);
+        for _ in 0..blocks {
+            let mut block = aes::Block::clone_from_slice(&counter);
+            cipher.encrypt_block(&mut block);
+            out.extend_from_slice(&block);
+            for byte in counter.iter_mut().rev() {
+                let (next, wrapped) = byte.overflowing_add(1);
+                *byte = next;
+                if !wrapped {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// One payload of `length` patterned bytes, so a wrong offset shows up in every
+    /// byte instead of only where the pattern happens to change.
+    fn patterned(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index as u8).wrapping_mul(7) ^ 0x3c)
+            .collect()
+    }
+
+    /// The client's side of the wire, written from the rule `mirror_buffer_decrypt`
+    /// follows (`upstream/UxPlay@3dbf7cee:lib/mirror_buffer.c:94-124`) rather than from
+    /// this port: the counter restarts on the block after the blocks used so far, the
+    /// bytes carried from the previous packet go in front, and a packet that does not
+    /// end on a block boundary puts its tail, zero padded, into one whole block whose
+    /// unused bytes it carries.
+    ///
+    /// A port and a client that both read the rule correctly agree on the keystream
+    /// every byte sits at. The differential test in `tests/upstream_oracle.rs` checks
+    /// the same port against upstream's own code; this is what checks whole packet
+    /// sequences, which the oracle's vectors are not.
+    struct Encoder<'a> {
+        stream: &'a [u8],
+        /// Whole blocks the packets so far occupied, plus one for a tail that did not
+        /// fill its block: where the next packet's fresh counter starts.
+        blocks: usize,
+        /// Where in `stream` the bytes being carried came from, so the test can check
+        /// the receiver read the same ones.
+        carry_at: usize,
+        carried: usize,
+    }
+
+    impl<'a> Encoder<'a> {
+        fn new(stream: &'a [u8]) -> Self {
+            Self {
+                stream,
+                blocks: 0,
+                carry_at: 0,
+                carried: 0,
+            }
+        }
+
+        /// Encrypts `plaintext` the way a client would, and returns the ciphertext,
+        /// the keystream offset each byte of it sits at, how many bytes are left for
+        /// the next packet, and the block the next packet will start its counter on.
+        fn encrypt(&mut self, plaintext: &[u8]) -> (Vec<u8>, Vec<usize>, usize, usize) {
+            let carried = self.carried;
+            let fresh_at = self.blocks * 16;
+            let whole = (plaintext.len() - carried) / 16 * 16;
+            let rest = plaintext.len() - carried - whole;
+            let mut ciphertext = plaintext.to_vec();
+            let mut offsets = Vec::with_capacity(plaintext.len());
+            for index in 0..carried {
+                offsets.push(self.carry_at + index);
+            }
+            for index in carried..plaintext.len() {
+                offsets.push(fresh_at + index - carried);
+            }
+            for (index, offset) in offsets.iter().enumerate() {
+                ciphertext[index] ^= self.stream[*offset];
+            }
+            // The counter advances by the block the tail sits in and the whole blocks
+            // after the carry: the carry's bytes were the previous packet's, so they
+            // are not part of this packet's blocks.
+            self.blocks += (plaintext.len() - carried) / 16;
+            if rest > 0 {
+                let tail = fresh_at + whole;
+                self.carry_at = tail + rest;
+                self.carried = 16 - rest;
+                self.blocks += 1;
+            } else {
+                self.carried = 0;
+            }
+            (ciphertext, offsets, self.carried, self.blocks)
+        }
+    }
+
+    #[test]
+    fn the_keystream_generator_matches_the_crates_own_cipher() {
+        // `MirrorDecryptor` generates its blocks from the IV itself, because where
+        // the counter sits is the whole of the mirror rule. This says that generator
+        // produces the same bytes as the CTR cipher the rest of the crate uses.
+        let keys = stream_keys(11, &[0x44; STREAM_KEY_LEN]);
+        let reference = keystream(&keys, 4);
+        let mut cipher = [0u8; 64];
+        crate::crypto::Aes128CtrState::new(&keys.key, &keys.iv)
+            .expect("state")
+            .apply(&mut cipher);
+        let decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+        assert_eq!(reference, cipher.to_vec(), "the reference over a buffer");
+        assert_eq!(
+            decryptor.keystream(0, 4),
+            cipher.to_vec(),
+            "the decryptor's generator"
+        );
+        // And a block further into the stream is that block, not a shifted one.
+        assert_eq!(
+            decryptor.keystream(2, 2),
+            cipher[32..64].to_vec(),
+            "blocks two and three"
+        );
+    }
+    #[test]
+    fn decrypts_what_a_client_encrypts_with_the_same_rule() {
+        // Packet lengths that can really appear on the wire: every one is at least as
+        // long as the bytes the previous packet left behind. The handoff's fixed
+        // vector comes first, then a length that is never block aligned, a whole
+        // number of blocks, and small packets.
+        let lengths = [40usize, 24, 33, 47, 1, 64, 5, 128];
+        let keys = stream_keys(7, &[0x31; STREAM_KEY_LEN]);
+        // The vector's total length is 339 bytes, and 64 blocks cover it.
+        let stream = keystream(&keys, 64);
+        // The reference keystream is checked against the crate's own cipher over a
+        // whole buffer, so a mistake in it cannot make this test agree with a mistake
+        // in the implementation.
+        let mut zeros = vec![0u8; 512];
+        crate::crypto::Aes128CtrState::new(&keys.key, &keys.iv)
+            .expect("state")
+            .apply(&mut zeros);
+        assert_eq!(zeros, stream[..512], "the reference keystream");
+
+        let mut encoder = Encoder::new(&stream);
+        let mut decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+        let mut carried = 0usize;
+        for length in lengths {
+            // A shorter packet than the bytes being carried is not something a client
+            // sends; the receiver refuses it, and that has its own test.
+            if length < carried {
+                continue;
+            }
+            let plaintext = patterned(length);
+            let (ciphertext, offsets, left, next_block) = encoder.encrypt(&plaintext);
+            assert_ne!(ciphertext, plaintext, "a packet of {length} is encrypted");
+            let mut out = vec![0u8; length];
+            decryptor
+                .decrypt(&ciphertext, &mut out)
+                .unwrap_or_else(|error| panic!("packet of {length}: {error}"));
+            assert_eq!(
+                out, plaintext,
+                "a packet of {length} did not come back the way it was sent"
+            );
+            // The receiver has to have read the keystream the client wrote with, byte
+            // for byte: this is the whole of the rule, and the offsets come from the
+            // client's side rather than from the port.
+            for (index, byte) in out.iter().enumerate() {
+                assert_eq!(
+                    *byte,
+                    ciphertext[index] ^ stream[offsets[index]],
+                    "packet of {length}, byte {index} read keystream offset {}",
+                    offsets[index]
+                );
+            }
+            assert_eq!(
+                decryptor.carried(),
+                left,
+                "the bytes a packet of {length} leaves for the next one"
+            );
+            // Where the client's counter will be is where the receiver's has to be:
+            // both sides have to agree about the block a packet starts on.
+            assert_eq!(
+                decryptor.blocks(),
+                next_block as u64,
+                "the block the packet after {length} starts on"
+            );
+            carried = left;
+        }
+    }
+
+    #[test]
+    fn carries_the_tail_block_into_the_next_packet() {
+        // Upstream's fixed vector, byte by byte: a 40-byte packet uses two whole
+        // blocks and eight bytes of a third, and the other eight bytes of that third
+        // block are what the next packet's head is XORed with
+        // (`mirror_buffer.c:96-100`, `:111-123`). An earlier attempt at this port lost
+        // those eight bytes, which is what this test reports.
+        let keys = stream_keys(1, &[0x11; STREAM_KEY_LEN]);
+        let stream = keystream(&keys, 6);
+        let mut encoder = Encoder::new(&stream);
+        let mut decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+
+        let first = patterned(40);
+        let (ciphertext, offsets, left, _) = encoder.encrypt(&first);
+        let mut out = vec![0u8; 40];
+        decryptor.decrypt(&ciphertext, &mut out).expect("first");
+        assert_eq!(out, first);
+        assert_eq!(decryptor.carried(), 8, "40 bytes leaves the block's last 8");
+        assert_eq!(left, 8);
+        for (index, byte) in out.iter().enumerate() {
+            assert_eq!(*byte, ciphertext[index] ^ stream[index], "byte {index}");
+            assert_eq!(offsets[index], index, "the encoder's own offset {index}");
+        }
+
+        let second = patterned(24);
+        let (ciphertext, offsets, left, _) = encoder.encrypt(&second);
+        let mut out = vec![0u8; 24];
+        decryptor.decrypt(&ciphertext, &mut out).expect("second");
+        assert_eq!(out, second);
+        assert_eq!(decryptor.carried(), 0, "24 bytes ends on a block boundary");
+        assert_eq!(left, 0);
+        // The second packet reads block 2's last eight bytes for its head and block 2
+        // from its start for the body: the counter restarted, it did not continue.
+        assert_eq!(&offsets[..8], &[40, 41, 42, 43, 44, 45, 46, 47]);
+        for (index, byte) in out.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                ciphertext[index] ^ stream[offsets[index]],
+                "byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn restarts_the_counter_at_every_packet() {
+        // Two 24-byte packets. The first uses block 0 and the first half of block 1,
+        // carrying the rest of block 1. The second's fresh block is block 2, so its
+        // head is the carry from block 1 and its body is block 2 — a continuous stream
+        // would have put the whole second packet at bytes 24..48 instead.
+        let keys = stream_keys(3, &[0x77; STREAM_KEY_LEN]);
+        let stream = keystream(&keys, 4);
+        let mut encoder = Encoder::new(&stream);
+        let mut decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+
+        let first = patterned(24);
+        let (ciphertext, offsets, _, _) = encoder.encrypt(&first);
+        let mut out = vec![0u8; 24];
+        decryptor.decrypt(&ciphertext, &mut out).expect("first");
+        assert_eq!(out, first);
+        assert_eq!(decryptor.carried(), 8);
+        for (index, byte) in out.iter().enumerate() {
+            assert_eq!(*byte, ciphertext[index] ^ stream[index], "byte {index}");
+            assert_eq!(offsets[index], index, "the encoder's own offset {index}");
+        }
+
+        let second = patterned(24);
+        let (ciphertext, offsets, _, _) = encoder.encrypt(&second);
+        let mut out = vec![0u8; 24];
+        decryptor.decrypt(&ciphertext, &mut out).expect("second");
+        assert_eq!(out, second);
+        assert_eq!(&offsets[..8], &[24, 25, 26, 27, 28, 29, 30, 31]);
+        assert_eq!(offsets[8], 32, "the body starts at the fresh block");
+        for (index, byte) in out.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                ciphertext[index] ^ stream[offsets[index]],
+                "byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rekey_drops_the_carry_and_starts_the_keystream_over() {
+        let keys = stream_keys(5, &[0x22; STREAM_KEY_LEN]);
+        let other = stream_keys(6, &[0x22; STREAM_KEY_LEN]);
+        let mut decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+        let mut out = vec![0u8; 40];
+        decryptor.decrypt(&patterned(40), &mut out).expect("first");
+        assert_eq!(decryptor.carried(), 8);
+        decryptor.rekey(&other).expect("rekey");
+        assert_eq!(decryptor.carried(), 0, "the old stream's bytes are gone");
+
+        // The first packet of the new stream is decrypted from the beginning of its
+        // own keystream, and its head is not the old stream's carry.
+        let stream = keystream(&other, 3);
+        let mut encoder = Encoder::new(&stream);
+        let packet = patterned(33);
+        let (ciphertext, offsets, _, _) = encoder.encrypt(&packet);
+        let mut out = vec![0u8; 33];
+        decryptor
+            .decrypt(&ciphertext, &mut out)
+            .expect("new stream");
+        assert_eq!(out, packet);
+        for (index, byte) in out.iter().enumerate() {
+            assert_eq!(*byte, ciphertext[index] ^ stream[index], "byte {index}");
+            assert_eq!(offsets[index], index, "the new stream starts at its IV");
+        }
     }
 
     #[test]

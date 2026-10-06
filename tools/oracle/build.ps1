@@ -25,6 +25,7 @@ $sources = @(
     (Join-Path $lib 'utils.c'),
     (Join-Path $lib 'logger.c'),
     (Join-Path $lib 'compat.c'),
+    (Join-Path $lib 'mirror_buffer.c'),
     (Join-Path $lib 'fairplay_playfair.c'),
     (Join-Path $lib 'playfair/hand_garble.c'),
     (Join-Path $lib 'playfair/modified_md5.c'),
