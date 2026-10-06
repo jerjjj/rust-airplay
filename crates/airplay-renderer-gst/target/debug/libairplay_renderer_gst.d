@@ -1,1 +1,0 @@
-D:\Projects\rust-airplay\crates\airplay-renderer-gst\target\debug\libairplay_renderer_gst.rlib: D:\Projects\rust-airplay\crates\airplay-renderer\src\lib.rs D:\Projects\rust-airplay\crates\airplay-renderer-gst\src\lib.rs D:\Projects\rust-airplay\crates\airplay-renderer-gst\src\pipeline.rs

@@ -1,4 +1,8 @@
 /target/
+# The GStreamer backend is a workspace of its own, so its build directory is not the
+# one above (docs/ADR-0003-media-backend.md); its lock file is, though, because the
+# crate is a product of its own and a published repository should pin what it builds.
+crates/airplay-renderer-gst/target/
 /upstream/
 /tools/oracle/oracle.exe
 *.pcap
