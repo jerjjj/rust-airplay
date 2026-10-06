@@ -57,9 +57,21 @@ const IV_PREFIX: &str = "AirPlayStreamIV";
 /// bytes before it looks at anything else).
 pub const HEADER_LEN: usize = 128;
 
-/// Largest payload this port reads, matching upstream's own buffer
-/// (`RAOP_PACKET_LEN` in `raop_rtp_mirror.c`).
-pub const MAX_PAYLOAD: usize = 32_768;
+/// Largest payload this port reads.
+///
+/// A bound exists so that a client cannot make a receiver allocate without limit,
+/// but it has to sit above what a real frame is. Upstream does not bound this at
+/// all: it `malloc`s exactly the size the header promised
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_rtp_mirror.c:365-368`), and the
+/// `RAOP_PACKET_LEN` of 32768 declared beside it (`:170`) is the buffer for
+/// reading the *header*, not a limit on the payload.
+///
+/// Reading it as a payload limit is what refused a device's first encrypted
+/// frame: a 1080p screen that has just changed is 76298 bytes in one packet, and
+/// a receiver that refuses that discards the stream at the moment a frame finally
+/// arrived. Four mebibytes is above any H.264 or H.265 frame a client sends for a
+/// display, and below anything a receiver would notice allocating.
+pub const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 
 /// What a mirror packet carries.
 ///
@@ -660,17 +672,28 @@ impl CodecConfig {
     /// parameter sets, which is dropped rather than prepended to a frame: a
     /// decoder fed a wrong byte stream does not fail cleanly.
     pub fn codec_data(&mut self, timestamp: u64, payload: &[u8]) -> Result<(), CodecDataError> {
-        // The size of the first parameter set sits at offset six, the sequence
-        // parameter set itself at eight, and the second set's size after the first
-        // (`raop_rtp_mirror.c:725-728`: `payload[6]`, `payload + 8`, and
-        // `payload[sps_size + 9]`, which is the two size bytes starting one byte
-        // before the set's last one).
+        // The offsets are upstream's, and a device's own packet is what shows why they
+        // are not the ones the format's description suggests. For an iPad's 1080p H.264
+        // configuration:
+        //
+        //   offset 6..8    the sequence set's size, big endian      00 12 = 18
+        //   offset 8..26   the sequence set itself                  (18 bytes)
+        //   offset 26      a byte between the two sets              01
+        //   offset 27..29  the picture set's size, big endian       00 04 = 4
+        //   offset 29..33  the picture set itself                   (4 bytes)
+        //
+        // So the picture set's size sits at `sps_size + 9` and the set at
+        // `sps_size + 11` (`raop_rtp_mirror.c:725-728`), one byte later than the
+        // AVCDecoderConfigurationRecord layout puts them. This port had the format's
+        // offsets: it read `0x9b86` as a size and refused the packet, which means a
+        // configuration a real client sent was dropped by a reader that was right
+        // about a document and wrong about the wire.
         let sps_size = read_size(payload, 6).ok_or(CodecDataError::TooShort {
             length: payload.len(),
         })?;
         let sps_at = 8;
-        let pps_size_at = sps_size + 8;
-        let pps_at = sps_size + 10;
+        let pps_size_at = sps_size + 9;
+        let pps_at = sps_size + 11;
         let pps_size = read_size(payload, pps_size_at).ok_or(CodecDataError::SizeOutOfRange {
             sps: sps_size,
             pps: pps_size_or_zero(payload, pps_size_at),
@@ -906,12 +929,21 @@ mod tests {
     /// sequence parameter set, then a sixteen-bit size and the picture parameter
     /// set (`raop_rtp_mirror.c:725-728`; the header around them is what
     /// `:560-572` describes).
+    /// A codec packet in the layout a client sends, which is the layout the reader
+    /// above expects: six bytes of header, the sequence set's size and the set, one
+    /// byte between the sets, then the picture set's size and the set.
+    ///
+    /// The byte between the sets is not decoration. A builder that left it out is how
+    /// the reader kept the offsets of the format's own description instead of the
+    /// wire's: the two agreed with each other and disagreed with every client, which
+    /// is what `reads_the_codec_packet_a_device_actually_sent` exists to catch.
     fn codec_payload(sps: &[u8], pps: &[u8]) -> Vec<u8> {
         let mut payload = vec![0u8; 6];
         payload[2..4].copy_from_slice(&1920u16.to_be_bytes());
         payload[4..6].copy_from_slice(&1080u16.to_be_bytes());
         payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
         payload.extend_from_slice(sps);
+        payload.push(0x01);
         payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
         payload.extend_from_slice(pps);
         payload
@@ -941,6 +973,76 @@ mod tests {
         assert!(config.prepend_to(0x1122).is_none(), "not twice");
     }
 
+    #[test]
+    fn reads_the_codec_packet_a_device_actually_sent() {
+        // The bytes are from a real session: an iPad mirroring a 1080p screen sent
+        // this as the first mirror packet (captured 2026-10-06, `kind=CodecData`,
+        // 37 bytes, option 0x1601). It is an AVCDecoderConfigurationRecord —
+        // `01` version, `64` profile, `00` compatibility, `28` level, `ff` a length
+        // prefix of four, `e1` one SPS — and the sizes inside it are what upstream
+        // reads (`raop_rtp_mirror.c:725-728`).
+        //
+        // A device test vector is worth more than a built one here: the port's own
+        // builder writes the same layout, so a test built from it would pass even if
+        // both were wrong about where the client puts the lengths.
+        let packet = [
+            0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x12, 0x27, 0x64, 0x00, 0x28, 0xac, 0x13,
+            0x14, 0x50, 0x18, 0x80, 0x89, 0xe2, 0x25, 0x9b, 0x80, 0x86, 0x80, 0x81, 0x01, 0x00,
+            0x04, 0x28, 0xee, 0x3c, 0xb0, 0x02, 0x00, 0x00, 0x00,
+        ];
+        // The timestamp is the one that packet carried, so the configuration is
+        // matched to the frame it belongs to the way a session matches it.
+        const TIMESTAMP: u64 = 22_900_758_101_784;
+        let mut config = CodecConfig::new();
+        config
+            .codec_data(TIMESTAMP, &packet)
+            .expect("its configuration");
+
+        // The record's own length fields decide where its sets end: `00 12` puts
+        // eighteen bytes of sequence set after the length, and the `e2` that follows
+        // marks four bytes of picture set. The four bytes after those are part of the
+        // record — this client's SPS is 0x27-led and the RFC 6184 sequence a real one
+        // ends with is not here — and a decoder is given the two sets the record
+        // sizes rather than the trailing bytes.
+        let units = config.prepend_to(TIMESTAMP).expect("prepended");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected.extend_from_slice(&packet[8..26]);
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected.extend_from_slice(&[0x28, 0xee, 0x3c, 0xb0]);
+        assert_eq!(units, expected, "each set behind its own start code");
+        assert_eq!(packet[6..8], [0x00, 0x12], "eighteen bytes of sequence set");
+        assert_eq!(units.len(), 4 + 18 + 4 + 4);
+    }
+
+    #[test]
+    fn refuses_a_stream_payload_beyond_what_a_frame_can_be() {
+        // The bound is a guard against a client making a receiver allocate without
+        // limit, not a judgement about frames: a 1080p screen that has just changed
+        // arrives as one 76298-byte packet, which a real session sent and this port
+        // refused when the bound was 32768. So the test parses a packet of exactly
+        // that size rather than asserting the constant is large enough, which would
+        // be a statement about the constant and not about what it does.
+        const REAL_FRAME: usize = 76_298;
+        let mut frame = vec![0u8; HEADER_LEN + REAL_FRAME];
+        frame[0..4].copy_from_slice(&(REAL_FRAME as u32).to_le_bytes());
+        frame[4] = 0x00;
+        frame[5] = 0x10;
+        let (header, payload) = parse_packet(&frame).expect("a frame a device sent");
+        assert_eq!(header.payload_size as usize, REAL_FRAME);
+        assert_eq!(payload.len(), REAL_FRAME);
+        assert_eq!(header.kind, MirrorKind::Video { idr: true });
+
+        let mut huge = vec![0u8; HEADER_LEN];
+        huge[0..4].copy_from_slice(&(MAX_PAYLOAD as u32 + 1).to_le_bytes());
+        assert_eq!(
+            parse_header(&huge),
+            Err(MirrorError::TooLarge {
+                promised: MAX_PAYLOAD + 1,
+                maximum: MAX_PAYLOAD
+            })
+        );
+    }
     #[test]
     fn drops_a_configuration_whose_timestamp_does_not_match() {
         // A video packet with another timestamp means the configuration belongs
