@@ -7,6 +7,7 @@
 //! discovery so a client can find the receiver.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -37,6 +38,7 @@ Options:
   --password <password>  Also require the SETUP digest password
   --device-id <address>  Advertised hardware address (default: from the seed)
   --seed <hex>           Identity seed, 32 bytes of hex (default: stored file)
+  --log <file>           Append the request trace to a file, for archiving a session
   --help                 Print this text
 
 The receiver answers the control plane: /info, /fp-setup, /feedback, the pairing
@@ -51,6 +53,7 @@ struct Options {
     password: Option<String>,
     device_id: Option<String>,
     seed: Option<[u8; 32]>,
+    log: Option<String>,
 }
 
 impl Default for Options {
@@ -64,6 +67,7 @@ impl Default for Options {
             password: None,
             device_id: None,
             seed: None,
+            log: None,
         }
     }
 }
@@ -150,6 +154,23 @@ async fn run() -> Result<(), String> {
         Protection::None => println!("pairing   open (legacy pairing only)"),
     }
 
+    // A device session is easier to archive than to describe, so the trace can be
+    // appended to a file as well as the console. Nothing written there is a
+    // secret: the lines carry what the client sent in the clear and the status it
+    // got, and never a body, a key or a signature.
+    let log = match options.log.as_deref() {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| format!("cannot open {path}: {error}"))?;
+            println!("logging   {path}");
+            Some(Arc::new(Mutex::new(file)))
+        }
+        None => None,
+    };
+
     let advertisement = Advertisement::new(&identity, address.port(), protection);
     // The same value answers `GET /info?txtAirPlay` and is registered below, so a
     // client that reads the record from either place sees one advertisement.
@@ -184,8 +205,10 @@ async fn run() -> Result<(), String> {
 
     let handlers_state = Arc::clone(&state);
     println!("waiting for a client (Ctrl+C to stop)");
+    let trace_log = log.clone();
     let result = server
         .run(move || {
+            let log = trace_log.clone();
             let mut handlers =
                 RouteHandlers::with_pairing(identity.clone(), Arc::clone(&handlers_state));
             // A session that carries a verified client key is a client worth
@@ -207,7 +230,7 @@ async fn run() -> Result<(), String> {
             }
             // A trace names what a client asked and what it got, which is what
             // makes a device session readable; it never carries a body or key.
-            handlers.set_trace_callback(|trace| {
+            handlers.set_trace_callback(move |trace| {
                 // `Active-Remote`/`DACP-ID` name the remote-control connection a
                 // client uses; they are shown because a device session is hard to
                 // follow without them, not because they prove anything.
@@ -217,8 +240,8 @@ async fn run() -> Result<(), String> {
                         format!(" remote={}/{}", active.unwrap_or("-"), dacp.unwrap_or("-"))
                     }
                 };
-                println!(
-                    "  -> {:<14} {:<24} cseq={:<6} body={:<6} {}{}{}{} => {}",
+                let line = format!(
+                    "  -> {:<14} {:<24} cseq={:<6} body={:<6} {}{}{} => {}{}",
                     trace.method,
                     trace.target,
                     trace
@@ -235,6 +258,10 @@ async fn run() -> Result<(), String> {
                     trace.status,
                     remote,
                 );
+                println!("{line}");
+                if let Some(log) = log.as_ref() {
+                    let _ = writeln!(&mut *lock(log), "{line}");
+                }
             });
             handlers
         })
@@ -273,6 +300,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Opt
             "--password" => options.password = Some(next_value(&mut arguments, "--password")?),
             "--device-id" => options.device_id = Some(next_value(&mut arguments, "--device-id")?),
             "--seed" => options.seed = Some(parse_seed(&next_value(&mut arguments, "--seed")?)?),
+            "--log" => options.log = Some(next_value(&mut arguments, "--log")?),
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }
@@ -381,7 +409,6 @@ fn record_client(path: &std::path::Path, client: &[u8; 32]) -> Result<(), String
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
-    use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

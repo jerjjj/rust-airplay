@@ -22,7 +22,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # 起一个接收端（默认一次性 PIN；Windows 上 7000 可能被 Hyper-V 保留，见下）
-cargo run -p airplay-cli -- --name "Rust AirPlay Test" --port 47000
+cargo run -p airplay-cli -- --name "Rust AirPlay Test" --port 47000 --log session.log
 
 # 另一终端确认广告已发布（需系统 Bonjour；Linux 可用 avahi-browse -r _raop._tcp）
 dns-sd -B _raop._tcp local
