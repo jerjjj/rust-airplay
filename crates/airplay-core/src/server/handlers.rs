@@ -109,6 +109,13 @@ pub struct SetupRequest {
     /// (`raop_ntp.c:617-618`). `None` is a request served without a transport, as a
     /// unit test serves one.
     pub client_address: Option<std::net::SocketAddr>,
+    /// The whole request, as XML, when a receiver asked for it.
+    ///
+    /// A `SETUP` is the one request whose body a device session is read from, and
+    /// its shape differs between clients enough that the keys alone do not always
+    /// explain it. This is empty unless a receiver turned it on, because a body
+    /// carries session material.
+    pub debug_body: Option<String>,
     /// Top-level keys the request carried, in the order it wrote them.
     ///
     /// A `SETUP` is the one request whose shape varies most between clients and
@@ -315,6 +322,9 @@ pub struct RouteHandlers {
     /// The peer of the connection whose `SETUP` is being served, which is where
     /// the clock exchange has to go.
     peer: Option<std::net::SocketAddr>,
+    /// Whether a `SETUP` body is reported in full, which a device session needs
+    /// and a normal run does not.
+    debug_setup: bool,
     setup: Option<Box<dyn FnMut(SetupRequest) + Send>>,
     parameter: Option<Box<dyn FnMut(SetParameter) + Send>>,
     trace: Option<TraceCallback>,
@@ -336,6 +346,7 @@ impl RouteHandlers {
             pairing: None,
             setup_ports: SetupPorts::default(),
             peer: None,
+            debug_setup: std::env::var("AIRPLAY_DEBUG_SETUP").is_ok(),
             setup: None,
             parameter: None,
             trace: None,
@@ -648,6 +659,11 @@ impl RouteHandlers {
             streams,
             client_timing_port,
             client_address: self.peer,
+            debug_body: if self.debug_setup {
+                Some(describe_plist(&body))
+            } else {
+                None
+            },
             keys,
             client_identity,
             authentication,
@@ -998,3 +1014,65 @@ fn displays(identity: &DeviceIdentity) -> plist::Value {
 
 #[cfg(test)]
 mod tests;
+
+/// A property list written out for a log, with the shape of each value.
+///
+/// A `SETUP` body is read from a device session, and what a session log needs is
+/// which keys arrived and what kind of value each held — not the session material
+/// inside them, which is why data is shortened rather than printed.
+fn describe_plist(plist: &Plist) -> String {
+    fn describe(value: &plist::Value, depth: usize) -> String {
+        let indent = "  ".repeat(depth);
+        match value {
+            plist::Value::Dictionary(dictionary) => {
+                let mut out = format!("dict({})", dictionary.len());
+                for (key, value) in dictionary {
+                    out.push_str(&format!(
+                        "\n{indent}  {key}: {}",
+                        describe(value, depth + 1)
+                    ));
+                }
+                out
+            }
+            plist::Value::Array(values) => {
+                let mut out = format!("array({})", values.len());
+                for (index, value) in values.iter().enumerate() {
+                    out.push_str(&format!(
+                        "\n{indent}  [{index}]: {}",
+                        describe(value, depth + 1)
+                    ));
+                }
+                out
+            }
+            plist::Value::Data(bytes) => {
+                let shown: Vec<String> = bytes
+                    .iter()
+                    .take(16)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                format!(
+                    "data({} bytes){}{}",
+                    bytes.len(),
+                    if bytes.is_empty() { "" } else { " " },
+                    shown.join("")
+                )
+            }
+            plist::Value::Boolean(value) => format!("bool({value})"),
+            plist::Value::Integer(value) => format!("int({value})"),
+            plist::Value::Real(value) => format!("real({value})"),
+            plist::Value::String(value) => format!("string({value:?})"),
+            plist::Value::Uid(value) => format!("uid({value:?})"),
+            other => format!("{other:?}"),
+        }
+    }
+    match plist.root_dictionary() {
+        Some(dictionary) => {
+            let mut out = String::new();
+            for (key, value) in dictionary {
+                out.push_str(&format!("  {key}: {}\n", describe(value, 1)));
+            }
+            out
+        }
+        None => "  (not a dictionary)\n".to_owned(),
+    }
+}
