@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod fairplay;
 mod fairplay_tables;
+pub mod media;
 pub mod mirror;
 pub mod ntp;
 pub mod pairing;

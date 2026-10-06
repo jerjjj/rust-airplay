@@ -28,11 +28,20 @@
 **首个切片（下一次开工从这里开始，逐个切片提交）**
 
 | 切片 | 内容 | 上游阅读顺序 | 验收判据 |
+| 切片 | 内容 | 上游阅读顺序 | 验收判据 |
 |---|---|---|---|
-| **S4-1a** 音频接收与解密 | 绑定 UDP 端口收包 → 解析 RTP 头（`rtp.rs` 已有原语）→ AES-CBC 解密（会话密钥来自 `SetupRequest.audio_key/audio_iv`）→ 按序号在**有界窗口**内重排序 → 通过回调交出解密后的帧；此时**不对外声明端口**（宁可没有媒体，也不声明不工作的服务） | `lib/raop_rtp.c`(881) 的收包/解密/缓冲路径 + `lib/raop_buffer.c`(307) 的重排序与丢失检测 | 造包测试：乱序、重复、丢包、超长、错误密钥、序号回绕全部有界且不 panic；窗口内存有上限；解密正确性用固定向量 |
+| **S4-1a** 包解析与有界重排序 | ✅ **已完成**（`src/media/audio.rs`）：`parse_audio_packet` 按上游布局读 RTP 头（payload type 96、<12 字节忽略、`00 68 34 00` 无数据标记识别、错误版本/类型拒绝）；`ReorderWindow` 有界（默认 512）按序交付、重复丢弃、缺口跨越并记录丢失（丢失表按容量封顶）、远跳视为新流起点并交付该帧、序号回绕正确 | `lib/raop_rtp.c:558-668` 收包/缓冲路径 + `lib/raop_buffer.c` | 12 条单测全部通过：乱序/重复/丢包/远跳/回绕/容量上限/过去帧丢弃/标记识别/非法包拒绝 |
+| **S4-1a-2** 载荷解密 | 用 `SETUP` 交付的 `audio_key`/`audio_iv` 解密载荷：**先核对上游 AES-CBC 覆盖范围与 IV 用法再实现**（不猜），之后 `AudioFrame.payload` 才是明文 | `lib/raop_rtp.c` 的解密调用点 + `lib/crypto.c` | 固定向量 + 与 oracle 差分解密结果一致 |
 | **S4-1b** 重传与时序服务 | 控制通道上的重传请求/应答；NTP 时序服务与客户端同步（注意 3dbf7cee 的 `sync_delay` 与 `recv_time_kernel` 可能为 NULL） | `lib/raop_rtp.c` 控制路径 + `lib/raop_ntp.c`(1027) | 与上游同构的时序报文；重传请求能被识别并应答；时钟偏差计算有固定向量 |
 | **S4-1c** 镜像通道 | 镜像 TCP 连接、H.264 分片重组、由 `streamConnectionID` 派生 AES-CTR 密钥与 IV、分片头解析 | `lib/raop_rtp_mirror.c`(966) + `lib/mirror_buffer.c`(133) | 分片乱序/重复/截断/超长有界；密钥派生与上游一致（可用 oracle 差分）；重组后的访问单元边界正确 |
-| **S4-1d** 端口声明 | 上述端口真实绑定后写进 `SetupPorts`，SETUP 才开始声明 `dataPort`/`controlPort`/`timingPort` | `lib/raop_handlers.h` 的 SETUP 分支（已移植，只需接上真实端口） | 真机 SETUP 响应含端口；`ss -lntup`/`netstat` 可见监听；真机开始真的发包（用抓包确认） |
+| **S4-1d** 端口声明 | 上述端口真实绑定后写进 `SetupPorts`，SETUP 才开始声明 `dataPort`/`controlPort`/`timingPort` | `lib/raop_handlers.h` 的 SETUP 分支（已移植，只需接上真实端口） | 真机 SETUP 响应含端口；`netstat`/`ss` 可见监听；真机开始真的发包（抓包确认） |
+
+**实现中被新单测抓出的两个自身缺陷**（记录在案以免重犯）：
+
+1. 丢失表无上限：调用方若不取走丢失列表，一个持续丢包的客户端能让它无限增长 → 现按窗口容量封顶（保留最近的）。
+2. "远跳视为新流"时**丢掉了触发重启的那一帧**，于是窗口永远等一个客户端已经发过的序号 → 现把该帧作为新流的首帧交付。
+
+写作用域：`src/media/`（新建）、`src/rtp.rs`、`src/mirror.rs`、`src/ntp.rs`、`src/server/`（会话与 `SetupPorts` 接线）。**不**修改 `control.rs` 的既有路由语义。
 
 写作用域：`src/rtp.rs`、`src/mirror.rs`、`src/ntp.rs`、`src/media/`（新建，若需要）、`src/server/`（会话与 `SetupPorts` 接线）。**不**修改 `control.rs` 的既有路由语义。
 
