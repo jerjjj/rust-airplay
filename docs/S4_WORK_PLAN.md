@@ -32,7 +32,8 @@
 |---|---|---|---|
 | **S4-1a** 包解析与有界重排序 | ✅ **已完成**（`src/media/audio.rs`）：`parse_audio_packet` 按上游布局读 RTP 头（payload type 96、<12 字节忽略、`00 68 34 00` 无数据标记识别、错误版本/类型拒绝）；`ReorderWindow` 有界（默认 512）按序交付、重复丢弃、缺口跨越并记录丢失（丢失表按容量封顶）、远跳视为新流起点并交付该帧、序号回绕正确 | `lib/raop_rtp.c:558-668` 收包/缓冲路径 + `lib/raop_buffer.c` | 12 条单测全部通过：乱序/重复/丢包/远跳/回绕/容量上限/过去帧丢弃/标记识别/非法包拒绝 |
 | **S4-1a-2** 载荷解密 | 用 `SETUP` 交付的 `audio_key`/`audio_iv` 解密载荷：**先核对上游 AES-CBC 覆盖范围与 IV 用法再实现**（不猜），之后 `AudioFrame.payload` 才是明文 | `lib/raop_rtp.c` 的解密调用点 + `lib/crypto.c` | 固定向量 + 与 oracle 差分解密结果一致 |
-| **S4-1b** 重传与时序服务 | 控制通道上的重传请求/应答；NTP 时序服务与客户端同步（注意 3dbf7cee 的 `sync_delay` 与 `recv_time_kernel` 可能为 NULL） | `lib/raop_rtp.c` 控制路径 + `lib/raop_ntp.c`(1027) | 与上游同构的时序报文；重传请求能被识别并应答；时钟偏差计算有固定向量 |
+| **S4-1b** 控制通道 | 🟡 **重传已完成**（`src/media/control.rs`）：解析控制包（类型 = `packet[1] & !0x80`；`0x56` 重发音频、音频从偏移 4 开始；`0x54` 同步包含 `sync_rtp`/`remote_ntp`/`next_rtp`）、按上游 8 字节格式构造重传请求（`0x80 0xd5`、控制序号、起始序号、数量）、`AudioSession::receive_control` 把重发音频走与数据口相同的路径（**补上窗口等待的缺口**而不是当重复丢弃）。**NTP 时序服务仍待做** | `lib/raop_rtp.c:203-233`（请求）+ 控制分支（`0x56`/`0x54`）+ `lib/raop_ntp.c`(1027) 待读 | 6 条控制通道测试 + 2 条会话测试；重发确实补缺口；同步包不报错且不交付；时钟偏差计算（待 S4-1b-2） |
+| **S4-1b-2** NTP 时序服务 | 时序端口上的报文与客户端时钟同步（注意 3dbf7cee 的 `sync_delay` 与 `recv_time_kernel` 可能为 NULL） | `lib/raop_ntp.c` | 与上游同构的时序报文；时钟偏差固定向量 |
 | **S4-1c** 镜像通道 | 镜像 TCP 连接、H.264 分片重组、由 `streamConnectionID` 派生 AES-CTR 密钥与 IV、分片头解析 | `lib/raop_rtp_mirror.c`(966) + `lib/mirror_buffer.c`(133) | 分片乱序/重复/截断/超长有界；密钥派生与上游一致（可用 oracle 差分）；重组后的访问单元边界正确 |
 | **S4-1d** 端口声明 | 上述端口真实绑定后写进 `SetupPorts`，SETUP 才开始声明 `dataPort`/`controlPort`/`timingPort` | `lib/raop_handlers.h` 的 SETUP 分支（已移植，只需接上真实端口） | 真机 SETUP 响应含端口；`netstat`/`ss` 可见监听；真机开始真的发包（抓包确认） |
 

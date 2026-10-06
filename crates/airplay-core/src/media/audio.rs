@@ -38,6 +38,8 @@ use std::collections::VecDeque;
 
 use crate::crypto::{self, CryptoError};
 use crate::rtp;
+
+use super::control::{self, ControlError};
 use crate::wire::ParseError;
 
 /// Payload type upstream names for audio (`raop_rtp.c:559`).
@@ -208,6 +210,34 @@ impl AudioSession {
         }))
     }
 
+    /// Reads one control datagram and returns any audio it delivered.
+    ///
+    /// A client answers a resend request by sending the audio packet again on the
+    /// control port, wrapped in four bytes upstream skips
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_rtp.c`, the `0x56` branch). The audio
+    /// inside goes through the same path as a packet that arrived on the data
+    /// port, so a resend fills the gap the window is waiting for instead of being
+    /// treated as a duplicate.
+    ///
+    /// A sync packet is read and reported as "nothing to deliver": the timing
+    /// service that consumes it is the next slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioSessionError`] for a control packet this session cannot
+    /// read, or when a resent audio packet does not decrypt.
+    pub fn receive_control(
+        &mut self,
+        datagram: &[u8],
+    ) -> Result<Vec<AudioFrame>, AudioSessionError> {
+        match control::parse_control_packet(datagram)? {
+            control::ControlPacket::ResentAudio { packet, .. } => self.receive(packet),
+            control::ControlPacket::Sync { .. } | control::ControlPacket::Other { .. } => {
+                Ok(Vec::new())
+            }
+        }
+    }
+
     /// Sequence numbers given up on since they were last taken.
     pub fn take_lost(&mut self) -> Vec<u16> {
         self.window.take_lost()
@@ -221,11 +251,19 @@ pub enum AudioSessionError {
     Packet(AudioPacketError),
     /// The payload could not be decrypted.
     Decrypt(CryptoError),
+    /// The control packet could not be read.
+    Control(ControlError),
 }
 
 impl From<AudioPacketError> for AudioSessionError {
     fn from(error: AudioPacketError) -> Self {
         Self::Packet(error)
+    }
+}
+
+impl From<ControlError> for AudioSessionError {
+    fn from(error: ControlError) -> Self {
+        Self::Control(error)
     }
 }
 
@@ -240,6 +278,7 @@ impl std::fmt::Display for AudioSessionError {
         match self {
             Self::Packet(error) => write!(formatter, "{error}"),
             Self::Decrypt(error) => write!(formatter, "the payload did not decrypt: {error:?}"),
+            Self::Control(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -674,6 +713,45 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].kind, AudioPayloadKind::NoDataMarker);
         assert_eq!(ready[0].payload, NO_DATA_MARKER);
+    }
+
+    #[test]
+    fn a_resent_packet_fills_the_gap_the_window_waits_for() {
+        let key = [0xbb; 16];
+        let iv = [0xcc; 16];
+        let mut session = AudioSession::new(key, iv, WINDOW_CAPACITY);
+        let audio = encrypt(&key, &iv, &[0x8c; 16]);
+        let packet = |sequence: u16, timestamp: u32| datagram(sequence, timestamp, &audio);
+
+        // 1 arrives, 3 is held: 2 is missing.
+        assert_eq!(session.receive(&packet(1, 480)).expect("first").len(), 1);
+        assert!(session.receive(&packet(3, 1440)).expect("third").is_empty());
+        assert!(session.take_lost().is_empty());
+
+        // The client answers a resend request with the audio wrapped in four
+        // bytes; the session must deliver it and then the frame it was holding.
+        let mut wrapped = vec![0x80, 0x56 | 0x80, 0x00, 0x00];
+        wrapped.extend_from_slice(&packet(2, 960));
+        let ready = session.receive_control(&wrapped).expect("resent");
+        assert_eq!(
+            ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(ready.iter().all(|frame| frame.payload == vec![0x8c; 16]));
+        assert!(session.take_lost().is_empty(), "nothing was lost after all");
+    }
+
+    #[test]
+    fn a_sync_packet_delivers_nothing_and_is_not_an_error() {
+        let mut session = AudioSession::new([0xdd; 16], [0xee; 16], WINDOW_CAPACITY);
+        let mut sync = vec![0x90, 0xd4, 0x00, 0x04];
+        sync.extend_from_slice(&[0u8; 16]);
+        assert!(session.receive_control(&sync).expect("sync").is_empty());
+        // A control packet this session cannot read is refused, not guessed at.
+        assert!(matches!(
+            session.receive_control(&[0x80]),
+            Err(AudioSessionError::Control(ControlError::TooShort))
+        ));
     }
 
     #[test]
