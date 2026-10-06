@@ -261,7 +261,7 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 4. **性能设施**：抓包回放 + 同硬件对比（MIGRATION_PLAN 测试策略 5）。
 
 ### E. W8 S3 验收与文档
-1. 退出标准逐条对照；真机矩阵无设备时写"未测试"。
+1. **✅ 已完成**：[S3_ACCEPTANCE.md](S3_ACCEPTANCE.md)——退出标准逐条对照（可发现 ✅、真实配对 ✅、SETUP ✅、RECORD/FLUSH/TEARDOWN 🟡 部分、错误连接有界 ✅）、能力声明、**真机证据**（iPad 完整请求序列 + 握手 63 ms 时序表 + 470 重试的解释）、测试与差分清单、真机矩阵、以及 6 条"仍未验收"。
 2. 能力声明区分 `RouteHandlers::new`（配对 501）与 `with_pairing`。
 3. ADR 索引 + 引用一致性检查（见 A3）。
 4. README 状态更新（当前：控制面 + 配对 + SETUP 密钥派生；无媒体）。

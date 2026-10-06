@@ -6,6 +6,7 @@
 
 - [全项目分阶段计划与验收](docs/MIGRATION_PLAN.md)
 - [S3 工作计划与缺陷修复批次](docs/S3_WORK_PLAN.md)
+- [S3 验收材料（含真机请求序列与时序）](docs/S3_ACCEPTANCE.md)
 - [S4 工作计划：媒体会话与 GStreamer 渲染](docs/S4_WORK_PLAN.md)
 - [ADR-0001：S3 网络、plist 与 DNS-SD 选型](docs/ADR-0001-network-stack.md)
 - [ADR-0002：配对身份与持久化边界](docs/ADR-0002-pairing-identity.md)
