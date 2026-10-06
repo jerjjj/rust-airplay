@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/airplay-core", "crates/airplay-cli"]
+members = ["crates/airplay-core", "crates/airplay-cli", "crates/airplay-renderer"]
+# The GStreamer backend is a member of a workspace of its own: it needs a GStreamer
+# runtime to be useful, and a machine without one must still be able to run this
+# workspace's gates. `crates/airplay-renderer-gst/README.md` says how to build it and
+# `docs/ADR-0003-media-backend.md` records why it is shaped this way.
 resolver = "3"
 
 [workspace.package]

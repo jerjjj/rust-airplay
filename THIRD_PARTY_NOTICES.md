@@ -18,6 +18,10 @@ The differential oracle under `tools/oracle/` is a **test tool**: it compiles th
 
 Discovery (`crates/airplay-core/src/discovery.rs`) depends on [`mdns-sd`](https://crates.io/crates/mdns-sd) 0.21.5 (Apache-2.0 OR MIT), a multicast-DNS responder written in Rust. `Cargo.lock` also pins its transitive dependencies (`if-addrs`, `socket-pktinfo`, `socket2`, `flume`, `log`, `parking_lot`/`lock_api`, `scopeguard`, `spin`, ...). The choice and the alternatives it replaced — Apple's Bonjour through `dns_sd.h`, or Avahi through its client library — are recorded in `docs/ADR-0001-network-stack.md`. The record contents this module advertises are transcribed from upstream `lib/dns_sd/dns_sd.c` and `lib/dnssdint.h`, which is what makes a stock client accept the receiver.
 
+The renderer boundary (`crates/airplay-renderer`) has **no dependencies**: it is the trait a backend implements, the frame and configuration types a session hands across it, and a renderer that accepts everything and plays nothing (`NullRenderer`). It is a member of the default workspace, so the gates that run on a machine without a media library cover it.
+
+The GStreamer backend (`crates/airplay-renderer-gst`) is a workspace of its own and is **not** built by the default gates. It uses the Rust standard library alone and links no C library: it runs `gst-launch-1.0` as a subprocess and writes frames to its standard input, so GStreamer is a run-time dependency of that crate only, its licence is not combined with this one, and a machine without GStreamer still builds and passes every gate here. `docs/ADR-0003-media-backend.md` records the decision and `crates/airplay-renderer-gst/README.md` the alternatives it rejected. Adding a Rust dependency to that crate later means recording it here first, as the rules at the top of this file require.
+
 To obtain the reference checkout on a new machine:
 
 ```powershell
