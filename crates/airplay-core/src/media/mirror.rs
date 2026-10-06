@@ -328,6 +328,71 @@ pub fn into_annex_b(payload: &mut [u8]) -> Result<usize, NalError> {
     }
     Ok(units)
 }
+/// The keystream of one mirror stream.
+///
+/// Video packets are decrypted with AES-128-CTR, and the counter does **not**
+/// restart at each packet: a packet continues where the previous one left the
+/// keystream. Upstream keeps that position in `mirror_buffer` and throws it away
+/// when the stream is re-keyed (`mirror_buffer.c`, which sets its counter to zero
+/// there), and this type is that position, with [`StreamCipher::restart`] for the
+/// re-key.
+///
+/// # One rule is deliberately missing
+///
+/// Upstream also accounts for a packet whose length is not a whole number of
+/// blocks, because the cipher it drives advances by blocks: the leftover bytes of
+/// the last block have to be skipped before the next packet starts. This type does
+/// not do that yet, and the reason is that the exact rule has to be read out of
+/// `mirror_buffer.c` rather than guessed - a guess here shows up as video that
+/// decodes into noise from the second packet on, which is far harder to notice
+/// than an error. `docs/S4_WORK_PLAN.md` records it as the next step of this
+/// slice, and nothing wires this cipher into a stream before it lands.
+pub struct StreamCipher {
+    state: crate::crypto::Aes128CtrState,
+    advanced: usize,
+}
+
+impl StreamCipher {
+    /// Starts the keystream of a stream at its beginning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::crypto::CryptoError`] when the keys have the wrong shape.
+    pub fn new(keys: &StreamKeys) -> Result<Self, crate::crypto::CryptoError> {
+        Ok(Self {
+            state: crate::crypto::Aes128CtrState::new(&keys.key, &keys.iv)?,
+            advanced: 0,
+        })
+    }
+
+    /// Decrypts one payload in place, continuing the keystream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::crypto::CryptoError`] when the cipher refuses the input.
+    pub fn decrypt(&mut self, payload: &mut [u8]) -> Result<(), crate::crypto::CryptoError> {
+        self.state.apply(payload);
+        self.advanced += payload.len();
+        Ok(())
+    }
+
+    /// Bytes the keystream has advanced, which is what a caller reports when it
+    /// wants to know how far into a stream it is.
+    pub fn advanced(&self) -> usize {
+        self.advanced
+    }
+
+    /// Starts the keystream over, as a re-key does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::crypto::CryptoError`] when the cipher refuses to reset.
+    pub fn restart(&mut self) -> Result<(), crate::crypto::CryptoError> {
+        self.state.reset()?;
+        self.advanced = 0;
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +418,53 @@ mod tests {
             payload.extend_from_slice(unit);
         }
         payload
+    }
+
+    #[test]
+    fn the_keystream_continues_from_one_packet_to_the_next() {
+        let keys = stream_keys(7, &[0x31; STREAM_KEY_LEN]);
+        let first = [0x11u8; 40];
+        let second = [0x22u8; 24];
+
+        // Two packets in sequence are the same as one payload of their length,
+        // which is what "the counter does not restart per packet" means.
+        let mut cipher = StreamCipher::new(&keys).expect("cipher");
+        let mut one = first;
+        let mut two = second;
+        cipher.decrypt(&mut one).expect("first");
+        cipher.decrypt(&mut two).expect("second");
+        assert_eq!(cipher.advanced(), 64);
+
+        let mut whole = Vec::new();
+        whole.extend_from_slice(&first);
+        whole.extend_from_slice(&second);
+        let mut expected_a = [0x11u8; 40];
+        let mut expected_b = [0x22u8; 24];
+        let mut reference = StreamCipher::new(&keys).expect("cipher");
+        let mut joined = Vec::new();
+        joined.extend_from_slice(&expected_a);
+        joined.extend_from_slice(&expected_b);
+        reference.decrypt(&mut joined).expect("joined");
+        expected_a.copy_from_slice(&joined[..40]);
+        expected_b.copy_from_slice(&joined[40..]);
+        assert_eq!(one, expected_a);
+        assert_eq!(two, expected_b);
+    }
+
+    #[test]
+    fn a_rekey_starts_the_keystream_over() {
+        let keys = stream_keys(9, &[0x41; STREAM_KEY_LEN]);
+        let mut cipher = StreamCipher::new(&keys).expect("cipher");
+        let mut payload = [0x55u8; 32];
+        cipher.decrypt(&mut payload).expect("first");
+        assert_eq!(cipher.advanced(), 32);
+        // The same bytes again: without the restart they would decrypt to
+        // something else, because the keystream has moved on.
+        cipher.restart().expect("restart");
+        assert_eq!(cipher.advanced(), 0);
+        let mut again = [0x55u8; 32];
+        cipher.decrypt(&mut again).expect("again");
+        assert_eq!(again, payload, "the stream began again");
     }
 
     #[test]
