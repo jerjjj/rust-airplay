@@ -25,6 +25,17 @@
 
 ### S4-1 媒体会话骨架（核心内，无媒体依赖）
 
+**首个切片（下一次开工从这里开始，逐个切片提交）**
+
+| 切片 | 内容 | 上游阅读顺序 | 验收判据 |
+|---|---|---|---|
+| **S4-1a** 音频接收与解密 | 绑定 UDP 端口收包 → 解析 RTP 头（`rtp.rs` 已有原语）→ AES-CBC 解密（会话密钥来自 `SetupRequest.audio_key/audio_iv`）→ 按序号在**有界窗口**内重排序 → 通过回调交出解密后的帧；此时**不对外声明端口**（宁可没有媒体，也不声明不工作的服务） | `lib/raop_rtp.c`(881) 的收包/解密/缓冲路径 + `lib/raop_buffer.c`(307) 的重排序与丢失检测 | 造包测试：乱序、重复、丢包、超长、错误密钥、序号回绕全部有界且不 panic；窗口内存有上限；解密正确性用固定向量 |
+| **S4-1b** 重传与时序服务 | 控制通道上的重传请求/应答；NTP 时序服务与客户端同步（注意 3dbf7cee 的 `sync_delay` 与 `recv_time_kernel` 可能为 NULL） | `lib/raop_rtp.c` 控制路径 + `lib/raop_ntp.c`(1027) | 与上游同构的时序报文；重传请求能被识别并应答；时钟偏差计算有固定向量 |
+| **S4-1c** 镜像通道 | 镜像 TCP 连接、H.264 分片重组、由 `streamConnectionID` 派生 AES-CTR 密钥与 IV、分片头解析 | `lib/raop_rtp_mirror.c`(966) + `lib/mirror_buffer.c`(133) | 分片乱序/重复/截断/超长有界；密钥派生与上游一致（可用 oracle 差分）；重组后的访问单元边界正确 |
+| **S4-1d** 端口声明 | 上述端口真实绑定后写进 `SetupPorts`，SETUP 才开始声明 `dataPort`/`controlPort`/`timingPort` | `lib/raop_handlers.h` 的 SETUP 分支（已移植，只需接上真实端口） | 真机 SETUP 响应含端口；`ss -lntup`/`netstat` 可见监听；真机开始真的发包（用抓包确认） |
+
+写作用域：`src/rtp.rs`、`src/mirror.rs`、`src/ntp.rs`、`src/media/`（新建，若需要）、`src/server/`（会话与 `SetupPorts` 接线）。**不**修改 `control.rs` 的既有路由语义。
+
 - 内容：NTP 时序服务与客户端同步（对照 `lib/raop_ntp.c`，注意 3dbf7cee 的 `sync_delay` 与 `recv_time_kernel` 可能为 NULL 的新签名）；音频 RTP 接收（UDP、AES-CBC 解密、序号/时间戳重排序、丢包检测）；重传请求（control 通道）；镜像 TCP（H.264 分片重组、由 `streamConnectionID` 派生的 AES-CTR 密钥与 IV、分片头解析）。
 - **端口真实绑定**：时序口、音频 data/control、镜像 data 绑定后写进 `SetupPorts`——SETUP 响应从此声明真实端口（当前未绑定的字段一律不写）。
 - 验收：造包/抓包回放测试证明解密与重组正确；乱序、重复、丢包、超长分片均有界且不 panic；无渲染器也能跑（帧可以丢弃或落盘）。写作用域：`src/rtp.rs`（已有基础）、`src/mirror.rs`、`src/ntp.rs`、`src/server/`（会话与新模块）。
