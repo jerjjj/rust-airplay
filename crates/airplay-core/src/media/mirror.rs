@@ -162,6 +162,26 @@ impl std::error::Error for MirrorError {}
 /// promises more payload than is present, or one that promises more than
 /// [`MAX_PAYLOAD`].
 pub fn parse_packet(datagram: &[u8]) -> Result<(MirrorHeader, &[u8]), MirrorError> {
+    let header = parse_header(datagram)?;
+    let promised = header.payload_size as usize;
+    let present = datagram.len() - HEADER_LEN;
+    if promised > present {
+        return Err(MirrorError::Truncated { promised, present });
+    }
+    Ok((header, &datagram[HEADER_LEN..HEADER_LEN + promised]))
+}
+
+/// Reads just the header, for a caller that reads the payload separately.
+///
+/// A TCP reader has to do that: it reads the header first, learns how much
+/// follows and then reads exactly that, because a stream does not arrive in
+/// packets (`raop_rtp_mirror.c:298-302` loops the same way).
+///
+/// # Errors
+///
+/// Returns [`MirrorError::TooShort`] for fewer than [`HEADER_LEN`] bytes and
+/// [`MirrorError::TooLarge`] for a payload size beyond [`MAX_PAYLOAD`].
+pub fn parse_header(datagram: &[u8]) -> Result<MirrorHeader, MirrorError> {
     if datagram.len() < HEADER_LEN {
         return Err(MirrorError::TooShort {
             length: datagram.len(),
@@ -180,11 +200,7 @@ pub fn parse_packet(datagram: &[u8]) -> Result<(MirrorHeader, &[u8]), MirrorErro
             maximum: MAX_PAYLOAD,
         });
     }
-    let present = datagram.len() - HEADER_LEN;
-    if promised > present {
-        return Err(MirrorError::Truncated { promised, present });
-    }
-    Ok((header, &datagram[HEADER_LEN..HEADER_LEN + promised]))
+    Ok(header)
 }
 
 /// The key and IV of one mirror stream.

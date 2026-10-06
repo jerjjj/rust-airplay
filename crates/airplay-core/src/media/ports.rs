@@ -23,7 +23,8 @@
 
 use std::net::SocketAddr;
 
-use tokio::net::UdpSocket;
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use super::audio::{AudioFrame, AudioSession, WINDOW_CAPACITY};
 
@@ -40,6 +41,8 @@ pub struct MediaSockets {
     timing: UdpSocket,
     control: UdpSocket,
     data: UdpSocket,
+    /// The mirror stream arrives over TCP, beside the audio sockets.
+    mirror: TcpListener,
 }
 
 impl MediaSockets {
@@ -53,6 +56,7 @@ impl MediaSockets {
             timing: UdpSocket::bind(bind).await?,
             control: UdpSocket::bind(bind).await?,
             data: UdpSocket::bind(bind).await?,
+            mirror: TcpListener::bind(bind).await?,
         })
     }
 
@@ -81,6 +85,25 @@ impl MediaSockets {
     /// Returns the underlying error when the socket has no local address.
     pub fn data_port(&self) -> std::io::Result<u16> {
         Ok(self.data.local_addr()?.port())
+    }
+
+    /// Port of the mirror listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error when the listener has no local address.
+    pub fn mirror_port(&self) -> std::io::Result<u16> {
+        Ok(self.mirror.local_addr()?.port())
+    }
+
+    /// Waits for a mirroring client to connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error when the listener cannot accept.
+    pub async fn accept_mirror(&self) -> std::io::Result<MirrorStream> {
+        let (stream, _) = self.mirror.accept().await?;
+        Ok(MirrorStream { stream })
     }
 
     /// Receives one audio datagram and returns what became ready.
@@ -178,6 +201,52 @@ impl MediaSockets {
                 }
             }
         }
+    }
+}
+
+/// One mirroring client's connection.
+///
+/// A TCP stream does not arrive in packets, so the reader asks for exactly the
+/// header and then exactly the payload the header promised
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_rtp_mirror.c:298-302` loops the same way),
+/// which is why a short read is handled here rather than by a caller.
+#[derive(Debug)]
+pub struct MirrorStream {
+    stream: TcpStream,
+}
+
+impl MirrorStream {
+    /// Reads one packet, or `None` when the client closed the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error when the connection fails, and
+    /// [`MirrorError`] when what arrived is not a packet this receiver reads.
+    pub async fn read_packet(
+        &mut self,
+    ) -> std::io::Result<Option<(crate::media::mirror::MirrorHeader, Vec<u8>)>> {
+        let mut header = [0u8; crate::media::mirror::HEADER_LEN];
+        match self.stream.read_exact(&mut header).await {
+            Ok(_) => {}
+            // The client closing the stream is how a mirror session ends.
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let header = match crate::media::mirror::parse_header(&header) {
+            Ok(header) => header,
+            // Something that is not a packet ends this stream: a receiver that
+            // guessed at a wrong length would read the rest of the connection as
+            // if it were video.
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ));
+            }
+        };
+        let mut payload = vec![0u8; header.payload_size as usize];
+        self.stream.read_exact(&mut payload).await?;
+        Ok(Some((header, payload)))
     }
 }
 
@@ -325,6 +394,65 @@ mod tests {
             [2, 3]
         );
         assert!(session.take_lost().is_empty(), "the gap was filled");
+    }
+
+    /// A mirror packet with `payload` after the header.
+    fn mirror_packet(kind: (u8, u8), payload: &[u8]) -> Vec<u8> {
+        use crate::media::mirror::HEADER_LEN;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.push(kind.0);
+        bytes.push(kind.1);
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+        bytes.resize(HEADER_LEN, 0);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn a_mirror_client_connects_and_its_packets_survive_short_reads() {
+        use crate::media::mirror::MirrorKind;
+        let sockets = MediaSockets::bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind");
+        let port = sockets.mirror_port().expect("port");
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            use tokio::io::AsyncWriteExt;
+            let packet = mirror_packet((0x01, 0x00), &[0x67, 0x42, 0x00, 0x1e]);
+            // A TCP stream splits where it likes: the test writes the packet in
+            // three pieces, so the reader has to keep asking until it has all of
+            // it rather than trusting one read.
+            for piece in packet.chunks(13) {
+                client.write_all(piece).await.expect("write");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let mut stream = sockets.accept_mirror().await.expect("accept");
+        let (header, payload) = stream.read_packet().await.expect("read").expect("a packet");
+        assert_eq!(header.kind, MirrorKind::CodecData);
+        assert_eq!(header.timestamp, 0x1122_3344_5566_7788);
+        assert_eq!(payload, [0x67, 0x42, 0x00, 0x1e]);
+        writer.await.expect("writer");
+    }
+
+    #[tokio::test]
+    async fn a_mirror_client_that_disconnects_ends_the_stream() {
+        let sockets = MediaSockets::bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind");
+        let port = sockets.mirror_port().expect("port");
+        tokio::spawn(async move {
+            let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            drop(client);
+        });
+        let mut stream = sockets.accept_mirror().await.expect("accept");
+        assert!(stream.read_packet().await.expect("read").is_none());
     }
 
     #[tokio::test]
