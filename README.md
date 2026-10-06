@@ -8,6 +8,7 @@
 - [S3 工作计划与缺陷修复批次](docs/S3_WORK_PLAN.md)
 - [ADR-0001：S3 网络、plist 与 DNS-SD 选型](docs/ADR-0001-network-stack.md)
 - [ADR-0002：配对身份与持久化边界](docs/ADR-0002-pairing-identity.md)
+- [ADR-0003：媒体后端先 GStreamer、为 FFmpeg 保留替换点](docs/ADR-0003-media-backend.md)
 - [架构与代码约定](docs/ARCHITECTURE.md)
 - [源码可行性研究](research/uxplay-rust-feasibility.zh-CN.md)
 - [上游基线及归属](THIRD_PARTY_NOTICES.md)

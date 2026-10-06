@@ -12,7 +12,7 @@
 | S1 | 有界协议基础：镜像帧、NAL、RTP、NTP 表示、HTTP/RTSP 消息 | 拆包/粘包、混合字节序、截断、超限、错误输入测试通过 | 已完成 |
 | S2 | 原版运行基线、密码原语、密钥派生、Apple SRP、PlayFair Rust 移植 | 受控 C oracle 差分、合法向量、重新配对/换流测试通过 | 已完成（离线） |
 | S3 | 发现、网络控制服务、plist、会话生命周期和访问控制 | 可发现；真实配对/SETUP/RECORD/FLUSH/TEARDOWN；错误连接有界 | 进行中 |
-| S4 | 镜像 TCP、音频 UDP、重传、NTP 同步、GStreamer backend | 指定设备 H.264+AAC-ELD、ALAC、长时播放、断线恢复 | 未开始 |
+| S4 | 镜像 TCP、音频 UDP、重传、NTP 同步、GStreamer backend（后端决策见 ADR-0003；FFmpeg 推迟，替换点保留） | 指定设备 H.264+AAC-ELD、ALAC、长时播放、断线恢复 | 未开始 |
 | S5 | H.265、HLS/FCUP/URL 播放、语言/字幕、模式切换 | 与基线逐场景对照，正确控制播放和媒体切换 | 未开始 |
 | S6 | MP4、RTP 转发、封面/元数据、CLI/配置完整兼容 | 选项与行为矩阵完成，录制/导出可用 | 未开始 |
 | S7 | BLE、AWDL、Windows/Linux/macOS/BSD/ARM、部署 | 约定硬件与平台矩阵验收；正确标明上游已有平台限制 | 未开始 |
