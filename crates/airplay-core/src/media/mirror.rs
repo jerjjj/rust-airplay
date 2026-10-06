@@ -233,6 +233,101 @@ pub fn stream_keys(connection_id: u64, audio_key: &[u8; STREAM_KEY_LEN]) -> Stre
     }
 }
 
+/// The Annex-B start code that replaces a length prefix
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_rtp_mirror.c:453-454`, `nal_start_code`).
+pub const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+
+/// Why a decrypted payload is not a sequence of NAL units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NalError {
+    /// A length prefix claims bytes the payload does not have.
+    LengthOutOfRange {
+        /// Offset the prefix was read at.
+        offset: usize,
+        /// Length it claimed.
+        claimed: usize,
+        /// Bytes actually left after the prefix.
+        available: usize,
+    },
+    /// The first byte of a unit has the bit set that has to be zero.
+    ForbiddenBit {
+        /// Offset of the unit's first byte.
+        offset: usize,
+    },
+}
+
+impl std::fmt::Display for NalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthOutOfRange {
+                offset,
+                claimed,
+                available,
+            } => write!(
+                formatter,
+                "the unit at {offset} claims {claimed} bytes but {available} are left"
+            ),
+            Self::ForbiddenBit { offset } => {
+                write!(formatter, "the unit at {offset} has its forbidden bit set")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NalError {}
+
+/// Rewrites the length prefixes of a decrypted mirror payload into Annex-B start
+/// codes, in place, and reports how many units it holds.
+///
+/// The AirPlay mirror protocol prefixes every NAL unit with its length, which a
+/// decoder does not expect; upstream replaces each prefix with `00 00 00 01`
+/// while it checks the unit
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_rtp_mirror.c:453-474`). Doing the same
+/// here means a caller hands the payload to a decoder unchanged after this.
+///
+/// The checks are upstream's, and they matter: a length read out of the payload
+/// is only a length if the unit it claims fits in what is left, and a unit whose
+/// first byte has the forbidden bit set is not a unit at all. A payload that
+/// fails either check is reported instead of being passed on, because a decoder
+/// fed a wrong byte stream does not fail cleanly.
+///
+/// # Errors
+///
+/// Returns [`NalError`] for a payload that is not a sequence of units.
+pub fn into_annex_b(payload: &mut [u8]) -> Result<usize, NalError> {
+    let mut offset = 0;
+    let mut units = 0;
+    while offset < payload.len() {
+        if offset + 4 > payload.len() {
+            return Err(NalError::LengthOutOfRange {
+                offset,
+                claimed: 0,
+                available: payload.len() - offset,
+            });
+        }
+        let claimed =
+            u32::from_be_bytes(payload[offset..offset + 4].try_into().expect("four")) as usize;
+        let available = payload.len() - offset - 4;
+        if claimed > available {
+            return Err(NalError::LengthOutOfRange {
+                offset,
+                claimed,
+                available,
+            });
+        }
+        payload[offset..offset + 4].copy_from_slice(&START_CODE);
+        offset += 4;
+        units += 1;
+        // The first bit of an H.264 unit has to be zero. Upstream reads the byte
+        // even for a unit of length zero, so this does too.
+        let first = payload.get(offset).copied().unwrap_or_default();
+        if first & 0x80 != 0 {
+            return Err(NalError::ForbiddenBit { offset });
+        }
+        offset += claimed;
+    }
+    Ok(units)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +343,63 @@ mod tests {
         bytes.resize(HEADER_LEN, 0);
         bytes.extend_from_slice(payload);
         bytes
+    }
+
+    /// A payload of length-prefixed units, as the client sends them.
+    fn units(units: &[&[u8]]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for unit in units {
+            payload.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+            payload.extend_from_slice(unit);
+        }
+        payload
+    }
+
+    #[test]
+    fn rewrites_length_prefixes_into_start_codes() {
+        // An IDR slice and a non-IDR slice, the two shapes a stream carries.
+        let mut payload = units(&[&[0x65, 0xaa, 0xbb], &[0x41, 0xcc]]);
+        assert_eq!(into_annex_b(&mut payload).expect("two units"), 2);
+        assert_eq!(
+            payload,
+            [
+                0x00, 0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb, 0x00, 0x00, 0x00, 0x01, 0x41, 0xcc
+            ]
+        );
+        // An empty payload holds no units and is not an error.
+        assert_eq!(into_annex_b(&mut []).expect("empty"), 0);
+    }
+
+    #[test]
+    fn refuses_a_length_that_does_not_fit() {
+        // The prefix claims eight bytes but two follow.
+        let mut payload = vec![0, 0, 0, 8, 0x65, 0xaa];
+        assert_eq!(
+            into_annex_b(&mut payload),
+            Err(NalError::LengthOutOfRange {
+                offset: 0,
+                claimed: 8,
+                available: 2
+            })
+        );
+        // A payload that ends inside a prefix is refused too, rather than being
+        // read as a length.
+        let mut short = vec![0, 0, 0x65, 0xaa];
+        assert!(matches!(
+            into_annex_b(&mut short),
+            Err(NalError::LengthOutOfRange { offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_a_unit_whose_forbidden_bit_is_set() {
+        // Upstream checks the bit before it looks at anything else in the unit
+        // (raop_rtp_mirror.c:470-474).
+        let mut payload = units(&[&[0x85, 0x00]]);
+        assert_eq!(
+            into_annex_b(&mut payload),
+            Err(NalError::ForbiddenBit { offset: 4 })
+        );
     }
 
     #[test]
