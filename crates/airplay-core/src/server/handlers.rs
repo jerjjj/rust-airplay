@@ -599,9 +599,57 @@ impl RouteHandlers {
                 else {
                     return RouteReply::new(400, "Bad Request");
                 };
-                let connection_id = stream
-                    .get("streamConnectionID")
-                    .and_then(plist::Value::as_unsigned_integer);
+                // A device that names its mirror stream sometimes does and sometimes
+                // does not send `streamConnectionID`, and the value is what the
+                // stream's AES-CTR keys are derived from, so it must not be missed
+                // because it arrived as another numeric type. `plist` can hold a
+                // number as an integer or as a real, and a client that wrote it as a
+                // real would otherwise leave the mirror stream unkeyable with nothing
+                // said anywhere.
+                let id_value = stream.get("streamConnectionID");
+                let connection_id = id_value.and_then(|value| {
+                    value
+                        .as_unsigned_integer()
+                        .or_else(|| {
+                            value
+                                .as_signed_integer()
+                                .and_then(|signed| signed.try_into().ok())
+                        })
+                        .or_else(|| {
+                            // A real is how a client writes a number it computed, and an
+                            // identifier that is not a whole number is not one this
+                            // receiver can use: the conversion refuses it rather than
+                            // rounding a key input into a different key.
+                            value
+                                .as_real()
+                                .and_then(|real| (real.is_finite() && real >= 0.0).then_some(real))
+                                .and_then(|real| {
+                                    #[allow(
+                                        clippy::cast_possible_truncation,
+                                        clippy::cast_sign_loss
+                                    )]
+                                    let whole = real as u64;
+                                    (whole as f64 == real).then_some(whole)
+                                })
+                        })
+                });
+                if stream.contains_key("streamConnectionID") && connection_id.is_none() {
+                    eprintln!(
+                        "rust-airplay: streamConnectionID is present but not a usable \
+                         identifier: {id_value:?}"
+                    );
+                }
+                // What the entry actually carried, for a device that names its mirror
+                // stream in one session and not in the next: the difference is either in
+                // the request or in this reader, and only the keys can say which. A
+                // setting, because it names what a client sent.
+                if connection_id.is_none() && std::env::var("AIRPLAY_DEBUG_SETUP").is_ok() {
+                    let keys: Vec<&str> = stream.keys().map(String::as_str).collect();
+                    eprintln!(
+                        "rust-airplay: stream type {kind} carried [{}]",
+                        keys.join(", ")
+                    );
+                }
                 // Upstream's `switch` has no default arm: an unknown type is
                 // simply not answered (`:954-1050`).
                 if !matches!(kind, 96 | 110) {
