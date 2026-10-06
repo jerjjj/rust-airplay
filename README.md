@@ -4,7 +4,7 @@
 
 **当前是分阶段开发中的协议核心：可被发现、可完成配对与控制面会话，但还不能播放媒体。** 客户端能查到本接收端、走完配对并发出 `SETUP`，但接收端尚未绑定媒体端口，所以不会出声。原版构建、密码链、实机互操作和媒体后端的完成状态以 [迁移计划](docs/MIGRATION_PLAN.md) 为准。
 
-- [分阶段计划与验收](docs/MIGRATION_PLAN.md)
+- [全项目分阶段计划与验收](docs/MIGRATION_PLAN.md)
 - [S3 工作计划与缺陷修复批次](docs/S3_WORK_PLAN.md)
 - [S4 工作计划：媒体会话与 GStreamer 渲染](docs/S4_WORK_PLAN.md)
 - [ADR-0001：S3 网络、plist 与 DNS-SD 选型](docs/ADR-0001-network-stack.md)
