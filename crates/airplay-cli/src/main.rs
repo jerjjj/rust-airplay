@@ -531,19 +531,53 @@ async fn run() -> Result<(), String> {
     let mirror_renderer = Arc::clone(&renderer);
     let mirror_stop = stopping.clone();
     tokio::spawn(async move {
-        let Ok(keys) = mirror_ready.await else {
-            return;
-        };
-        println!("*** mirror stream keyed, video can arrive ***");
-        loop {
-            let mut stream = tokio::select! {
+        // The listener accepts from the moment the receiver is up, which is not the
+        // moment it has keys: a device may open the mirror connection before the
+        // `SETUP` that carries the `type: 110` stream entry has been answered, and a
+        // connection nobody accepts is one the device abandons after a timeout. So
+        // the first connection waits for the keys beside the accept rather than
+        // behind it.
+        println!(
+            "media     mirror listener ready on port {}",
+            mirror_sockets.mirror_port().unwrap_or_default()
+        );
+        let mut pending = None;
+        let mut mirror_ready = mirror_ready;
+        let keys = loop {
+            tokio::select! {
                 _ = stopped(mirror_stop.clone()) => return,
-                accepted = mirror_sockets.accept_mirror() => match accepted {
-                    Ok(stream) => stream,
+                ready = &mut mirror_ready => match ready {
+                    Ok(keys) => {
+                        println!("*** mirror stream keyed, video can arrive ***");
+                        break keys;
+                    }
+                    Err(_) => return,
+                },
+                accepted = mirror_sockets.accept_mirror(), if pending.is_none() => match accepted {
+                    Ok(stream) => {
+                        println!("media     a mirror connection arrived before its keys");
+                        pending = Some(stream);
+                    }
                     Err(error) => {
                         eprintln!("rust-airplay: the mirror listener stopped: {error}");
                         return;
                     }
+                },
+            }
+        };
+        let mut waiting = pending;
+        loop {
+            let mut stream = match waiting.take() {
+                Some(stream) => stream,
+                None => tokio::select! {
+                    _ = stopped(mirror_stop.clone()) => return,
+                    accepted = mirror_sockets.accept_mirror() => match accepted {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            eprintln!("rust-airplay: the mirror listener stopped: {error}");
+                            return;
+                        }
+                    },
                 },
             };
             let mut session = match airplay_core::media::mirror::MirrorSession::new(&keys) {
@@ -630,6 +664,10 @@ async fn run() -> Result<(), String> {
                 let media_key = Arc::clone(&media_key);
                 let mirror_keys = Arc::clone(&mirror_keys);
                 let timing_target = Arc::clone(&timing_target);
+                // A device sends its audio key in one `SETUP` and its `type: 110`
+                // stream entry in a later one, so the key has to outlive the
+                // request that carried it.
+                let mut remembered_key: Option<[u8; 16]> = None;
                 handlers.set_setup_callback(move |request| {
                     // Which streams a client asked for is what decides whether the
                     // mirror listener will ever see a connection, so it is part of
@@ -676,24 +714,43 @@ async fn run() -> Result<(), String> {
                         ),
                     }
                     // The session key starts the receive loop, once, however many
-                    // connections a client opens.
+                    // connections a client opens. It is also kept, because a device
+                    // sends its `type: 110` stream entry in a later request without
+                    // repeating the key that stream is encrypted under.
                     if let (Some(key), Some(iv)) = (request.audio_key, request.audio_iv) {
+                        remembered_key = Some(key);
                         if let Some(sender) = lock(&media_key).take() {
                             let _ = sender.send((key, iv));
                             println!("*** media session keyed, audio can arrive ***");
                         }
                     }
                     // The mirror stream's key is the audio key hashed with the
-                    // connection identifier the client chose, so it is derived here
-                    // where both are known.
+                    // connection identifier the client chose, and a device sends
+                    // those in *different* requests: the key in the first `SETUP`
+                    // of a session, the `type: 110` stream entry in a later one
+                    // without the key repeated (`raop_handlers.h:955-967` derives
+                    // it from the audio key the connection already holds). This
+                    // used to be read from the same request, which meant a device
+                    // that splits them never got a mirror stream at all: the
+                    // listener below waits for keys that were never derived, so a
+                    // client that connects is not even accepted.
                     let mirror_id = request
                         .streams
                         .iter()
                         .find(|stream| stream.kind == MIRROR_STREAM_TYPE)
                         .and_then(|stream| stream.stream_connection_id);
-                    if let (Some(id), Some(key)) = (mirror_id, request.audio_key) {
+                    if let Some(id) = mirror_id {
+                        let key = request.audio_key.or(remembered_key);
+                        let Some(key) = key else {
+                            eprintln!(
+                                "rust-airplay: a mirror stream was asked for before any \
+                                 audio key arrived, so its bytes cannot be decrypted"
+                            );
+                            return;
+                        };
                         if let Some(sender) = lock(&mirror_keys).take() {
                             let keys = airplay_core::media::mirror::stream_keys(id, &key);
+                            println!("*** mirror stream keyed, video can arrive ***");
                             let _ = sender.send(keys);
                         }
                     }
