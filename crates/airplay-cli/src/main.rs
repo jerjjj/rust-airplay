@@ -25,6 +25,11 @@ use airplay_core::server::{
     DeviceIdentity, PairingState, PinMode, RouteHandlers, Server, ServerConfig, SetupPorts,
 };
 
+/// The stream type a mirroring client asks for, whose entry carries the
+/// `streamConnectionID` the mirror keys are derived from
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:954-983`).
+const MIRROR_STREAM_TYPE: u16 = 110;
+
 const USAGE: &str = "\
 rust-airplay - protocol development receiver
 
@@ -235,23 +240,41 @@ async fn run() -> Result<(), String> {
                 .data_port()
                 .map_err(|error| format!("data port: {error}"))?,
         ),
+        // A mirroring client is told where to connect, so its stream arrives on a
+        // port this receiver is already listening on.
+        mirror_data_port: Some(
+            media
+                .mirror_port()
+                .map_err(|error| format!("mirror port: {error}"))?,
+        ),
         ..SetupPorts::default()
     };
     println!(
-        "media     timing {} control {} data {}",
+        "media     timing {} control {} data {} mirror {}",
         setup_ports.timing_port.unwrap_or_default(),
         setup_ports.control_port.unwrap_or_default(),
-        setup_ports.data_port.unwrap_or_default()
+        setup_ports.data_port.unwrap_or_default(),
+        setup_ports.mirror_data_port.unwrap_or_default()
     );
+    // The three datagram sockets and the mirror listener are shared by the audio loop
+    // and the mirror loop, which watch different ones of them.
+    let media = Arc::new(media);
     let (media_key, media_ready) = tokio::sync::oneshot::channel::<([u8; 16], [u8; 16])>();
     let media_key = Arc::new(Mutex::new(Some(media_key)));
+    // The mirror stream is keyed by the connection identifier a client sends in its
+    // `type: 110` stream entry, so its keys can only be derived once that `SETUP`
+    // has been accepted.
+    let (mirror_keys, mirror_ready) =
+        tokio::sync::oneshot::channel::<airplay_core::media::mirror::StreamKeys>();
+    let mirror_keys = Arc::new(Mutex::new(Some(mirror_keys)));
+    let audio_sockets = Arc::clone(&media);
     tokio::spawn(async move {
         let Ok((key, iv)) = media_ready.await else {
             return;
         };
         let mut session = airplay_core::media::ports::session(key, iv);
         let mut frames: u64 = 0;
-        let outcome = media
+        let outcome = audio_sockets
             .serve(&mut session, |_frame| {
                 frames += 1;
                 if frames % 500 == 0 {
@@ -261,6 +284,55 @@ async fn run() -> Result<(), String> {
             .await;
         if let Err(error) = outcome {
             eprintln!("rust-airplay: the media session stopped: {error}");
+        }
+    });
+
+    // A mirroring client connects over TCP after its `SETUP`, and until it does
+    // there is nothing to read from. Each connection gets a session of its own: a
+    // client that reconnects starts its stream over.
+    let mirror_sockets = Arc::clone(&media);
+    tokio::spawn(async move {
+        let Ok(keys) = mirror_ready.await else {
+            return;
+        };
+        println!("*** mirror stream keyed, video can arrive ***");
+        loop {
+            let mut stream = match mirror_sockets.accept_mirror().await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    eprintln!("rust-airplay: the mirror listener stopped: {error}");
+                    return;
+                }
+            };
+            let mut session = match airplay_core::media::mirror::MirrorSession::new(&keys) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!("rust-airplay: cannot start the mirror session: {error}");
+                    return;
+                }
+            };
+            let mut frames: u64 = 0;
+            let outcome = stream
+                .serve(&mut session, |frame| {
+                    frames += 1;
+                    if frames == 1 {
+                        println!(
+                            "media     first video frame: {} bytes, {} units, idr={}, ts={}",
+                            frame.data.len(),
+                            frame.units,
+                            frame.idr,
+                            frame.timestamp
+                        );
+                    } else if frames % 200 == 0 {
+                        println!("media     {frames} video frames received");
+                    }
+                })
+                .await;
+            match outcome {
+                // The client closing the connection is how a mirror session ends.
+                Ok(()) => println!("media     the mirror stream ended after {frames} frames"),
+                Err(error) => eprintln!("rust-airplay: the mirror stream stopped: {error}"),
+            }
         }
     });
 
@@ -278,6 +350,7 @@ async fn run() -> Result<(), String> {
                 let known = Arc::clone(&known);
                 let clients_path = clients_path.clone();
                 let media_key = Arc::clone(&media_key);
+                let mirror_keys = Arc::clone(&mirror_keys);
                 handlers.set_setup_callback(move |request| {
                     // The session key starts the receive loop, once, however many
                     // connections a client opens.
@@ -285,6 +358,20 @@ async fn run() -> Result<(), String> {
                         if let Some(sender) = lock(&media_key).take() {
                             let _ = sender.send((key, iv));
                             println!("*** media session keyed, audio can arrive ***");
+                        }
+                    }
+                    // The mirror stream's key is the audio key hashed with the
+                    // connection identifier the client chose, so it is derived here
+                    // where both are known.
+                    let mirror_id = request
+                        .streams
+                        .iter()
+                        .find(|stream| stream.kind == MIRROR_STREAM_TYPE)
+                        .and_then(|stream| stream.stream_connection_id);
+                    if let (Some(id), Some(key)) = (mirror_id, request.audio_key) {
+                        if let Some(sender) = lock(&mirror_keys).take() {
+                            let keys = airplay_core::media::mirror::stream_keys(id, &key);
+                            let _ = sender.send(keys);
                         }
                     }
                     let Some(client) = request.client_identity else {

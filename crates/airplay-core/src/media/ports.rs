@@ -216,6 +216,41 @@ pub struct MirrorStream {
 }
 
 impl MirrorStream {
+    /// Reads packets until the client closes the connection, handing every frame to
+    /// `on_frame`.
+    ///
+    /// A packet that is not a frame — a keep-alive, a streaming report, the codec
+    /// configuration — is not reported: a caller's callback is for video, and
+    /// [`super::mirror::MirrorSession`] is where the rest is kept. A packet that is
+    /// not a frame *and* not something the session can place is reported to the
+    /// caller as an error, because a stream that has come apart is not something to
+    /// keep reading blindly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error when the connection fails, and a
+    /// [`super::mirror::FrameError`] when a packet does not fit the stream.
+    pub async fn serve(
+        &mut self,
+        session: &mut super::mirror::MirrorSession,
+        mut on_frame: impl FnMut(super::mirror::VideoFrame),
+    ) -> Result<(), ServeError> {
+        while let Some((header, payload)) = self.read_packet().await? {
+            match session.receive(&header, &payload) {
+                Ok(Some(frame)) => on_frame(frame),
+                Ok(None) => {}
+                // A frame that cannot be read is upstream's "invalid frame", which it
+                // marks and passes on rather than ending the connection
+                // (`raop_rtp_mirror.c:533-536`). A packet that is off the stream is
+                // not: the receiver has lost the keystream and cannot recover it by
+                // reading more packets.
+                Err(super::mirror::FrameError::NotUnits(_)) => {}
+                Err(error) => return Err(ServeError::Frame(error)),
+            }
+        }
+        Ok(())
+    }
+
     /// Reads one packet, or `None` when the client closed the connection.
     ///
     /// # Errors
@@ -253,6 +288,37 @@ impl MirrorStream {
 /// Creates a session for a `SETUP` that carried `key` and `iv`.
 pub fn session(key: [u8; 16], iv: [u8; 16]) -> AudioSession {
     AudioSession::new(key, iv, WINDOW_CAPACITY)
+}
+
+/// Why serving a mirror stream stopped.
+///
+/// The two cases are kept apart because they mean different things to a caller: a
+/// connection that failed can be retried, while a stream this receiver has lost
+/// cannot be picked up again by reading more packets.
+#[derive(Debug)]
+pub enum ServeError {
+    /// The connection itself failed, or the client sent something that is not a
+    /// packet at all.
+    Connection(std::io::Error),
+    /// A packet could not be placed in the stream.
+    Frame(crate::media::mirror::FrameError),
+}
+
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(error) => write!(formatter, "the mirror connection: {error}"),
+            Self::Frame(error) => write!(formatter, "the mirror stream: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ServeError {}
+
+impl From<std::io::Error> for ServeError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Connection(error)
+    }
 }
 
 #[cfg(test)]

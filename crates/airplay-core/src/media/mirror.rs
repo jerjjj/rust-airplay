@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! The mirror stream: its keys, and the packets that carry video.
 //!
 //! A mirroring client sets up a stream of its own with `SETUP`, and the two
@@ -720,6 +721,149 @@ fn pps_size_or_zero(payload: &[u8], offset: usize) -> usize {
     read_size(payload, offset).unwrap_or_default()
 }
 
+/// One video frame a mirroring client sent, ready for a decoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoFrame {
+    /// The frame's units, each behind a `00 00 00 01` start code: the codec
+    /// configuration a client sent ahead of it, then the frame's own units.
+    pub data: Vec<u8>,
+    /// Units the frame holds, the prepended configuration included.
+    pub units: usize,
+    /// The client's timestamp, which is the wall-clock time the frame belongs to
+    /// (`raop_rtp_mirror.c:393-395`).
+    pub timestamp: u64,
+    /// Whether the frame starts with an IDR unit, which a decoder needs to start.
+    pub idr: bool,
+}
+
+/// Why a mirror packet did not become a frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    /// The packet does not fit the keystream this receiver is on, which means a
+    /// packet was lost or the stream was re-keyed behind its back.
+    OffTheStream(MirrorError),
+    /// The payload is not the sequence of units it should be.
+    NotUnits(NalError),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OffTheStream(error) => write!(formatter, "the packet is off the stream: {error}"),
+            Self::NotUnits(error) => write!(formatter, "the frame's units: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// A mirroring client's stream: the packets it sends, turned into video frames.
+///
+/// Upstream does all of this in one loop over the TCP stream
+/// (`raop_rtp_mirror.c:295-558`): it reads a header and a payload, decrypts the
+/// video kinds with [`MirrorDecryptor`], prepends a pending codec configuration,
+/// rewrites the length prefixes into start codes, and hands the result to a
+/// decoder. This type is that loop without the socket, so the part that can be
+/// wrong about the protocol is testable and a caller owns the connection.
+#[derive(Debug)]
+pub struct MirrorSession {
+    decryptor: MirrorDecryptor,
+    codec: CodecConfig,
+    /// Frames handed out so far, which is what a caller reports to say the stream
+    /// is alive.
+    frames: u64,
+}
+
+impl MirrorSession {
+    /// Starts a session on a stream's keys, which `SETUP` carried.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::crypto::CryptoError`] when the keys have the wrong shape.
+    pub fn new(keys: &StreamKeys) -> Result<Self, crate::crypto::CryptoError> {
+        Ok(Self {
+            decryptor: MirrorDecryptor::new(keys)?,
+            codec: CodecConfig::new(),
+            frames: 0,
+        })
+    }
+
+    /// Starts the stream over, as a re-key does: the new keys begin a new keystream
+    /// and the configuration waiting from the old stream is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::crypto::CryptoError`] when the keys have the wrong shape.
+    pub fn rekey(&mut self, keys: &StreamKeys) -> Result<(), crate::crypto::CryptoError> {
+        self.codec = CodecConfig::new();
+        self.decryptor.rekey(keys)
+    }
+
+    /// Frames handed out so far.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Takes one packet and returns the frame it carried, if it carried one.
+    ///
+    /// A packet that is not video is kept for the frame it belongs to instead of
+    /// being reported: a keep-alive, a streaming report or a codec configuration
+    /// is not something a decoder can be handed. `payload` is the packet's payload
+    /// as [`parse_packet`] returned it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError`] when a video payload is not the sequence of units it
+    /// should be, and [`MirrorError`] when the packet does not fit the stream the
+    /// decryptor is on.
+    pub fn receive(
+        &mut self,
+        header: &MirrorHeader,
+        payload: &[u8],
+    ) -> Result<Option<VideoFrame>, FrameError> {
+        match header.kind {
+            MirrorKind::CodecData => {
+                // A codec packet that cannot be read is dropped rather than treated
+                // as fatal: the client sends another when the format changes.
+                let _ = self.codec.codec_data(header.timestamp, payload);
+                Ok(None)
+            }
+            MirrorKind::Video { idr } => {
+                let mut data = self.decrypt(payload)?;
+                let mut units = into_annex_b(&mut data).map_err(FrameError::NotUnits)?;
+                if let Some(config) = self.codec.prepend_to(header.timestamp) {
+                    // Upstream counts the two units it prepends, so a caller can
+                    // report how many a frame holds (`raop_rtp_mirror.c:547-553`).
+                    units += 2;
+                    let mut whole = Vec::with_capacity(config.len() + data.len());
+                    whole.extend_from_slice(&config);
+                    whole.extend_from_slice(&data);
+                    data = whole;
+                }
+                self.frames += 1;
+                Ok(Some(VideoFrame {
+                    data,
+                    units,
+                    timestamp: header.timestamp,
+                    idr,
+                }))
+            }
+            // Keep-alives, streaming reports and packets this port does not know
+            // carry nothing a decoder can use.
+            _ => Ok(None),
+        }
+    }
+
+    /// Decrypts one video payload.
+    fn decrypt(&mut self, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
+        let mut data = vec![0u8; payload.len()];
+        self.decryptor
+            .decrypt(payload, &mut data)
+            .map_err(FrameError::OffTheStream)?;
+        Ok(data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1145,6 +1289,199 @@ mod tests {
             assert_eq!(*byte, ciphertext[index] ^ stream[index], "byte {index}");
             assert_eq!(offsets[index], index, "the new stream starts at its IV");
         }
+    }
+
+    #[test]
+    fn a_session_turns_video_packets_into_frames_and_keeps_the_codec_data() {
+        // The client's side of a whole little stream: a codec packet, then two video
+        // packets of the kind a client sends, one of them an IDR.
+        let keys = stream_keys(21, &[0x66; STREAM_KEY_LEN]);
+        let timestamp = 0x0000_1234_5678_9abc;
+        let sps = [0x67, 0x42, 0x00, 0x1e];
+        let pps = [0x68, 0xce];
+        let mut session = MirrorSession::new(&keys).expect("session");
+
+        // The codec packet is not a frame; it is kept for the next one.
+        let codec = packet(0x01, 0x00, 0x16, timestamp, &codec_payload(&sps, &pps));
+        let (header, payload) = parse_packet(&codec).expect("codec packet");
+        assert_eq!(
+            session.receive(&header, payload).expect("codec"),
+            None,
+            "a codec packet is not a frame"
+        );
+        assert_eq!(session.frames(), 0);
+
+        // One video packet carrying one unit, encrypted by the client.
+        let unit = [0x65, 0x11, 0x22, 0x33];
+        let body = units(&[&unit]);
+        let mut stream = keystream(&keys, 4);
+        let ciphertext: Vec<u8> = body
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ stream[index])
+            .collect();
+        stream.clear();
+        let video = packet(0x00, 0x10, 0x00, timestamp, &ciphertext);
+        let (header, payload) = parse_packet(&video).expect("video packet");
+        let frame = session
+            .receive(&header, payload)
+            .expect("video")
+            .expect("a frame");
+        assert_eq!(frame.timestamp, timestamp);
+        assert!(frame.idr, "0x00 0x10 is an IDR packet");
+        assert_eq!(
+            frame.data,
+            [
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce,
+                0x00, 0x00, 0x00, 0x01, 0x65, 0x11, 0x22, 0x33
+            ],
+            "the codec data is prepended and the prefix is a start code"
+        );
+        assert_eq!(frame.units, 3, "SPS, PPS and the slice");
+        assert_eq!(session.frames(), 1);
+
+        // A keep-alive is not a frame and does not disturb the stream.
+        let keep_alive = packet(0x02, 0x00, 0x1e, 0, &[]);
+        let (header, payload) = parse_packet(&keep_alive).expect("keep-alive");
+        assert_eq!(session.receive(&header, payload).expect("keep-alive"), None);
+        assert_eq!(session.frames(), 1);
+    }
+
+    #[test]
+    fn a_session_drops_a_codec_configuration_that_no_longer_matches() {
+        // A codec packet, then a video packet with another timestamp: the
+        // configuration belongs to a stream that stopped, so it must not be
+        // prepended to this frame.
+        let keys = stream_keys(22, &[0x67; STREAM_KEY_LEN]);
+        let mut session = MirrorSession::new(&keys).expect("session");
+        let codec = packet(0x01, 0x00, 0x16, 7, &codec_payload(&[0x67, 1], &[0x68, 2]));
+        let (header, payload) = parse_packet(&codec).expect("codec");
+        session.receive(&header, payload).expect("codec");
+
+        let mut stream = keystream(&keys, 2);
+        let body = units(&[&[0x41, 0xaa]]);
+        let ciphertext: Vec<u8> = body
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ stream[index])
+            .collect();
+        stream.clear();
+        let video = packet(0x00, 0x00, 0x00, 99, &ciphertext);
+        let (header, payload) = parse_packet(&video).expect("video");
+        let frame = session
+            .receive(&header, payload)
+            .expect("video")
+            .expect("a frame");
+        assert_eq!(
+            frame.data,
+            [0x00, 0x00, 0x00, 0x01, 0x41, 0xaa],
+            "only the frame's own unit"
+        );
+        assert_eq!(frame.units, 1);
+        assert!(!frame.idr);
+    }
+
+    #[test]
+    fn a_session_reports_a_frame_whose_units_do_not_hold_together() {
+        // The length prefix claims more than the payload has, which upstream treats
+        // as an invalid frame rather than as a broken connection
+        // (`raop_rtp_mirror.c:458-474`).
+        let keys = stream_keys(23, &[0x68; STREAM_KEY_LEN]);
+        let mut session = MirrorSession::new(&keys).expect("session");
+        let body = [0x00, 0x00, 0x00, 0x40, 0x65, 0x01];
+        let stream = keystream(&keys, 2);
+        let ciphertext: Vec<u8> = body
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ stream[index])
+            .collect();
+        let video = packet(0x00, 0x00, 0x00, 3, &ciphertext);
+        let (header, payload) = parse_packet(&video).expect("video");
+        assert_eq!(
+            session.receive(&header, payload),
+            Err(FrameError::NotUnits(NalError::LengthOutOfRange {
+                offset: 0,
+                claimed: 64,
+                available: 2
+            }))
+        );
+        assert_eq!(
+            session.frames(),
+            0,
+            "a frame that could not be read is not one"
+        );
+    }
+
+    #[test]
+    fn a_rekey_restarts_the_keystream_and_drops_the_codec_data() {
+        let keys = stream_keys(24, &[0x69; STREAM_KEY_LEN]);
+        let other = stream_keys(25, &[0x69; STREAM_KEY_LEN]);
+        let mut session = MirrorSession::new(&keys).expect("session");
+        let codec = packet(0x01, 0x00, 0x16, 5, &codec_payload(&[0x67, 1], &[0x68, 2]));
+        let (header, payload) = parse_packet(&codec).expect("codec");
+        session.receive(&header, payload).expect("codec");
+        session.rekey(&other).expect("rekey");
+
+        // The first packet of the new stream reads its own keystream from the start,
+        // and the configuration from the old stream is gone.
+        let stream = keystream(&other, 2);
+        let body = units(&[&[0x41, 0xbb]]);
+        let ciphertext: Vec<u8> = body
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ stream[index])
+            .collect();
+        let video = packet(0x00, 0x00, 0x00, 5, &ciphertext);
+        let (header, payload) = parse_packet(&video).expect("video");
+        let frame = session
+            .receive(&header, payload)
+            .expect("video")
+            .expect("a frame");
+        assert_eq!(frame.data, [0x00, 0x00, 0x00, 0x01, 0x41, 0xbb]);
+        assert_eq!(frame.units, 1);
+    }
+
+    #[test]
+    fn a_session_reports_a_packet_that_is_off_its_stream() {
+        // A four-byte packet cannot be the first one: the stream's first packet has
+        // to be long enough to leave a block behind, and the session says so rather
+        // than decrypting at a guessed offset.
+        let keys = stream_keys(26, &[0x6a; STREAM_KEY_LEN]);
+        let mut session = MirrorSession::new(&keys).expect("session");
+        let short = packet(0x00, 0x00, 0x00, 9, &[0u8; 3]);
+        let (header, payload) = parse_packet(&short).expect("short");
+        // Three bytes is a legal packet length for the stream itself; what it cannot
+        // be is a packet whose units hold together, so this is the unit check that
+        // reports it.
+        let outcome = session.receive(&header, payload);
+        assert!(
+            matches!(outcome, Err(FrameError::NotUnits(_))),
+            "a three-byte video payload is not a frame: {outcome:?}"
+        );
+        assert_eq!(session.frames(), 0);
+
+        // A packet with more carried bytes than it has is off the stream, and the
+        // session reports where rather than guessing.
+        let mut carried = MirrorSession::new(&keys).expect("session");
+        let stream = keystream(&keys, 3);
+        let body = units(&[&[0x41; 20]]);
+        let ciphertext: Vec<u8> = body
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ stream[index])
+            .collect();
+        let video = packet(0x00, 0x00, 0x00, 8, &ciphertext);
+        let (header, payload) = parse_packet(&video).expect("video");
+        assert!(carried.receive(&header, payload).expect("video").is_some());
+        let short = packet(0x00, 0x00, 0x00, 9, &[0u8; 3]);
+        let (header, payload) = parse_packet(&short).expect("short");
+        assert_eq!(
+            carried.receive(&header, payload),
+            Err(FrameError::OffTheStream(MirrorError::Carry {
+                carried: 8,
+                length: 3
+            }))
+        );
     }
 
     #[test]
