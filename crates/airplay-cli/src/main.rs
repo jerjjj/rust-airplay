@@ -22,7 +22,7 @@ use std::time::Duration;
 use airplay_core::crypto::sha512_concat;
 use airplay_core::discovery::{Advertisement, Advertiser, Protection};
 use airplay_core::server::{
-    DeviceIdentity, PairingState, PinMode, RouteHandlers, Server, ServerConfig,
+    DeviceIdentity, PairingState, PinMode, RouteHandlers, Server, ServerConfig, SetupPorts,
 };
 
 const USAGE: &str = "\
@@ -210,17 +210,83 @@ async fn run() -> Result<(), String> {
     // log without timestamps cannot answer it.
     let started = std::time::Instant::now();
     let trace_log = log.clone();
+
+    // The media sockets are bound before anything is advertised, so the ports
+    // `SETUP` names are ports that already answer. The receive loop waits for the
+    // first `SETUP` that carries a key, because until then there is nothing to
+    // decrypt with.
+    let media =
+        airplay_core::media::ports::MediaSockets::bind("0.0.0.0:0".parse().expect("bind address"))
+            .await
+            .map_err(|error| format!("cannot bind the media ports: {error}"))?;
+    let setup_ports = SetupPorts {
+        timing_port: Some(
+            media
+                .timing_port()
+                .map_err(|error| format!("timing port: {error}"))?,
+        ),
+        control_port: Some(
+            media
+                .control_port()
+                .map_err(|error| format!("control port: {error}"))?,
+        ),
+        data_port: Some(
+            media
+                .data_port()
+                .map_err(|error| format!("data port: {error}"))?,
+        ),
+        ..SetupPorts::default()
+    };
+    println!(
+        "media     timing {} control {} data {}",
+        setup_ports.timing_port.unwrap_or_default(),
+        setup_ports.control_port.unwrap_or_default(),
+        setup_ports.data_port.unwrap_or_default()
+    );
+    let (media_key, media_ready) = tokio::sync::oneshot::channel::<([u8; 16], [u8; 16])>();
+    let media_key = Arc::new(Mutex::new(Some(media_key)));
+    tokio::spawn(async move {
+        let Ok((key, iv)) = media_ready.await else {
+            return;
+        };
+        let mut session = airplay_core::media::ports::session(key, iv);
+        let mut frames: u64 = 0;
+        let outcome = media
+            .serve(&mut session, |_frame| {
+                frames += 1;
+                if frames % 500 == 0 {
+                    println!("media     {frames} audio frames received");
+                }
+            })
+            .await;
+        if let Err(error) = outcome {
+            eprintln!("rust-airplay: the media session stopped: {error}");
+        }
+    });
+
     let result = server
         .run(move || {
             let log = trace_log.clone();
             let mut handlers =
                 RouteHandlers::with_pairing(identity.clone(), Arc::clone(&handlers_state));
+            // The ports this run actually listens on, so a client is told where
+            // to send instead of guessing.
+            handlers.set_setup_ports(setup_ports);
             // A session that carries a verified client key is a client worth
             // remembering, so the next run can answer for it.
             {
                 let known = Arc::clone(&known);
                 let clients_path = clients_path.clone();
+                let media_key = Arc::clone(&media_key);
                 handlers.set_setup_callback(move |request| {
+                    // The session key starts the receive loop, once, however many
+                    // connections a client opens.
+                    if let (Some(key), Some(iv)) = (request.audio_key, request.audio_iv) {
+                        if let Some(sender) = lock(&media_key).take() {
+                            let _ = sender.send((key, iv));
+                            println!("*** media session keyed, audio can arrive ***");
+                        }
+                    }
                     let Some(client) = request.client_identity else {
                         return;
                     };
