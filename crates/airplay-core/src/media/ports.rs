@@ -369,7 +369,7 @@ impl MirrorStream {
             Err(error) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("{error} (first bytes: {})", hex_preview(&header)),
+                    format!("{error} (first 128 bytes: {})", hex_preview(&header)),
                 ));
             }
         };
@@ -413,6 +413,21 @@ impl From<std::io::Error> for ServeError {
     fn from(error: std::io::Error) -> Self {
         Self::Connection(error)
     }
+}
+
+/// The first bytes of a packet, in hex, for a header that could not be read.
+///
+/// A wrong length is read once and everything after it comes from the wrong
+/// place, so the bytes are the only thing that says whether the framing is wrong
+/// or the stream was never a mirror stream. The whole first read is shown,
+/// because a mirror header is 128 bytes and its shape is what identifies it.
+pub(crate) fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(128)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -675,12 +690,3 @@ mod tests {
     }
 }
 
-/// The first bytes of a packet, for a header that could not be read.
-fn hex_preview(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
