@@ -36,6 +36,7 @@
 
 use std::collections::VecDeque;
 
+use crate::crypto::{self, CryptoError};
 use crate::rtp;
 use crate::wire::ParseError;
 
@@ -128,6 +129,122 @@ pub fn parse_audio_packet(datagram: &[u8]) -> Result<AudioPacket<'_>, AudioPacke
         kind,
     })
 }
+
+/// Decrypts one audio payload the way upstream does
+/// (`upstream/UxPlay@3dbf7cee:lib/raop_buffer.c:116-137`).
+///
+/// Two details there are easy to get wrong and are therefore stated here:
+///
+/// - Only the part that fills whole blocks is encrypted: upstream decrypts
+///   `payload_size / 16 * 16` bytes and copies the remaining tail through
+///   unchanged, so a payload whose length is not a multiple of sixteen ends in
+///   clear bytes rather than being padded.
+/// - The cipher is reset for every packet, which makes each packet start from the
+///   same IV that `SETUP` carried. Nothing chains across packets, so a receiver
+///   that decrypted them as one stream would produce noise.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] when the key or IV has the wrong length; an empty
+/// encrypted prefix is not an error, it is a payload that is entirely clear.
+pub fn decrypt_payload(
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    payload: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let encrypted = payload.len() / 16 * 16;
+    let mut output = Vec::with_capacity(payload.len());
+    if encrypted > 0 {
+        output.extend_from_slice(&crypto::aes128_cbc_decrypt(key, iv, &payload[..encrypted])?);
+    }
+    output.extend_from_slice(&payload[encrypted..]);
+    Ok(output)
+}
+
+/// One audio stream of one session: the datagrams a client sends, decrypted and
+/// put back in order.
+///
+/// The key and IV are the ones `SETUP` handed over (`SetupRequest::audio_key` and
+/// `audio_iv`); a receiver that has not set a session up has neither, and must
+/// not build one of these.
+#[derive(Debug)]
+pub struct AudioSession {
+    key: [u8; 16],
+    iv: [u8; 16],
+    window: ReorderWindow,
+}
+
+impl AudioSession {
+    /// Creates a session that holds at most `capacity` reordered packets.
+    pub fn new(key: [u8; 16], iv: [u8; 16], capacity: usize) -> Self {
+        Self {
+            key,
+            iv,
+            window: ReorderWindow::new(capacity),
+        }
+    }
+
+    /// Reads one datagram and returns the frames that are ready for a renderer.
+    ///
+    /// The marker an AAC-ELD stream starts with is delivered undecrypted:
+    /// upstream treats it as a packet with no audio in it, so decrypting it would
+    /// produce nonsense.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioSessionError`] for a datagram this stream cannot use, or
+    /// when the payload does not decrypt.
+    pub fn receive(&mut self, datagram: &[u8]) -> Result<Vec<AudioFrame>, AudioSessionError> {
+        let packet = parse_audio_packet(datagram)?;
+        let payload = match packet.kind {
+            AudioPayloadKind::NoDataMarker => packet.payload.to_vec(),
+            AudioPayloadKind::Data => decrypt_payload(&self.key, &self.iv, packet.payload)?,
+        };
+        Ok(self.window.accept(AudioFrame {
+            sequence: packet.sequence,
+            timestamp: packet.timestamp,
+            payload,
+            kind: packet.kind,
+        }))
+    }
+
+    /// Sequence numbers given up on since they were last taken.
+    pub fn take_lost(&mut self) -> Vec<u16> {
+        self.window.take_lost()
+    }
+}
+
+/// Why a datagram could not be turned into audio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioSessionError {
+    /// The datagram was not an audio packet.
+    Packet(AudioPacketError),
+    /// The payload could not be decrypted.
+    Decrypt(CryptoError),
+}
+
+impl From<AudioPacketError> for AudioSessionError {
+    fn from(error: AudioPacketError) -> Self {
+        Self::Packet(error)
+    }
+}
+
+impl From<CryptoError> for AudioSessionError {
+    fn from(error: CryptoError) -> Self {
+        Self::Decrypt(error)
+    }
+}
+
+impl std::fmt::Display for AudioSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Packet(error) => write!(formatter, "{error}"),
+            Self::Decrypt(error) => write!(formatter, "the payload did not decrypt: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for AudioSessionError {}
 
 /// One audio payload, ready for a renderer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,6 +592,105 @@ mod tests {
         let ready = window.accept(frame(101));
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].sequence, 101);
+    }
+
+    /// Encrypts with the port's own CBC primitive, so the test builds the
+    /// ciphertext the way a client's key does rather than trusting a fixture.
+    fn encrypt(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        type Encryptor = cbc::Encryptor<aes::Aes128>;
+        let mut buffer = plaintext.to_vec();
+        let encrypted = Encryptor::new(key.into(), iv.into())
+            .encrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(
+                &mut buffer,
+                plaintext.len() / 16 * 16,
+            )
+            .expect("whole blocks");
+        let mut output = encrypted.to_vec();
+        output.extend_from_slice(&plaintext[plaintext.len() / 16 * 16..]);
+        output
+    }
+
+    #[test]
+    fn decrypts_only_whole_blocks_and_copies_the_tail() {
+        let key = [0x11; 16];
+        let iv = [0x22; 16];
+        // Sixteen bytes of audio and five bytes that no block covers: upstream
+        // decrypts the first part and passes the rest through unchanged
+        // (raop_buffer.c:130-136).
+        let mut plaintext = vec![0x8c; 16];
+        plaintext.extend_from_slice(b"clear");
+        assert_eq!(plaintext.len(), 21);
+        let encrypted = encrypt(&key, &iv, &plaintext);
+        assert_ne!(&encrypted[..16], &plaintext[..16], "the block is encrypted");
+        assert_eq!(&encrypted[16..], b"clear", "the tail is not");
+
+        let decrypted = decrypt_payload(&key, &iv, &encrypted).expect("decrypt");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn every_packet_starts_from_the_same_iv() {
+        let key = [0x33; 16];
+        let iv = [0x44; 16];
+        let first = encrypt(&key, &iv, &[0x8c; 16]);
+        let second = encrypt(&key, &iv, &[0x8c; 16]);
+        assert_eq!(first, second, "the client resets its cipher per packet too");
+        // A payload that is entirely clear is not an error: nothing to decrypt.
+        assert_eq!(
+            decrypt_payload(&key, &iv, b"short").expect("decrypt"),
+            b"short"
+        );
+    }
+
+    #[test]
+    fn a_session_delivers_decrypted_audio_in_order() {
+        let key = [0x55; 16];
+        let iv = [0x66; 16];
+        let mut session = AudioSession::new(key, iv, WINDOW_CAPACITY);
+        let audio = encrypt(&key, &iv, &[0x8c; 16]);
+        let packet = |sequence: u16, timestamp: u32| datagram(sequence, timestamp, &audio);
+
+        // The first packet fixes the starting point, so it is delivered.
+        let ready = session.receive(&packet(1, 480)).expect("first");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].payload, vec![0x8c; 16], "delivered decrypted");
+        // The third one waits for the second.
+        assert!(session.receive(&packet(3, 1440)).expect("third").is_empty());
+        let ready = session.receive(&packet(2, 960)).expect("second");
+        assert_eq!(
+            ready.iter().map(|frame| frame.sequence).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(ready.iter().all(|frame| frame.payload == vec![0x8c; 16]));
+    }
+
+    #[test]
+    fn a_session_delivers_the_start_marker_without_decrypting_it() {
+        let mut session = AudioSession::new([0x77; 16], [0x88; 16], WINDOW_CAPACITY);
+        let ready = session
+            .receive(&datagram(1, 0, &NO_DATA_MARKER))
+            .expect("marker");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].kind, AudioPayloadKind::NoDataMarker);
+        assert_eq!(ready[0].payload, NO_DATA_MARKER);
+    }
+
+    #[test]
+    fn a_session_refuses_what_is_not_audio() {
+        let mut session = AudioSession::new([0x99; 16], [0xaa; 16], WINDOW_CAPACITY);
+        assert!(matches!(
+            session.receive(&[0x80, 0x60, 0, 1]),
+            Err(AudioSessionError::Packet(AudioPacketError::TooShort))
+        ));
+        let mut wrong_type = datagram(1, 0, &[0; 16]);
+        wrong_type[1] = 97;
+        assert!(matches!(
+            session.receive(&wrong_type),
+            Err(AudioSessionError::Packet(
+                AudioPacketError::UnexpectedPayloadType(97)
+            ))
+        ));
     }
 
     #[test]
