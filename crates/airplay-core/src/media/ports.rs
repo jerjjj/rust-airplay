@@ -221,7 +221,7 @@ impl MirrorStream {
     /// # Errors
     ///
     /// Returns the underlying error when the connection fails, and
-    /// [`MirrorError`] when what arrived is not a packet this receiver reads.
+    /// [`crate::media::mirror::MirrorError`] when what arrived is not a packet this receiver reads.
     pub async fn read_packet(
         &mut self,
     ) -> std::io::Result<Option<(crate::media::mirror::MirrorHeader, Vec<u8>)>> {
