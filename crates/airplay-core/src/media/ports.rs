@@ -128,6 +128,59 @@ impl MediaSockets {
     }
 }
 
+impl MediaSockets {
+    /// Serves the session until a socket fails, handing every ready frame to
+    /// `on_frame`.
+    ///
+    /// The three sockets are watched together, because a session that read them
+    /// one after another would stop draining audio while it waited for a control
+    /// packet. A datagram this session cannot use is ignored rather than fatal:
+    /// a client that sends something unexpected does not end the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error when a socket stops being readable. The
+    /// caller decides what that means for the session; this function does not
+    /// retry, because a receiver that silently reopens a socket hides the
+    /// problem from whoever is watching it.
+    pub async fn serve(
+        &self,
+        session: &mut AudioSession,
+        mut on_frame: impl FnMut(AudioFrame),
+    ) -> std::io::Result<()> {
+        use tokio::select;
+        let mut audio = [0u8; MAX_DATAGRAM];
+        let mut control = [0u8; MAX_DATAGRAM];
+        let mut timing = [0u8; MAX_DATAGRAM];
+        loop {
+            select! {
+                result = self.data.recv(&mut audio) => {
+                    let length = result?;
+                    if let Ok(frames) = session.receive(&audio[..length]) {
+                        for frame in frames {
+                            on_frame(frame);
+                        }
+                    }
+                }
+                result = self.control.recv(&mut control) => {
+                    let length = result?;
+                    if let Ok(frames) = session.receive_control(&control[..length]) {
+                        for frame in frames {
+                            on_frame(frame);
+                        }
+                    }
+                }
+                result = self.timing.recv(&mut timing) => {
+                    // Answers to the clock exchange are handed to the caller by
+                    // `receive_timing`; the loop only keeps the socket drained
+                    // until the clock arithmetic lands (`S4-1b-3`).
+                    let _ = result?;
+                }
+            }
+        }
+    }
+}
+
 /// Creates a session for a `SETUP` that carried `key` and `iv`.
 pub fn session(key: [u8; 16], iv: [u8; 16]) -> AudioSession {
     AudioSession::new(key, iv, WINDOW_CAPACITY)
@@ -272,6 +325,48 @@ mod tests {
             [2, 3]
         );
         assert!(session.take_lost().is_empty(), "the gap was filled");
+    }
+
+    #[tokio::test]
+    async fn the_loop_hands_audio_to_the_callback_while_a_control_packet_is_pending() {
+        let key = [0x0f; 16];
+        let iv = [0xf0; 16];
+        let sockets = MediaSockets::bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind");
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+        let data: SocketAddr = format!("127.0.0.1:{}", sockets.data_port().expect("port"))
+            .parse()
+            .expect("address");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = std::sync::Arc::clone(&seen);
+
+        // The loop runs until the test stops it, so it is aborted rather than
+        // awaited to completion.
+        let serving = {
+            let mut session = session(key, iv);
+            tokio::spawn(async move {
+                sockets
+                    .serve(&mut session, move |frame| {
+                        collected.lock().expect("lock").push(frame.sequence);
+                    })
+                    .await
+            })
+        };
+
+        for sequence in [1u16, 2, 3] {
+            client
+                .send_to(
+                    &datagram(sequence, u32::from(sequence) * 480, &key, &iv),
+                    data,
+                )
+                .await
+                .expect("send");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let sequences = seen.lock().expect("lock").clone();
+        assert_eq!(sequences, [1, 2, 3], "every packet reached the callback");
+        serving.abort();
     }
 
     #[tokio::test]
