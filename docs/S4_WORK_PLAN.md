@@ -36,7 +36,7 @@
 | **S4-1b-2** NTP 时序服务 | 🟡 **报文层已完成**（`src/media/timing.rs`）：按上游 `raop_ntp.c:578-700` 构造 32 字节请求（`0x80 0xd2 0x00 0x07`，偏移 24 放本机 NTP 时间戳，复用 `ntp::unix_nanos_to_timestamp`）并读回应答的三个 32 位值（偏移 8/16/24 = t1/t2/t3，类型 `0x53`）。**时钟算术仍未做**：上游用 `raop_ntp_adjust_remote_timestamp_offset` 调整远端值、拒绝重复与伪造包、并叠加 `sync_delay`，这些必须通读 `raop_ntp.c`(1027 行) 才能忠实实现——不猜 | `lib/raop_ntp.c`（待通读） | 3 条报文层测试（请求字节与上游一致、时间戳往返在格式精度内、请求/短包/错类型被拒） |
 | **S4-1b-3** 时钟同步算术 | 偏差与延迟计算、`sync_delay`、重复/伪造包拒绝、`recv_time_kernel` 可能为 NULL 的分支 | `lib/raop_ntp.c` 的 `t1..t4` 段落 | 偏差固定向量 + 与上游对照 |
 | **S4-1c** 镜像通道 | 🟡 **已完成**：密钥派生（`AirPlayStreamKey`/`AirPlayStreamIV` + 十进制连接号 + 音频密钥，SHA-512 取前 16 字节）、128 字节包头解析与类型表（`raop_rtp_mirror.c:298-352`，含"哪两类是加密的"）、TCP 监听与分包读取（含短读）、NAL 长度前缀→Annex-B 起始码就地改写与校验（`:453-474`）。**未完成**：视频载荷的 CTR 解密规则 | `lib/raop_rtp_mirror.c` + `lib/mirror_buffer.c` | 已有 11 条镜像测试 |
-| **S4-1c-2** 镜像 CTR 解密规则 | **读出来的准确规则**（`mirror_buffer_decrypt`）：每个包**重启计数器**（`aes_ctr_start_fresh_block`）→ 解密整数块 → 尾部不足 16 字节时把**整块**解密，只用前 `len%16` 字节，**该块剩余的 `16-(len%16)` 个密钥流字节留在 `og[]`**（`nextDecryptCount`），下个包开头用它们异或。**注意**：`media/mirror.rs` 里现有的 `StreamCipher` 是"单条连续密钥流"的模型，**与上游不符且未接线**，实现时必须替换而不是扩展它；另有 SPS/PPS 前缀拼装（`:420-450`） | `lib/mirror_buffer.c` 的 `mirror_buffer_decrypt`（已读，规则如上）+ `lib/raop_rtp_mirror.c:420-450` | 需要针对"包长为非整块"的固定向量（例如 40 字节包后接 24 字节包）与上游 oracle 差分 |
+| **S4-1c-2** 镜像 CTR 解密规则 | ✅ **已完成**（`src/media/mirror.rs`）：`MirrorDecryptor` 按 `mirror_buffer_decrypt` 的规则解密——每包把计数器移到块边界（`aes_ctr_start_fresh_block`，即上一包尾块之后的那一块）、包头的 `carried` 字节用上一包尾块未用的密钥流、尾部按整块零填充解密并留下 `16-rest` 字节给下一包、计数器按本包用掉的**含尾块在内**的块数前进；密钥流由本模块从 IV 显式生成（位置是规则的一部分，不能依赖 CTR 实现自己保存的状态）。错误的 `StreamCipher`（"单条连续密钥流"模型）已删除。另有 `CodecConfig`：未加密的 SPS+PPS 包按上游规则**拼到下一个时间戳相同的视频包前面**；`MirrorSession` 把整条镜像流变成 `VideoFrame`，CLI 现在声明并接受镜像端口。**验证**：`tools/oracle` 新增 `mirror` 模式——用上游自己的 `mirror_buffer_decrypt` 解密全零包，打印它**读到的密钥流位置**，并做上游自身的往返校验；`tests/upstream_oracle.rs` 用同一批向量逐字节比对本移植。另有 23 条单测（密钥流生成器比对 crate 自己的 CTR、40+24 固定向量、非整块长度序列的收发往返、计数器重启、重键、拒绝越界包、codec 拼装四条、会话层四条） | `lib/mirror_buffer.c` 的 `mirror_buffer_decrypt` + `lib/raop_rtp_mirror.c:420-450` | ✅ 固定向量 + 非整块长度（40→24、33、47、1、64、5、128）+ 与上游 oracle 差分全部通过 |
 | **S4-1d** 端口与收包 | 🟡 **套接字层已完成**（`src/media/ports.rs`）：`MediaSockets::bind` 绑定 timing/control/data 三个 UDP 端口（上游 `raop_rtp.c:236-244` 同样是这三个），`receive_audio`/`receive_control`/`receive_timing` 驱动收包；socket 级测试证明**真 UDP 上**乱序被正确重排序、重发在控制口补上缺口、时序口把报文交给调用方。**仍待**：① 收包循环的编排（tokio task + 帧回调和背压）；② 镜像 TCP 监听（随 S4-1c）；③ 把绑定端口写进 `SetupPorts` 并接进 CLI（之后真机 SETUP 才声明端口） | `lib/raop_rtp.c:236-244` + `lib/raop_handlers.h` 的 SETUP 分支 | 已有 4 条 socket 测试；接线后需真机确认 SETUP 响应含端口且真有包进来 |
 
 **实现中被新单测抓出的两个自身缺陷**（记录在案以免重犯）：
@@ -85,7 +85,7 @@ S4-1 媒体会话骨架 ───┼─→ S4-2 渲染边界 + GStreamer ─→ 
 
 ## 需要用户决策/输入
 
-1. **GStreamer 安装方式**：Windows 上装 MSVC 版运行时（含 ALAC/AAC-ELD/H.264 插件），还是先在 Linux/macOS 上做（上游更顺）；这决定 S4-2 的首个验收平台。
+1. ~~**GStreamer 安装方式**~~（2026-10-06 已定）：用户问"发布到 GitHub 怎么选更好"，据此选了**运行期子进程接入**：默认 `cargo test`/`clippy` 在没有 GStreamer 的机器上全绿，贡献者不需要第二套 Rust 工具链，本机也不需要 MSVC 版 SDK。本机用 MSYS2/UCRT64 的 GStreamer 1.28.3（`C:\msys64\ucrt64\bin` 进 PATH）验证，六个集成测试通过；真机出声出画仍待做。
 2. **对照设备**：是否只有一台 iPad（用于镜像与音频），有无第二台设备/播放器做对照。
 3. **CI 远程**：是否配置远程仓库让三个 job 真正运行（否则继续标注"仅本地验证"）。
 4. **S4-0 是否先做**：我建议先做 S4-0 的 W8 验收材料与真机证据归档，把 S3 正式收口，再进 S4-1。
@@ -95,3 +95,6 @@ S4-1 媒体会话骨架 ───┼─→ S4-2 渲染边界 + GStreamer ─→ 
 | 日期 | 事项 |
 |---|---|
 | 2026-10-05 | 计划建立；ADR-0003 定案（GStreamer 先行、FFmpeg 留替换点） |
+| 2026-10-06 | S4-1c-2 完成：镜像 CTR 规则重写为 `MirrorDecryptor`（上游规则逐条），SPS/PPS 拼装，`MirrorSession` 接线；`tools/oracle` 新增 `mirror` 模式做上游差分 |
+| 2026-10-06 | S4-2 接口与后端落地：`crates/airplay-renderer`（零依赖边界 + `NullRenderer`）、`crates/airplay-renderer-gst`（子进程接入，6 条集成测试对真 GStreamer 通过）；ADR-0003 第 5 条记录接入方式。真机出声出画与 CLI 接线未做 |
+| 2026-10-06 | S4-1b-3（NTP 时钟算术）**未完成**：试做的工作被回退（`git stash`），原因见交接文档第 7 节——固定偏移与漂移偏移的语义没有与上游对齐到可验证的程度，宁可不落地也不落地一个错的时钟信号 |
