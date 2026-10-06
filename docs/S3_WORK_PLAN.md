@@ -254,7 +254,7 @@ cargo test --release -p airplay-core --test server_spec -- --ignored --nocapture
 4. **注册表接线**：`with_client_registered` + `SetupRequest.client_identity` → 真实名单（配置层负责持久化，见 [ADR-0002](ADR-0002-pairing-identity.md)）。
 5. Windows 上 `mdns-sd` 可用性记录；不可用则按 ADR-0001 的降级路径决策。
 
-### D. S4 前置（媒体栈）
+### D. S4 前置（媒体栈）——详细工作包见 [S4_WORK_PLAN.md](S4_WORK_PLAN.md)
 1. **✅ 后端决策已定（[ADR-0003](ADR-0003-media-backend.md)）**：先按上游形态实现 **GStreamer**（audio/video 两个 renderer，对照 `upstream/UxPlay/renderers/`，HLS/URL 用 `playbin`）；**协议核心不链接任何媒体库**，renderer 落在独立 crate（暂名 `crates/airplay-renderer-gst`），CLI 注入；**为 FFmpeg 保留替换点**——核心只认识"帧与配置"的最小接口（`open/push/flush/close` + `set_volume`），接口在 S4 第一个 renderer 落地时随代码定义（不为未实现功能预造抽象），将来加 FFmpeg 就是再加一个同级 crate，协议侧不动。仍需在 S4-1 决定并记录的形式：renderer crate 如何不污染默认 workspace 门禁（feature 或独立成员），因为 CI 必须能在没有 GStreamer SDK 的机器上通过。GStreamer 版本/插件矩阵（ALAC、AAC-ELD、H.264、sink）随 S4-1 一起记录。
 2. **端口绑定**：NTP 时序口、音频 data/control、镜像 data 真实绑定后填进 `SetupPorts`，SETUP 响应从此声明真实端口（现在未绑定的字段一律不写）。
 3. **媒体会话接口**：以 `SetupRequest`（audio key/IV/streams/identity/auth）为输入，定义 RECORD/FLUSH/TEARDOWN 的媒体语义、重传与 NTP 同步（上游 `raop_ntp.c` 的签名已变，开工前重读）。
