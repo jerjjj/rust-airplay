@@ -642,6 +642,7 @@ async fn run() -> Result<(), String> {
                             None => format!("type {}", stream.kind),
                         })
                         .collect();
+                    println!("media     SETUP keys [{}]", request.keys.join(", "));
                     println!(
                         "media     SETUP asked for [{}], audio key {}, iv {}",
                         asked.join(", "),

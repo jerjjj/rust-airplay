@@ -109,6 +109,13 @@ pub struct SetupRequest {
     /// (`raop_ntp.c:617-618`). `None` is a request served without a transport, as a
     /// unit test serves one.
     pub client_address: Option<std::net::SocketAddr>,
+    /// Top-level keys the request carried, in the order it wrote them.
+    ///
+    /// A `SETUP` is the one request whose shape varies most between clients and
+    /// firmware versions, and knowing exactly which keys arrived is the difference
+    /// between reading a device session and guessing at it. It is reported, not
+    /// used: nothing in a session decides anything from this.
+    pub keys: Vec<String>,
     /// Client key of the verified pairing exchange, when this connection had one.
     pub client_identity: Option<[u8; 32]>,
     /// How far the pairing exchange of this connection got.
@@ -550,6 +557,13 @@ impl RouteHandlers {
         // exchange, which the receiver has to send its requests to. The receiver
         // starts that exchange, so a session that never learns this port never
         // ticks.
+        // What the request actually carried, for a device session that has to be
+        // read afterwards. A `SETUP` is where clients differ most.
+        let keys: Vec<String> = body
+            .root_dictionary()
+            .map(|dictionary| dictionary.keys().cloned().collect())
+            .unwrap_or_default();
+
         let client_timing_port = body
             .get("timingPort")
             .and_then(plist::Value::as_unsigned_integer)
@@ -634,6 +648,7 @@ impl RouteHandlers {
             streams,
             client_timing_port,
             client_address: self.peer,
+            keys,
             client_identity,
             authentication,
         });
