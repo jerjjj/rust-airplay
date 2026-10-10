@@ -41,6 +41,14 @@ const MIRROR_STREAM_TYPE: u16 = 110;
 /// stall a decoder produces and far below anything a receiver would notice holding.
 const QUEUED_FRAMES: usize = 32;
 
+/// How many audio frames a writer thread will hold before frames start being dropped.
+///
+/// Audio packets are small and arrive in bursts, so this is deeper than the video
+/// queue: at 44.1 kHz a frame is a few milliseconds, and a second of slack is what a
+/// decoder stall needs. It is still bounded, because an unbounded queue turns "the
+/// pipeline has stopped" into a growing delay rather than a visible fault.
+const QUEUED_AUDIO_FRAMES: usize = 256;
+
 const USAGE: &str = "\
 rust-airplay - protocol development receiver
 
@@ -148,10 +156,14 @@ fn open_gst() -> Result<Arc<dyn airplay_renderer::Renderer>, String> {
 ///
 /// A session without audio is not a reason to drop the client: the protocol half still
 /// works, and what is wrong is the machine's media stack rather than the session.
+///
+/// The stream is owned rather than borrowed from the renderer, because it is played on a
+/// thread of its own: a stream tied to the renderer's lifetime could not be moved into one,
+/// and a stream that blocks the receive loop is what made a session with sound in it freeze.
 fn open_audio(
     renderer: &Arc<dyn airplay_renderer::Renderer>,
     codec: AudioCodec,
-) -> Option<Box<dyn airplay_renderer::AudioStream + '_>> {
+) -> Option<Box<dyn airplay_renderer::AudioStream>> {
     let config = AudioConfig {
         codec,
         ..AudioConfig::default()
@@ -443,8 +455,46 @@ async fn run() -> Result<(), String> {
                     return;
                 };
                 let stream = open_audio(&audio_renderer, audio_codec);
-                let stream = stream.as_ref();
                 let mut session = airplay_core::media::ports::session(key, iv);
+                // Audio is pushed by a thread of its own, for the same reason video is:
+                // writing to a pipeline blocks when the pipeline is full, and a write that
+                // blocks inside the receive loop stops everything that loop is watching —
+                // the screen, the control socket and the clock exchange. A session with
+                // sound in it froze while a silent one ran, and this is that.
+                //
+                // A queue that is full drops the frame rather than waiting. Waiting is the
+                // fault being avoided, and the receive loop has to keep draining the sockets
+                // whatever the pipeline is doing; dropping is counted and reported once, so
+                // a pipeline that never recovers is seen rather than buffered away.
+                let (feed, queued) = std::sync::mpsc::sync_channel::<airplay_renderer::AudioFrame>(
+                    QUEUED_AUDIO_FRAMES,
+                );
+                let played = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let played_writer = std::sync::Arc::clone(&played);
+                // The stream is taken out of the `Option` rather than borrowed from it: the
+                // writer thread owns it for the life of the session, and a borrowed stream
+                // cannot be moved into a thread.
+                let playing = stream.map(|playing| {
+                    std::thread::spawn(move || {
+                        use std::sync::atomic::Ordering;
+                        while let Ok(frame) = queued.recv() {
+                            // What real-time playback needs and this backend does not do
+                            // yet: the frame carries its timestamp and the sink is told to
+                            // play as fast as it is given, so audio runs at whatever rate
+                            // the pipeline manages. Named here rather than left implicit.
+                            if let Err(error) = playing.push(frame) {
+                                eprintln!("rust-airplay: the renderer refused a frame: {error}");
+                                break;
+                            }
+                            played_writer.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // A last frame already handed over is played out rather than cut
+                        // off, which is what an end of stream means to a backend.
+                        if let Err(error) = playing.close() {
+                            eprintln!("rust-airplay: the audio stream ended badly: {error}");
+                        }
+                    })
+                });
                 // The clock exchange runs beside the audio, on its own socket: the
                 // receiver is the one that starts it, and upstream keeps it going
                 // for as long as the session does.
@@ -485,9 +535,8 @@ async fn run() -> Result<(), String> {
                         }
                     }
                 });
-                let mut frames: u64 = 0;
-                let mut played: u64 = 0;
-                let mut refused = 0u64;
+                let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 // What arrived, so "the client is not sending" and "we are throwing it
                 // away" cannot be confused in a log. A session that never reaches the
                 // frame counter still says which sockets were written to.
@@ -517,41 +566,43 @@ async fn run() -> Result<(), String> {
                 });
                 let outcome = audio_sockets
                     .serve(&mut session, &received, |frame| {
-                        frames += 1;
-                        if frames == 1 {
+                        use std::sync::atomic::Ordering;
+                        let count = frames.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count == 1 {
                             println!(
                                 "media     first audio frame: {} bytes, seq {}, ts {}",
                                 frame.payload.len(),
                                 frame.sequence,
                                 frame.timestamp
                             );
-                        } else if frames % 500 == 0 {
-                            println!("media     {frames} audio frames received");
+                        } else if count % 500 == 0 {
+                            println!("media     {count} audio frames received");
                         }
-                        let Some(stream) = stream else {
-                            return;
-                        };
-                        if let Err(error) = stream.push(airplay_renderer::AudioFrame {
+                        let queued = airplay_renderer::AudioFrame {
                             data: frame.payload,
                             timestamp: u64::from(frame.timestamp),
-                        }) {
-                            refused += 1;
-                            if refused == 1 {
-                                eprintln!("rust-airplay: the renderer refused a frame: {error}");
+                        };
+                        if feed.try_send(queued).is_err() {
+                            let missed = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            if missed == 1 {
+                                eprintln!(
+                                    "rust-airplay: the audio pipeline is not keeping up; \
+                                     frames are being dropped rather than stalling the session"
+                                );
                             }
-                            return;
                         }
-                        played += 1;
                     })
                     .await;
-                if let Some(stream) = stream {
-                    // A last frame already handed over is played out rather than cut off,
-                    // which is what an end of stream means to a backend.
-                    match stream.close() {
-                        Ok(()) => println!("media     {played} audio frames played of {frames}"),
-                        Err(error) => eprintln!("rust-airplay: the audio stream ended badly: {error}"),
-                    }
+                drop(feed);
+                if let Some(playing) = playing {
+                    let _ = playing.join();
                 }
+                println!(
+                    "media     {} audio frames played of {}, {} dropped",
+                    played.load(std::sync::atomic::Ordering::Relaxed),
+                    frames.load(std::sync::atomic::Ordering::Relaxed),
+                    dropped.load(std::sync::atomic::Ordering::Relaxed)
+                );
                 if let Err(error) = outcome {
                     eprintln!("rust-airplay: the media session stopped: {error}");
                 }
