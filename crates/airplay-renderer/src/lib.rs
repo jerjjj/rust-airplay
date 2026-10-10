@@ -170,14 +170,14 @@ pub trait Renderer: fmt::Debug + Send + Sync {
     ///
     /// Returns [`RenderError`] when the backend cannot serve this configuration, which
     /// a caller reports and a session continues without audio.
-    fn open_audio(&self, config: AudioConfig) -> Result<Box<dyn AudioStream + '_>, RenderError>;
+    fn open_audio(&self, config: AudioConfig) -> Result<Box<dyn AudioStream>, RenderError>;
 
     /// Prepares to render a video stream.
     ///
     /// # Errors
     ///
     /// Returns [`RenderError`] when the backend cannot serve this configuration.
-    fn open_video(&self, config: VideoConfig) -> Result<Box<dyn VideoStream + '_>, RenderError>;
+    fn open_video(&self, config: VideoConfig) -> Result<Box<dyn VideoStream>, RenderError>;
 
     /// Sets the volume every stream plays at.
     ///
@@ -272,8 +272,8 @@ pub trait VideoStream: fmt::Debug + Send + Sync {
 /// [`docs/S4_WORK_PLAN.md`]: ../../../docs/S4_WORK_PLAN.md
 #[derive(Debug, Default)]
 pub struct NullRenderer {
-    audio: Counters,
-    video: Counters,
+    audio: std::sync::Arc<Counters>,
+    video: std::sync::Arc<Counters>,
     volume: std::sync::Mutex<Volume>,
 }
 
@@ -345,21 +345,21 @@ impl NullRenderer {
 }
 
 impl Renderer for NullRenderer {
-    fn open_audio(&self, _config: AudioConfig) -> Result<Box<dyn AudioStream + '_>, RenderError> {
+    fn open_audio(&self, _config: AudioConfig) -> Result<Box<dyn AudioStream>, RenderError> {
         self.audio
             .opened
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Box::new(NullAudio {
-            counters: &self.audio,
+            counters: std::sync::Arc::clone(&self.audio),
         }))
     }
 
-    fn open_video(&self, _config: VideoConfig) -> Result<Box<dyn VideoStream + '_>, RenderError> {
+    fn open_video(&self, _config: VideoConfig) -> Result<Box<dyn VideoStream>, RenderError> {
         self.video
             .opened
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Box::new(NullVideo {
-            counters: &self.video,
+            counters: std::sync::Arc::clone(&self.video),
         }))
     }
 
@@ -373,11 +373,11 @@ impl Renderer for NullRenderer {
 }
 
 /// One audio stream of [`NullRenderer`].
-struct NullAudio<'a> {
-    counters: &'a Counters,
+struct NullAudio {
+    counters: std::sync::Arc<Counters>,
 }
 
-impl fmt::Debug for NullAudio<'_> {
+impl fmt::Debug for NullAudio {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NullAudio")
@@ -392,7 +392,7 @@ impl fmt::Debug for NullAudio<'_> {
     }
 }
 
-impl AudioStream for NullAudio<'_> {
+impl AudioStream for NullAudio {
     fn push(&self, frame: AudioFrame) -> Result<(), RenderError> {
         self.counters
             .frames
@@ -419,11 +419,11 @@ impl AudioStream for NullAudio<'_> {
 }
 
 /// One video stream of [`NullRenderer`].
-struct NullVideo<'a> {
-    counters: &'a Counters,
+struct NullVideo {
+    counters: std::sync::Arc<Counters>,
 }
 
-impl fmt::Debug for NullVideo<'_> {
+impl fmt::Debug for NullVideo {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NullVideo")
@@ -438,7 +438,7 @@ impl fmt::Debug for NullVideo<'_> {
     }
 }
 
-impl VideoStream for NullVideo<'_> {
+impl VideoStream for NullVideo {
     fn push(&self, frame: VideoFrame) -> Result<(), RenderError> {
         self.counters
             .frames

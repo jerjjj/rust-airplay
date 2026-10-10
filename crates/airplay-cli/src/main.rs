@@ -31,6 +31,28 @@ use airplay_renderer::{AudioCodec, AudioConfig};
 /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:954-983`).
 const MIRROR_STREAM_TYPE: u16 = 110;
 
+/// Frames a mirror session may hold for its renderer before it starts dropping them.
+///
+/// The queue exists so that waiting for a picture is not waiting inside the receive
+/// loop. It is bounded because a client that sends faster than a decoder decodes must
+/// not be able to make a receiver allocate without limit; a frame dropped when it is
+/// full is reported, because a dropped frame is one the rest of the stream may depend
+/// on. Thirty-two frames is about a second of a screen, which is longer than any
+/// stall a decoder produces and far below anything a receiver would notice holding.
+const QUEUED_FRAMES: usize = 32;
+
+/// The longest a receiver waits between two frames.
+///
+/// This is the floor a frame interval is believed at: a display sends something
+/// between about fifteen and a hundred and twenty frames a second, and a device's
+/// timestamps measure tens of microseconds apart, which is not a frame rate at all.
+/// Waiting that little is the same as not waiting, and a decoder that is never waited
+/// for is a decoder that is overrun — which is a picture that is partly decoded.
+const SLOWEST_FRAME_SECONDS: f64 = 1.0 / 15.0;
+
+/// The shortest a receiver waits between two frames.
+const FASTEST_FRAME_SECONDS: f64 = 1.0 / 240.0;
+
 const USAGE: &str = "\
 rust-airplay - protocol development receiver
 
@@ -638,15 +660,71 @@ async fn run() -> Result<(), String> {
                 }
             };
             let mut frames: u64 = 0;
-            let mut shown: u64 = 0;
             let mut refused = 0u64;
             // When the frame being pushed belongs, from the client's own timestamps.
             // A mirror stream is one key frame followed by frames that describe only
             // what changed, so decoding faster than real time loses frames the rest of
             // the stream depends on and leaves the picture partly wrong for the rest of
-            // the session. The rate is the client's to state, and this is where it is
-            // read.
-            let mut previous: Option<u64> = None;
+            // the session. The rate is the client's to state, and it is applied in the
+            // thread below rather than here: writing to a pipeline and waiting for the
+            // next frame are both blocking, and a receive loop is not a place a blocking
+            // call can be — one that waits stops reading its socket, which stops the
+            // client too, and the picture freezes with it.
+            let (feed, queued) =
+                std::sync::mpsc::sync_channel::<(Vec<u8>, u64, bool)>(QUEUED_FRAMES);
+            let playing = video.map(|video| {
+                std::thread::spawn(move || {
+                    let mut previous: Option<u64> = None;
+                    let mut shown: u64 = 0;
+                    while let Ok((data, timestamp, idr)) = queued.recv() {
+                        if let Some(previous) = previous.replace(timestamp) {
+                            let gap = timestamp.wrapping_sub(previous);
+                            // A stream that restarts, or a screen that wakes, jumps
+                            // rather than advances; the backend caps what it will wait
+                            // anyway.
+                            if gap < u64::MAX / 2 {
+                                let seconds =
+                                    (gap >> 32) as f64 + f64::from(gap as u32) / 4_294_967_296.0;
+                                // The interval is only believed when it is one a screen
+                                // could produce. A device's timestamp is not a frame
+                                // counter — measured gaps are tens of microseconds, which
+                                // no display sends — and a wait computed from those is no
+                                // wait at all, which is how a decoder gets overrun. The
+                                // floor is what makes an unusable interval safe rather
+                                // than useless.
+                                let seconds = if (SLOWEST_FRAME_SECONDS..=FASTEST_FRAME_SECONDS)
+                                    .contains(&seconds)
+                                {
+                                    seconds
+                                } else {
+                                    SLOWEST_FRAME_SECONDS
+                                };
+                                if let Err(error) = video.set_pace(seconds) {
+                                    eprintln!("rust-airplay: the renderer cannot pace: {error}");
+                                }
+                            }
+                        }
+                        if let Err(error) = video.push(airplay_renderer::VideoFrame {
+                            data,
+                            timestamp,
+                            keyframe: idr,
+                        }) {
+                            eprintln!("rust-airplay: the renderer refused a frame: {error}");
+                            break;
+                        }
+                        shown += 1;
+                    }
+                    // A last frame already handed over is played out rather than cut
+                    // off, which is what an end of stream means to a backend.
+                    match video.close() {
+                        Ok(()) => shown,
+                        Err(error) => {
+                            eprintln!("rust-airplay: the video stream ended badly: {error}");
+                            shown
+                        }
+                    }
+                })
+            });
             let outcome = stream
                 .serve(&mut session, |frame| {
                     frames += 1;
@@ -661,9 +739,6 @@ async fn run() -> Result<(), String> {
                     } else if frames % 200 == 0 {
                         println!("media     {frames} video frames received");
                     }
-                    let Some(video) = video.as_ref() else {
-                        return;
-                    };
                     // The bytes handed to a decoder are what a picture is diagnosed
                     // from, and nothing else can say whether a stream is malformed or
                     // merely hard to follow: `AIRPLAY_DUMP_VIDEO=<path>` writes the
@@ -671,55 +746,40 @@ async fn run() -> Result<(), String> {
                     if let Some(path) = dump_video_path() {
                         if frames <= 30 {
                             use std::io::Write;
-                            if let Ok(mut file) =
-                                std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                            if let Ok(mut file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&path)
                             {
                                 let _ = file.write_all(&frame.data);
-                                println!(
-                                    "media     dumped frame {frames} ({} bytes, {} units, idr={}) to {}",
-                                    frame.data.len(),
-                                    frame.units,
-                                    frame.idr,
-                                    path.display()
+                            }
+                        }
+                    }
+                    // A queue that is full means the picture is behind what a client
+                    // sent, which is worth saying once: a frame dropped here is one the
+                    // rest of the stream may depend on.
+                    match feed.try_send((frame.data, frame.timestamp, frame.idr)) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                            refused += 1;
+                            if refused == 1 {
+                                eprintln!(
+                                    "rust-airplay: the renderer is {QUEUED_FRAMES} frames behind; \
+                                     frames are being dropped and the picture will be incomplete"
                                 );
                             }
                         }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
                     }
-                    // The gap to the previous frame, in seconds, from the Q32.32
-                    // timestamps a client stamps a mirror stream with.
-                    if let Some(previous) = previous.replace(frame.timestamp) {
-                        let gap = frame.timestamp.wrapping_sub(previous);
-                        // A stream that restarts, or a screen that wakes, jumps rather
-                        // than advances; the backend caps what it will wait anyway.
-                        if gap < u64::MAX / 2 {
-                            let seconds =
-                                (gap >> 32) as f64 + f64::from(gap as u32) / 4_294_967_296.0;
-                            if let Err(error) = video.set_pace(seconds) {
-                                refused += 1;
-                                if refused == 1 {
-                                    eprintln!("rust-airplay: the renderer cannot pace: {error}");
-                                }
-                            }
-                        }
-                    }
-                    if let Err(error) = video.push(airplay_renderer::VideoFrame {
-                        data: frame.data,
-                        timestamp: frame.timestamp,
-                        keyframe: frame.idr,
-                    }) {
-                        refused += 1;
-                        if refused == 1 {
-                            eprintln!("rust-airplay: the renderer refused a frame: {error}");
-                        }
-                        return;
-                    }
-                    shown += 1;
                 })
                 .await;
-            if let Some(video) = video {
-                match video.close() {
-                    Ok(()) => println!("media     {shown} video frames shown of {frames}"),
-                    Err(error) => eprintln!("rust-airplay: the video stream ended badly: {error}"),
+            // Dropping the queue is what ends the writer, and waiting for it is what
+            // makes the count below the frames that were actually handed over.
+            drop(feed);
+            if let Some(playing) = playing {
+                match playing.join() {
+                    Ok(shown) => println!("media     {shown} video frames shown of {frames}"),
+                    Err(_) => eprintln!("rust-airplay: the video thread ended unexpectedly"),
                 }
             }
             match outcome {

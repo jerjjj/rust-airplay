@@ -210,17 +210,21 @@ fn video_pipeline(sink: &str) -> String {
 }
 
 impl Renderer for GstRenderer {
-    fn open_audio(&self, config: AudioConfig) -> Result<Box<dyn AudioStream + '_>, RenderError> {
+    fn open_audio(&self, config: AudioConfig) -> Result<Box<dyn AudioStream>, RenderError> {
         let caps = audio_caps(config)?;
         let description = audio_pipeline(&caps, &self.audio_sink);
         let pipeline = Pipeline::start(&self.program, &description).map_err(unavailable)?;
-        Ok(Box::new(GstAudio { pipeline }))
+        Ok(Box::new(GstAudio {
+            pipeline: std::sync::Arc::new(pipeline),
+        }))
     }
 
-    fn open_video(&self, _config: VideoConfig) -> Result<Box<dyn VideoStream + '_>, RenderError> {
+    fn open_video(&self, _config: VideoConfig) -> Result<Box<dyn VideoStream>, RenderError> {
         let description = video_pipeline(&self.video_sink);
         let pipeline = Pipeline::start(&self.program, &description).map_err(unavailable)?;
-        Ok(Box::new(GstVideo { pipeline }))
+        Ok(Box::new(GstVideo {
+            pipeline: std::sync::Arc::new(pipeline),
+        }))
     }
 
     fn set_volume(&self, volume: Volume) -> Result<(), RenderError> {
@@ -240,7 +244,9 @@ impl Renderer for GstRenderer {
 /// One audio stream, writing frames to a pipeline.
 #[derive(Debug)]
 struct GstAudio {
-    pipeline: Pipeline,
+    /// Shared, because a stream is handed to whichever thread plays it and the
+    /// pipeline has to outlive the value that opened it.
+    pipeline: std::sync::Arc<Pipeline>,
 }
 
 impl AudioStream for GstAudio {
@@ -264,7 +270,9 @@ impl AudioStream for GstAudio {
 /// One video stream, writing frames to a pipeline.
 #[derive(Debug)]
 struct GstVideo {
-    pipeline: Pipeline,
+    /// Shared, because a stream is handed to whichever thread plays it and the
+    /// pipeline has to outlive the value that opened it.
+    pipeline: std::sync::Arc<Pipeline>,
 }
 
 impl VideoStream for GstVideo {
