@@ -329,18 +329,6 @@ fn a_packet_reads_the_keystream_the_packet_before_it_ended_at() {
             .iter()
             .zip(&expected)
             .position(|(ours, theirs)| ours != theirs);
-        if let Some(at) = differs {
-            // The bytes either side of the first difference, from both sides: the shape of
-            // the difference is what says whether it is a shift, a wrong block, or a wrong
-            // carry.
-            let from = at.saturating_sub(4);
-            let to = (at + 12).min(expected.len());
-            println!("  bytes {from}..{to}: ours     {:02x?}", &output[from..to]);
-            println!(
-                "  bytes {from}..{to}: upstream {:02x?}",
-                &expected[from..to]
-            );
-        }
         println!(
             "pair {pairs}: first {first}, second {second}: this reads at {}, upstream at {}, \
              {differs:?}",
@@ -360,4 +348,84 @@ fn a_packet_reads_the_keystream_the_packet_before_it_ended_at() {
         pairs >= 6,
         "the oracle printed {pairs} pairs, which is not enough to show a position rule"
     );
+}
+
+/// Every block the oracle printed by number, against this port's own generator.
+///
+/// A block number is the whole of the mirror rule, so this is the comparison that says
+/// whether the two agree about the stream at all: no packets, no carries, no positions —
+/// just which bytes belong to which block, four hundred blocks in, where a long packet was
+/// measured to go wrong.
+#[test]
+#[ignore = "needs AIRPLAY_UPSTREAM_ORACLE; run tools/oracle/run.ps1"]
+fn the_keystream_agrees_block_by_block_far_into_the_stream() {
+    let fields = oracle("mirror");
+    let connection_id: u64 = field(&fields, "mirror.connection_id")
+        .parse()
+        .expect("the oracle prints the connection identifier");
+    let decryptor =
+        MirrorDecryptor::new(&stream_keys(connection_id, &[0x5a; 16])).expect("decryptor");
+
+    let mut compared = 0;
+    for block in [176u64, 177, 178, 432, 433, 434] {
+        let expected = hex_of(&fields, &format!("mirror.block{block}"));
+        let ours = decryptor.keystream(block, 1);
+        assert_eq!(
+            ours, expected,
+            "block {block} of the stream: this port generates different bytes from upstream"
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 6, "every block the oracle printed was compared");
+}
+
+/// The counter the cipher is given, block for block, against upstream's own arithmetic.
+///
+/// This is the comparison the keystream hides. A counter that is built wrongly produces
+/// keystream bytes that look arbitrary either way, so a port can agree at block 0, agree
+/// for a hundred blocks, and be a byte short from a carry it dropped — and the only sign is
+/// that the stream parts hundreds of blocks later. The counters say it directly: the IV
+/// here ends in `4f`, block `b1` makes the last byte `00` with one to carry into the byte
+/// before it, and what that byte becomes is a number.
+#[test]
+#[ignore = "needs AIRPLAY_UPSTREAM_ORACLE; run tools/oracle/run.ps1"]
+fn the_counter_carries_through_the_whole_of_it() {
+    let fields = oracle("mirror");
+    let connection_id: u64 = field(&fields, "mirror.connection_id")
+        .parse()
+        .expect("the oracle prints the connection identifier");
+    let keys = stream_keys(connection_id, &[0x5a; 16]);
+
+    let mut compared = 0;
+    for block in [0u64, 1, 176, 177, 178, 255, 256, 257, 432, 433] {
+        let expected = hex_of(&fields, &format!("mirror.counter{block}"));
+        let ours = counter_for(&keys.iv, block);
+        assert_eq!(
+            ours, expected,
+            "the counter of block {block}: this port builds a different one"
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        compared, 10,
+        "every counter the oracle printed was compared"
+    );
+}
+
+/// The IV plus a block number, big-endian, carried through all sixteen bytes.
+///
+/// Written out here rather than read from the port, so the test says what the rule is
+/// instead of agreeing with whatever the port does.
+fn counter_for(iv: &[u8; 16], block: u64) -> Vec<u8> {
+    let mut counter = *iv;
+    let mut carry = block;
+    for byte in counter.iter_mut().rev() {
+        if carry == 0 {
+            break;
+        }
+        let (next, overflow) = byte.overflowing_add((carry & 0xff) as u8);
+        *byte = next;
+        carry = (carry >> 8) + u64::from(overflow);
+    }
+    counter.to_vec()
 }

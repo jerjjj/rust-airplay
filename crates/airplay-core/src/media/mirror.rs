@@ -547,16 +547,24 @@ impl MirrorDecryptor {
         let mut out = Vec::with_capacity(blocks * 16);
         for index in 0..blocks as u64 {
             let mut counter = self.iv;
-            // The counter is the IV plus the block index, big-endian, the way
-            // OpenSSL's CTR mode counts.
+            // The counter is the IV plus the block index, big-endian, the way OpenSSL's CTR
+            // mode counts, and the carry is propagated through the whole 128-bit counter.
+            //
+            // This loop was wrong for a long time and the cost was a session's picture. It
+            // stopped as soon as a byte did not overflow, which is not the same as having
+            // nothing left to carry: with an IV ending in `4f`, block 177 adds `b1`, the
+            // last byte becomes `00`, and one has to carry into the byte before it — and
+            // that carry was dropped, leaving the counter a byte short and the stream 256
+            // blocks out. Every vector was shorter than 177 blocks, so nothing caught it; a
+            // real packet of 62 kB is 3875 blocks and catches it at once.
             let mut carry = first + index;
             for byte in counter.iter_mut().rev() {
-                let (next, wrapped) = byte.overflowing_add((carry & 0xff) as u8);
-                *byte = next;
-                carry >>= 8;
-                if carry == 0 && !wrapped {
+                if carry == 0 {
                     break;
                 }
+                let (next, overflow) = byte.overflowing_add((carry & 0xff) as u8);
+                *byte = next;
+                carry = (carry >> 8) + u64::from(overflow);
             }
             let mut block = aes::Block::clone_from_slice(&counter);
             cipher.encrypt_block(&mut block);
@@ -1565,6 +1573,42 @@ mod tests {
             "blocks two and three"
         );
     }
+
+    #[test]
+    fn the_counter_carries_into_the_byte_before_it() {
+        // The counter is the IV plus the block index as a 128-bit big-endian number, and the
+        // carry goes through every byte of it. A generator that stops at the first byte that
+        // does not overflow reads 256 blocks away from where it should, which is what this
+        // pins: `4f` at the end of the IV, block `b1`, is `100` in the last byte and needs
+        // the byte before it to take the one.
+        //
+        // The keys are the mirror stream's own, and the blocks are the ones a real session
+        // reaches: this went wrong at block 177 and every vector before it was shorter.
+        let keys = stream_keys(2_765_102_747_429_192_913, &[0x5a; STREAM_KEY_LEN]);
+        let generator = keystream(&keys, 700);
+        let decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+
+        assert_eq!(
+            keys.iv[STREAM_KEY_LEN - 1],
+            0x4f,
+            "the carry this pins starts at this byte"
+        );
+        for block in [176usize, 177, 178, 255, 256, 257, 432, 433] {
+            assert_eq!(
+                decryptor.keystream(block as u64, 1),
+                generator[block * 16..block * 16 + 16],
+                "block {block} is that block of the stream and not one 256 further on"
+            );
+        }
+        // And the block the wrong carry would have produced is a different one, so a
+        // generator that drops it cannot pass by accident.
+        assert_ne!(
+            decryptor.keystream(177, 1),
+            decryptor.keystream(433, 1),
+            "block 177 is not block 433"
+        );
+    }
+
     #[test]
     fn decrypts_what_a_client_encrypts_with_the_same_rule() {
         // Packet lengths that can really appear on the wire: every one is at least as

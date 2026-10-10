@@ -397,6 +397,58 @@ static void mirror_vectors(void) {
         aes_ctr_decrypt(far, far_blocks, far_blocks, (int)sizeof(far_blocks));
         emit("mirror.keystream_far", far_blocks, sizeof(far_blocks));
         aes_ctr_destroy(far);
+        /* The counters themselves, for a range of blocks, printed as the cipher uses them.
+         *
+         * The keystream is the counter encrypted, so a port that encrypts the right counter
+         * agrees with these by construction — and a port whose counter is built wrongly can
+         * be compared with the number it should have been, which is a comparison the
+         * keystream alone makes hard: the bytes look arbitrary either way, and a counter
+         * that is short by one in a byte looks like nothing until the stream parts hundreds
+         * of blocks later. The IV ends in `4f`, so block `b1` carries into the byte before
+         * it, and that is where one port was 256 blocks out. */
+        {
+            static const int counter_blocks[] = {0, 1, 176, 177, 178, 255, 256, 257, 432, 433};
+            const int counter_count =
+                (int)(sizeof(counter_blocks) / sizeof(counter_blocks[0]));
+            for (int which = 0; which < counter_count; which++) {
+                uint64_t block = (uint64_t) counter_blocks[which];
+                unsigned char counter[16];
+                memcpy(counter, iv_hash, 16);
+                /* The counter is the IV plus the block, big-endian, carried through the
+                 * whole 128 bits — the same addition OpenSSL's CTR mode does. */
+                uint64_t carry = block;
+                for (int at = 15; at >= 0 && carry > 0; at--) {
+                    uint64_t sum = (uint64_t) counter[at] + (carry & 0xff);
+                    counter[at] = (unsigned char) (sum & 0xff);
+                    carry = (carry >> 8) + (sum >> 8);
+                }
+                char label[64];
+                snprintf(label, sizeof(label), "mirror.counter%d", counter_blocks[which]);
+                emit(label, counter, 16);
+            }
+        }
+
+        /* Six blocks, three either side of the place a long packet was measured to part at,
+         * and three around the block it appeared to jump to. Printed together so the two
+         * can be compared with a port's own generator rather than reasoned about. */
+        {
+            static const int wanted[] = {176, 177, 178, 432, 433, 434};
+            aes_ctx_t *walk = aes_ctr_init(key_hash, iv_hash);
+            unsigned char block[16];
+            unsigned char zeros[16];
+            for (int index = 0; index < 435; index++) {
+                memset(zeros, 0, sizeof(zeros));
+                aes_ctr_decrypt(walk, zeros, block, 16);
+                for (int which = 0; which < 6; which++) {
+                    if (wanted[which] == index) {
+                        char label[64];
+                        snprintf(label, sizeof(label), "mirror.block%d", index);
+                        emit(label, block, 16);
+                    }
+                }
+            }
+            aes_ctr_destroy(walk);
+        }
         aes_ctr_destroy(probe);
     }
 
@@ -469,12 +521,12 @@ static void mirror_vectors(void) {
             {1265, 9710},   /* the one that diverges */
             {9710, 1237},   /* and one that does not, for contrast */
             {1356, 1355},
-            {1265, 1265},   /* the same first packet, second longer than a block */
-            {1265, 4096},   /* and longer still, ending on a block boundary */
-            {1265, 8000},   /* and longer: does the place it parts move with the length? */
-            {33, 8000},     /* a smaller first packet, the same long second one */
-            {1265, 4097},   /* one byte past a boundary */
-            {4096, 8000},   /* no carry at all, and the same long second packet */
+            {0, 8000},      /* no first packet at all: a long packet from the start */
+            {0, 4000},      /* and one that does not reach the place the other parts at */
+            {16, 8000},     /* one block first: does the place move with where it starts? */
+            {256, 8000},    /* sixteen blocks */
+            {0, 16000},     /* longer still */
+            {0, 262144},    /* and far longer, to see if the shift repeats */
         };
         const int pair_count = (int)(sizeof(pairs) / sizeof(pairs[0]));
         unsigned char input[131072];
@@ -501,6 +553,35 @@ static void mirror_vectors(void) {
              * than search for it. */
             snprintf(label, sizeof(label), "mirror.pair_read%d", pair);
             emit(label, model, second);
+        }
+    }
+
+    /* One long packet read from the start of the stream, which is the simplest case there
+     * is: no packet before it, so no carry and no counter to restart — the reader is given
+     * one length and reads it straight through.
+     *
+     * A divergence in the middle of that would be a property of the reader itself and of
+     * nothing else, and the lengths here bracket where one appears to start. */
+    {
+        static const int single_lengths[] = {
+            1024, 2048, 4000, 8000, 16000, 65536, 262144,
+        };
+        const int single_count = (int)(sizeof(single_lengths) / sizeof(single_lengths[0]));
+        static unsigned char input[300000];
+        static unsigned char model[300000];
+        char label[64];
+        for (int step = 0; step < single_count; step++) {
+            int length = single_lengths[step];
+            mirror_buffer_t *reader = mirror_buffer_init(logger, mirror_audio_key);
+            mirror_buffer_init_aes(reader, &mirror_connection_id);
+            memset(input, 0, sizeof(input));
+            memset(model, 0, sizeof(model));
+            mirror_buffer_decrypt(reader, input, model, length);
+            mirror_buffer_destroy(reader);
+            snprintf(label, sizeof(label), "mirror.single_length%d", step);
+            emit_int(label, length);
+            snprintf(label, sizeof(label), "mirror.single%d", step);
+            emit(label, model, length);
         }
     }
 
