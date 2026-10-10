@@ -541,7 +541,9 @@ async fn setup_derives_the_audio_key_and_answers_the_configured_ports() {
             seen[0].streams,
             vec![SetupStream {
                 kind: 96,
-                stream_connection_id: None
+                stream_connection_id: None,
+                compression_type: None,
+                samples_per_frame: None,
             }]
         );
     }

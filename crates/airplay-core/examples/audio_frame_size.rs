@@ -1,92 +1,86 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Which frame size turns a run of audio bytes into a stream a decoder will take.
+//! The dump's frames as ADTS, which is a stream that says where its frames end.
 //!
-//! The bytes a client sent are known, and so is what a decoder wants: frames, and a
-//! configuration that says what they are — raw AAC carries no sample rate, so a decoder
-//! given a bare run of it refuses with "no valid frames found" and nothing is heard. What
-//! is not known from a dump that recorded no lengths is where the frames begin and end.
+//! A raw AAC frame has no length in it: the decoder is expected to be told where each one
+//! stops, and `fdsrc` tells it nothing. That is why every decoder tried so far failed on
+//! this stream — `faad` with an assertion about a zero length, `fdkaacdec` with unfixed
+//! caps — and why the port's own pipeline takes frames and makes no sound.
 //!
-//! So this tries every frame size in the range a stream's frames can have, writes the run
-//! cut at that size with the AudioSpecificConfig in front of it, and leaves the candidate
-//! files behind for a decoder to be pointed at. One of them decodes; the sizes that do not
-//! are silent, which is the evidence this port has been missing.
+//! ADTS is the answer that needs no other change: a seven-byte header in front of each
+//! frame carries its length and the profile it was encoded with, so a decoder can find the
+//! frames by itself. This writes the dump's frames that way and runs a decoder over the
+//! result, which is what says whether the frames are what this port thinks they are.
+//!
+//! The header's fields are the ones the evidence gives: ELD is profile 3 in the two-bit
+//! field ADTS has for it (its meaning is inverted, so the value written is 3), 44.1 kHz is
+//! frequency index 4, and the channel configuration is the one the session is at.
 
 use std::io::Write;
 
-/// The configuration of an AAC-ELD stream at 44.1 kHz in stereo, as the bits
-/// `AudioSpecificConfig` is made of: five bits of object type (39, ELD), four bits of
-/// sampling frequency (4, 44100), four bits of channel configuration (2, stereo), and the
-/// three bits that follow them. Written out here because it is what a decoder needs and
-/// what a raw frame does not carry.
-const AUDIO_SPECIFIC_CONFIG: [u8; 3] = [0xf8, 0x2c, 0x00];
+/// ADTS profile for AAC-ELD: the two bits are `object type - 1` in the older scheme, and
+/// every decoder in practice reads 3 here for ELD.
+const PROFILE_ELD: u8 = 3;
 
-/// The frame sizes to try. A 480-sample frame at any bitrate an audio stream uses lands in
-/// this range, and one of these is the size the client is sending.
-const CANDIDATES: std::ops::RangeInclusive<usize> = 8..=600;
+/// Sampling frequency index for 44100 Hz.
+const FREQUENCY_44100: u8 = 4;
+
+/// The channel configuration: stereo.
+const CHANNELS_STEREO: u8 = 2;
+
+/// The seven-byte ADTS header for one frame of `length` bytes.
+fn adts_header(length: usize, channels: u8, frequency: u8) -> [u8; 7] {
+    let total = length + 7;
+    [
+        0xff,
+        0xf1, // MPEG-4, layer 0, no CRC
+        ((PROFILE_ELD) << 6) | (frequency << 2) | ((channels >> 2) & 1),
+        ((channels & 3) << 6) | ((total >> 11) & 3) as u8,
+        ((total >> 3) & 0xff) as u8,
+        (((total & 7) << 5) | 0x1f) as u8,
+        0xfc,
+    ]
+}
 
 fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "target/client-audio.bin".to_owned());
     let bytes = std::fs::read(&path).expect("the dump is readable");
-    println!("{path}: {} bytes", bytes.len());
 
-    // The start-up markers are four bytes each and carry no audio, so they are skipped:
-    // whatever follows them is a whole number of frames, which is what makes a size
-    // findable by division as well as by trying.
+    let mut frames: Vec<&[u8]> = Vec::new();
+    let mut markers = 0usize;
     let mut at = 0usize;
-    while at + 4 <= bytes.len()
-        && bytes[at] == 0x00
-        && bytes[at + 1] == 0x68
-        && bytes[at + 2] == 0x34
-        && bytes[at + 3] == 0x00
-    {
-        at += 4;
+    while at + 4 <= bytes.len() {
+        let length =
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+        let start = at + 4;
+        if start + length > bytes.len() {
+            break;
+        }
+        let payload = &bytes[start..start + length];
+        if payload == [0x00, 0x68, 0x34, 0x00] {
+            markers += 1;
+        } else {
+            frames.push(payload);
+        }
+        at = start + length;
     }
     println!(
-        "{at} bytes of start-up markers, then {} bytes of audio",
-        bytes.len() - at
+        "{} frames of audio and {markers} start-up markers",
+        frames.len()
     );
-    let audio = &bytes[at..];
 
-    let out = std::path::Path::new("target/audio-candidates");
-    std::fs::create_dir_all(out).expect("a directory for the candidates");
-
-    let mut written = 0;
-    for size in CANDIDATES {
-        if audio.len() < size * 4 {
-            break;
-        }
-        // A frame size that divides the run is far more likely than one that leaves a
-        // remainder: a stream is whole frames, and the markers were taken off the front.
-        // The remainder is counted rather than required to be zero, because the last frame
-        // may be cut short by where the recording stopped.
-        let whole = audio.len() / size;
-        if whole < 4 {
-            break;
-        }
-        let remainder = audio.len() % size;
-        // Only sizes that come close to dividing the run are worth a file: the rest cannot
-        // be the frame size of a stream that was recorded whole.
-        if remainder > size / 2 {
-            continue;
-        }
-        let file = out.join(format!("frame-{size}.aac"));
-        let mut handle = std::fs::File::create(&file).expect("a candidate file");
+    let out = std::path::Path::new("target/audio-candidates/decoded-adts.aac");
+    std::fs::create_dir_all("target/audio-candidates").expect("a directory");
+    let mut handle = std::fs::File::create(out).expect("the file");
+    let mut written = 0usize;
+    for frame in &frames {
         handle
-            .write_all(&AUDIO_SPECIFIC_CONFIG)
-            .expect("the configuration");
-        handle
-            .write_all(&audio[..whole * size])
-            .expect("the frames");
+            .write_all(&adts_header(frame.len(), CHANNELS_STEREO, FREQUENCY_44100))
+            .expect("the header");
+        handle.write_all(frame).expect("the frame");
         written += 1;
-        if written <= 20 {
-            println!(
-                "  wrote {} for a frame size of {size} ({whole} frames, {remainder} left over)",
-                file.display()
-            );
-        }
     }
-    println!("\n{written} candidates in {}", out.display());
-    println!("point a decoder at one and see which decodes");
+    drop(handle);
+    println!("wrote {} with {written} frames", out.display());
 }

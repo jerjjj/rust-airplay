@@ -998,9 +998,27 @@ async fn run() -> Result<(), String> {
                     let asked: Vec<String> = request
                         .streams
                         .iter()
-                        .map(|stream| match stream.stream_connection_id {
-                            Some(id) => format!("type {} (id {id})", stream.kind),
-                            None => format!("type {}", stream.kind),
+                        .map(|stream| {
+                            // The coding and the frame size, when the client named them:
+                            // `ct` is the one field that says which decoder a stream needs,
+                            // and a receiver that does not print it is a receiver that
+                            // cannot be told its assumption is wrong.
+                            let coding = match stream.compression_type {
+                                Some(2) => "ct 2 (ALAC)".to_owned(),
+                                Some(8) => "ct 8 (AAC-ELD)".to_owned(),
+                                Some(other) => format!("ct {other}"),
+                                None => "ct absent".to_owned(),
+                            };
+                            let spf = match stream.samples_per_frame {
+                                Some(spf) => format!(", spf {spf}"),
+                                None => String::new(),
+                            };
+                            match stream.stream_connection_id {
+                                Some(id) => {
+                                    format!("type {} (id {id}, {coding}{spf})", stream.kind)
+                                }
+                                None => format!("type {} ({coding}{spf})", stream.kind),
+                            }
                         })
                         .collect();
                     println!("media     SETUP keys [{}]", request.keys.join(", "));

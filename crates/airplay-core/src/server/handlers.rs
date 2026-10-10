@@ -76,6 +76,18 @@ pub struct SetupStream {
     /// `streamConnectionID`, which the mirror stream uses to derive its own
     /// AES-CTR key (`raop_handlers.h:959-963`).
     pub stream_connection_id: Option<u64>,
+    /// `ct`, the compression type: `2` is ALAC and `8` is AAC-ELD
+    /// (`upstream/UxPlay@3dbf7cee:lib/raop_rtp.c:113`).
+    ///
+    /// It is what says which coding a client is sending, and upstream takes its decoder
+    /// from it rather than guessing. A port that assumes one of the two is a port that is
+    /// wrong for every client that uses the other, and the assumption is invisible from the
+    /// audio alone: both are compressed, and a decoder handed the wrong one reports a
+    /// stream it cannot read rather than the mix-up.
+    pub compression_type: Option<u16>,
+    /// `spf`, samples per frame, which upstream passes to its decoder with `ct`
+    /// (`raop_handlers.h:1007-1009`).
+    pub samples_per_frame: Option<u16>,
 }
 
 /// What one accepted `SETUP` request hands to the session layer.
@@ -616,9 +628,24 @@ impl RouteHandlers {
                 if !matches!(kind, 96 | 110) {
                     continue;
                 }
+                // The coding a client is sending, which is what decides the decoder: `ct`
+                // is 2 for ALAC and 8 for AAC-ELD (`raop_rtp.c:113`), and `spf` is the
+                // samples a frame carries. Read here rather than assumed downstream,
+                // because a receiver that guesses is wrong for every client that uses the
+                // other coding and cannot tell that it is.
+                let compression_type = stream
+                    .get("ct")
+                    .and_then(plist::Value::as_unsigned_integer)
+                    .and_then(|value| u16::try_from(value).ok());
+                let samples_per_frame = stream
+                    .get("spf")
+                    .and_then(plist::Value::as_unsigned_integer)
+                    .and_then(|value| u16::try_from(value).ok());
                 streams.push(SetupStream {
                     kind,
                     stream_connection_id: connection_id,
+                    compression_type,
+                    samples_per_frame,
                 });
             }
         }
