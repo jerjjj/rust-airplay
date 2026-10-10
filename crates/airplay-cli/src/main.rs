@@ -714,8 +714,42 @@ async fn run() -> Result<(), String> {
                     }
                 })
             });
+            // Every packet a mirror connection sends, counted before it is
+            // interpreted, so that a stream which stops is a stream that stopped
+            // arriving rather than one this receiver cannot say anything about.
+            let received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let received_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let watching = std::sync::Arc::clone(&received);
+            let watching_bytes = std::sync::Arc::clone(&received_bytes);
+            let watching_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let watching_frames_task = std::sync::Arc::clone(&watching_frames);
+            tokio::spawn(async move {
+                let mut last = (0u64, 0u64, 0u64);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let now = (
+                        watching.load(std::sync::atomic::Ordering::Relaxed),
+                        watching_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        watching_frames_task.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    if now != last {
+                        println!(
+                            "media     mirror: {} packets, {} bytes in, {} frames out",
+                            now.0, now.1, now.2
+                        );
+                        last = now;
+                    }
+                }
+            });
             let outcome = stream
-                .serve(&mut session, |frame| {
+                .serve(
+                    &mut session,
+                    |_header, bytes| {
+                        received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        received_bytes
+                            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                    },
+                    |frame| {
                     frames += 1;
                     if frames == 1 {
                         println!(

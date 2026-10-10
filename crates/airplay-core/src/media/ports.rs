@@ -178,6 +178,8 @@ impl MediaSockets {
 /// caller that logs, not by the receive path itself.
 #[derive(Debug, Default)]
 pub struct Received {
+    mirror: std::sync::atomic::AtomicU64,
+    mirror_bytes: std::sync::atomic::AtomicU64,
     timing: std::sync::atomic::AtomicU64,
     control: std::sync::atomic::AtomicU64,
     data: std::sync::atomic::AtomicU64,
@@ -186,6 +188,28 @@ pub struct Received {
 }
 
 impl Received {
+    /// Packets that arrived on a mirror connection.
+    ///
+    /// A mirror stream is a byte stream, so "nothing arrived" and "we stopped
+    /// reading" look the same from the outside; this is the number that tells them
+    /// apart, and it is the first thing to look at when a picture stops moving.
+    pub fn mirror(&self) -> u64 {
+        self.mirror.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes that arrived on a mirror connection.
+    pub fn mirror_bytes(&self) -> u64 {
+        self.mirror_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records one mirror packet of `bytes`.
+    pub fn saw_mirror(&self, bytes: usize) {
+        self.mirror
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.mirror_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Datagrams that arrived on the timing port.
     pub fn timing(&self) -> u64 {
         self.timing.load(std::sync::atomic::Ordering::Relaxed)
@@ -326,9 +350,15 @@ impl MirrorStream {
     pub async fn serve(
         &mut self,
         session: &mut super::mirror::MirrorSession,
+        mut on_packet: impl FnMut(&super::mirror::MirrorHeader, usize),
         mut on_frame: impl FnMut(super::mirror::VideoFrame),
     ) -> Result<(), ServeError> {
         while let Some((header, payload)) = self.read_packet().await? {
+            // Every packet, before it is interpreted: a mirror stream is a byte
+            // stream, so a caller that is only told about frames cannot tell "the
+            // client stopped sending" from "we stopped reading", and those are
+            // different problems.
+            on_packet(&header, payload.len());
             match session.receive(&header, &payload) {
                 Ok(Some(frame)) => on_frame(frame),
                 Ok(None) => {}

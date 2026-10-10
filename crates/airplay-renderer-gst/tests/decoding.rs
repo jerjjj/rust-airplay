@@ -20,6 +20,27 @@ const FRAME_BYTES: usize = 1554 * 1080 * 3 / 2;
 /// The start code every unit of an Annex-B stream is behind.
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// The codec packet a device opens its stream with, exactly as it sent it.
+///
+/// Thirty-seven bytes of AVCDecoderConfigurationRecord: version, profile, level, a
+/// length prefix of four bytes, one sequence set of eighteen bytes and one picture
+/// set of four. It is what a session hands a decoder *before* the first frame, and it
+/// is not an Annex-B stream: there is no start code anywhere in it. A test that
+/// decoded the frames on their own therefore proved less than it looked like it did,
+/// because a session never sends them on their own.
+const CODEC_PACKET: [u8; 37] = [
+    0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x12, 0x27, 0x64, 0x00, 0x28, 0xac, 0x13, 0x14, 0x50,
+    0x18, 0x80, 0x89, 0xe2, 0x25, 0x9b, 0x80, 0x86, 0x80, 0x81, 0x01, 0x00, 0x04, 0x28, 0xee, 0x3c,
+    0xb0, 0x02, 0x00, 0x00, 0x00,
+];
+
+/// The bytes a session actually hands a decoder: the codec packet, then the frames.
+fn session_bytes() -> Vec<u8> {
+    let mut bytes = CODEC_PACKET.to_vec();
+    bytes.extend_from_slice(DUMP);
+    bytes
+}
+
 /// The program to run pipelines in, if this machine has one.
 fn launcher() -> Option<String> {
     match airplay_renderer_gst::pipeline::find_launcher() {
@@ -63,6 +84,7 @@ fn frames_in_fixture() -> usize {
 /// — and its standard output is the raw decoded stream, so the count is the
 /// pipeline's own answer and not a receiver's.
 fn decode_with(program: &str, pipeline: &str) -> usize {
+    let session = session_bytes();
     let mut child = std::process::Command::new(program)
         .arg("-q")
         // Handed over the way the backend hands it: as separate arguments, because a
@@ -76,7 +98,7 @@ fn decode_with(program: &str, pipeline: &str) -> usize {
         .expect("a pipeline");
     let mut input = child.stdin.take().expect("a pipe to write frames to");
     let writer = std::thread::spawn(move || {
-        let _ = input.write_all(DUMP);
+        let _ = input.write_all(&session);
         // Dropping the pipe is the end of stream, which is how a sink knows to play
         // what it has left before it exits.
     });
