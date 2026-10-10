@@ -11,3 +11,5 @@ crates/airplay-renderer-gst/target/
 *.pem
 *.mp4
 
+
+tools/oracle/probe_sequence.exe
