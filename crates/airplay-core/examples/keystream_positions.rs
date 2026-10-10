@@ -60,26 +60,25 @@ fn main() {
             println!("  identical for all {second} bytes");
             continue;
         };
+        // What this port read the diverging byte from, in blocks of the stream: the fresh
+        // part starts on a block, so the block is the byte's own offset past it. This is
+        // the number the question is about — a rule is a block number, and an unexplained
+        // difference is a difference in one.
+        let probe = {
+            let mut probe = MirrorDecryptor::new(&keys).expect("keys");
+            let mut sink = vec![0u8; *first];
+            probe.decrypt(&vec![0u8; *first], &mut sink).expect("first");
+            (probe.carried(), probe.read_block())
+        };
+        println!(
+            "  carried {} bytes, fresh blocks from {}; byte {at} is fresh byte {} of block {}",
+            probe.0,
+            probe.1,
+            at - probe.0,
+            probe.1 + (at - probe.0) as u64 / 16
+        );
         let from = at.saturating_sub(AROUND);
         let to = (at + AROUND).min(*second);
-        // The block each byte of the second packet comes from, on both sides: ours is the
-        // block this port asks the stream for, and upstream's is the block its bytes were
-        // found in. A rule is a block number, so this is what the rule is.
-        println!(
-            "  carried {} bytes, then fresh blocks from {}",
-            {
-                let mut probe = MirrorDecryptor::new(&keys).expect("keys");
-                let mut sink = vec![0u8; *first];
-                probe.decrypt(&vec![0u8; *first], &mut sink).expect("first");
-                probe.carried()
-            },
-            {
-                let mut probe = MirrorDecryptor::new(&keys).expect("keys");
-                let mut sink = vec![0u8; *first];
-                probe.decrypt(&vec![0u8; *first], &mut sink).expect("first");
-                probe.read_block()
-            }
-        );
         for index in from..to {
             let marker = if ours[index] == upstream[index] {
                 " "
