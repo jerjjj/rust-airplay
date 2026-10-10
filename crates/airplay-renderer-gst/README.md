@@ -63,3 +63,23 @@ wrapper:
 
 They are `#[ignore]`d for the same reason the crate is: the default workspace's gates run
 where GStreamer is not installed.
+
+## What the tests keep
+
+`tests/fixtures/mirror-first-frames.h264` is the first thirty frames of a real
+session: an iPad mirroring a 1554x1080 screen, as this backend handed them to a
+decoder. It is committed because it is the only evidence that survives a session —
+a device is not available to a test, and "the picture looks wrong" cannot be
+asserted, while "the pipeline decoded every frame" can.
+
+Two tests read it, and they are the ones to run first when a picture is wrong:
+
+```powershell
+$env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+cargo test --test decoding -- --ignored --test-threads=1 --nocapture
+```
+
+They decode the fixture through this backend's own pipeline and through the one a
+player would build, and compare the counts. Both report 64 frames of 65, the last
+still inside the decoder when the stream ends. If the two ever disagree, the
+difference is which decoder each chose.

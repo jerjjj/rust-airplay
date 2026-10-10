@@ -198,8 +198,15 @@ fn audio_pipeline(caps: &str, sink: &str) -> String {
 /// what the receiver advertised, and the two need different parsers and decoders.
 /// `decodebin` picks them from what arrives, which is what makes one pipeline serve
 /// both: a device that switches coding mid-session is then not a special case.
+///
+/// The format handed to the sink is named rather than left to negotiation. A decoder
+/// chooses a format for its own convenience — a hardware one usually produces NV12 —
+/// and a sink that is given a format it reads with the wrong stride draws part of the
+/// picture correctly and the rest as flat colour, which is a screen that "shows
+/// something but not all of it". `videoconvert` to a format every sink reads removes
+/// the negotiation from the path a picture takes.
 fn video_pipeline(sink: &str) -> String {
-    format!("fdsrc ! decodebin ! videoconvert ! {sink} sync=false")
+    format!("fdsrc ! decodebin ! videoconvert ! video/x-raw,format=I420 ! {sink} sync=false")
 }
 
 impl Renderer for GstRenderer {
