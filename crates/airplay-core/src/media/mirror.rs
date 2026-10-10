@@ -805,6 +805,106 @@ pub struct MirrorSession {
     /// Frames handed out so far, which is what a caller reports to say the stream
     /// is alive.
     frames: u64,
+    /// What happened to the packets that did not become frames.
+    ///
+    /// A packet that carries no frame is normal — a keep-alive, a streaming report, a
+    /// codec configuration — so a session that dropped them silently could not say
+    /// whether a stream had stopped arriving or had changed into something this
+    /// receiver does not recognise. Those are different problems and the counts are
+    /// what tells them apart.
+    dropped: std::sync::Arc<PacketCensus>,
+}
+
+/// What a session did with the packets that were not frames.
+///
+/// The kinds are the header's own, so a stream that starts sending a second header
+/// byte this receiver does not know shows up as `unknown` rather than as silence.
+///
+/// The counters are shared with whoever reports on the stream: a caller watching a
+/// session for a stall needs to read them while the session is being served, and a
+/// value the session owns cannot be read at the same time as the session is used.
+#[derive(Debug, Default)]
+pub struct PacketCensus {
+    video: std::sync::atomic::AtomicU64,
+    codec: std::sync::atomic::AtomicU64,
+    reports: std::sync::atomic::AtomicU64,
+    unknown: std::sync::atomic::AtomicU64,
+    /// The first two bytes of the first unknown packet, packed as `first << 8 | second`.
+    last_unknown: std::sync::atomic::AtomicU32,
+    not_units: std::sync::atomic::AtomicU64,
+}
+
+/// A reading of a [`PacketCensus`], which is what a report prints.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PacketCounts {
+    /// Video packets that became frames.
+    pub video: u64,
+    /// Codec configurations, which are kept for the frame they belong to.
+    pub codec: u64,
+    /// Keep-alives and streaming reports, which carry no picture.
+    pub reports: u64,
+    /// Packets whose header kind this receiver does not know.
+    pub unknown: u64,
+    /// The first two bytes of the first unknown packet, for a report.
+    pub last_unknown: Option<(u8, u8)>,
+    /// Payloads that were not the units they should be, which upstream passes on
+    /// marked rather than treating as fatal (`raop_rtp_mirror.c:533-536`).
+    pub not_units: u64,
+}
+
+impl PacketCensus {
+    /// The counts as they stand.
+    pub fn read(&self) -> PacketCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        let packed = self.last_unknown.load(Relaxed);
+        PacketCounts {
+            video: self.video.load(Relaxed),
+            codec: self.codec.load(Relaxed),
+            reports: self.reports.load(Relaxed),
+            unknown: self.unknown.load(Relaxed),
+            last_unknown: (packed != 0).then_some((((packed >> 8) & 0xff) as u8, (packed & 0xff) as u8)),
+            not_units: self.not_units.load(Relaxed),
+        }
+    }
+
+    /// Counts one packet of a kind.
+    fn count(&self, kind: PacketKind) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match kind {
+            PacketKind::Video => {
+                self.video.fetch_add(1, Relaxed);
+            }
+            PacketKind::Codec => {
+                self.codec.fetch_add(1, Relaxed);
+            }
+            PacketKind::Report => {
+                self.reports.fetch_add(1, Relaxed);
+            }
+            PacketKind::NotUnits => {
+                self.not_units.fetch_add(1, Relaxed);
+            }
+            PacketKind::Unknown(first, second) => {
+                self.unknown.fetch_add(1, Relaxed);
+                // The first one is the one worth keeping: a stream that changed into
+                // something unreadable says so once, and later packets are the same
+                // change.
+                let packed = u32::from(first) << 8 | u32::from(second);
+                let _ = self
+                    .last_unknown
+                    .compare_exchange(0, packed | 0x1_0000, Relaxed, Relaxed);
+            }
+        }
+    }
+}
+
+/// The kinds a census counts.
+#[derive(Debug, Clone, Copy)]
+enum PacketKind {
+    Video,
+    Codec,
+    Report,
+    NotUnits,
+    Unknown(u8, u8),
 }
 
 impl MirrorSession {
@@ -818,6 +918,7 @@ impl MirrorSession {
             decryptor: MirrorDecryptor::new(keys)?,
             codec: CodecConfig::new(),
             frames: 0,
+            dropped: std::sync::Arc::new(PacketCensus::default()),
         })
     }
 
@@ -830,6 +931,12 @@ impl MirrorSession {
     pub fn rekey(&mut self, keys: &StreamKeys) -> Result<(), crate::crypto::CryptoError> {
         self.codec = CodecConfig::new();
         self.decryptor.rekey(keys)
+    }
+
+    /// Frames handed out so far.
+    /// What this session did with the packets that were not frames.
+    pub fn census(&self) -> std::sync::Arc<PacketCensus> {
+        std::sync::Arc::clone(&self.dropped)
     }
 
     /// Frames handed out so far.
@@ -858,12 +965,22 @@ impl MirrorSession {
             MirrorKind::CodecData => {
                 // A codec packet that cannot be read is dropped rather than treated
                 // as fatal: the client sends another when the format changes.
+                self.dropped.count(PacketKind::Codec);
                 let _ = self.codec.codec_data(header.timestamp, payload);
                 Ok(None)
             }
             MirrorKind::Video { idr } => {
                 let mut data = self.decrypt(payload)?;
-                let mut units = into_annex_b(&mut data).map_err(FrameError::NotUnits)?;
+                let mut units = match into_annex_b(&mut data) {
+                    Ok(units) => units,
+                    Err(error) => {
+                        // Upstream marks a frame whose units do not add up and passes
+                        // it on rather than ending the stream (`:533-536`), so this is
+                        // counted and reported instead of being fatal.
+                        self.dropped.count(PacketKind::NotUnits);
+                        return Err(FrameError::NotUnits(error));
+                    }
+                };
                 if let Some(config) = self.codec.prepend_to(header.timestamp) {
                     // Upstream counts the two units it prepends, so a caller can
                     // report how many a frame holds (`raop_rtp_mirror.c:547-553`).
@@ -873,6 +990,7 @@ impl MirrorSession {
                     whole.extend_from_slice(&data);
                     data = whole;
                 }
+                self.dropped.count(PacketKind::Video);
                 self.frames += 1;
                 Ok(Some(VideoFrame {
                     data,
@@ -881,9 +999,18 @@ impl MirrorSession {
                     idr,
                 }))
             }
-            // Keep-alives, streaming reports and packets this port does not know
-            // carry nothing a decoder can use.
-            _ => Ok(None),
+            // Keep-alives and streaming reports carry nothing a decoder can use, and a
+            // packet this port does not recognise is the one worth being able to see:
+            // a stream that changes into something unreadable looks exactly like a
+            // stream that stopped, unless the two bytes are recorded.
+            MirrorKind::KeepAlive | MirrorKind::StreamingReport => {
+                self.dropped.count(PacketKind::Report);
+                Ok(None)
+            }
+            MirrorKind::Unknown { first, second } => {
+                self.dropped.count(PacketKind::Unknown(first, second));
+                Ok(None)
+            }
         }
     }
 

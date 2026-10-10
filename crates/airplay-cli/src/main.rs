@@ -723,6 +723,9 @@ async fn run() -> Result<(), String> {
             let watching_bytes = std::sync::Arc::clone(&received_bytes);
             let watching_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let watching_frames_task = std::sync::Arc::clone(&watching_frames);
+            // The census the session keeps is the one the reporter reads: it is shared
+            // rather than copied, so there is one answer to what became of the packets.
+            let watching_census = session.census();
             tokio::spawn(async move {
                 let mut last = (0u64, 0u64, 0u64);
                 loop {
@@ -737,6 +740,21 @@ async fn run() -> Result<(), String> {
                             "media     mirror: {} packets, {} bytes in, {} frames out",
                             now.0, now.1, now.2
                         );
+                        // What became of the packets that were not frames. A stream
+                        // that is arriving but producing nothing says which of the
+                        // kinds it turned into, which is the whole question when a
+                        // picture stops.
+                        let census = watching_census.read();
+                        println!(
+                            "media     mirror kinds: video {}, codec {}, reports {}, \
+                             unknown {} {:?}, not units {}",
+                            census.video,
+                            census.codec,
+                            census.reports,
+                            census.unknown,
+                            census.last_unknown,
+                            census.not_units
+                        );
                         last = now;
                     }
                 }
@@ -748,6 +766,9 @@ async fn run() -> Result<(), String> {
                         received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         received_bytes
                             .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                        // Nothing to do here: the census is shared, so the reporter
+                        // reads it as it stands. A copy per packet would be a copy of
+                        // something the reporter can already see.
                     },
                     |frame| {
                     frames += 1;
