@@ -726,6 +726,9 @@ async fn run() -> Result<(), String> {
             // The census the session keeps is the one the reporter reads: it is shared
             // rather than copied, so there is one answer to what became of the packets.
             let watching_census = session.census();
+            // The recent packets live beside the census and are read the same way.
+            let recent_source = std::sync::Arc::clone(&watching_census);
+            let watching_recent = move || recent_source.recent();
             tokio::spawn(async move {
                 let mut last = (0u64, 0u64, 0u64);
                 loop {
@@ -765,6 +768,29 @@ async fn run() -> Result<(), String> {
                                  {} (bytes: {})",
                                 bad.declared, bad.length, bad.error, bad.preview
                             );
+                            // The packets either side of it. A keystream that has gone
+                            // out of step is only visible across packets, and the one
+                            // that broke it is the one just before the first payload
+                            // that could not be read.
+                            println!(
+                                "media     packets around it (size, carry->carry, blocks->blocks, first bytes, read):"
+                            );
+                            for packet in watching_recent() {
+                                println!(
+                                    "media       {:>7} B  carry {}->{}  blocks {}->{}  \
+                                     {:02x}{:02x}{:02x}{:02x}  {}",
+                                    packet.declared,
+                                    packet.carried_before,
+                                    packet.carried_after,
+                                    packet.blocks_before,
+                                    packet.blocks_after,
+                                    packet.first[0],
+                                    packet.first[1],
+                                    packet.first[2],
+                                    packet.first[3],
+                                    if packet.read { "frame" } else { "NOT READ" }
+                                );
+                            }
                         }
                         last = now;
                     }

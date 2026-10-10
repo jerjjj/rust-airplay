@@ -815,6 +815,9 @@ pub struct MirrorSession {
     dropped: std::sync::Arc<PacketCensus>,
 }
 
+/// How many decrypted packets a census keeps for a report.
+const RECENT_PACKETS: usize = 24;
+
 /// What a session did with the packets that were not frames.
 ///
 /// The kinds are the header's own, so a stream that starts sending a second header
@@ -832,6 +835,12 @@ pub struct PacketCensus {
     /// The first two bytes of the first unknown packet, packed as `first << 8 | second`.
     last_unknown: std::sync::atomic::AtomicU32,
     not_units: std::sync::atomic::AtomicU64,
+    /// The last packets this session decrypted, oldest first.
+    ///
+    /// Kept because a keystream that goes out of step is only visible across packets:
+    /// the one that broke it is the one before the first payload that could not be
+    /// read, and by then it is gone.
+    recent: std::sync::Mutex<std::collections::VecDeque<Decrypted>>,
     /// The first payload that was not units, with what it looked like.
     ///
     /// Behind a lock rather than an atomic because it is a description and not a
@@ -865,6 +874,27 @@ pub struct PacketCounts {
 /// wrong or a framing this receiver does not have; the two are told apart by the
 /// bytes, so the first one is kept with the error that was raised on it.
 #[derive(Debug, Clone)]
+pub struct Decrypted {
+    /// What the packet was.
+    pub kind: String,
+    /// Bytes the header declared.
+    pub declared: u32,
+    /// Carried keystream bytes before it was decrypted.
+    pub carried_before: usize,
+    /// The block the counter started on.
+    pub blocks_before: u64,
+    /// The block the counter came to.
+    pub blocks_after: u64,
+    /// Carried keystream bytes after it.
+    pub carried_after: usize,
+    /// The first four bytes it decrypted to.
+    pub first: [u8; 4],
+    /// Whether it became a frame.
+    pub read: bool,
+}
+
+/// What a payload that was not units looked like.
+#[derive(Debug, Clone)]
 pub struct PendingBadPacket {
     /// What the reader objected to.
     pub error: NalError,
@@ -890,6 +920,31 @@ impl PartialEq for PacketCounts {
 impl Eq for PacketCounts {}
 
 impl PacketCensus {
+    /// The counts as they stand.
+    /// The last packets this session decrypted, oldest first.
+    pub fn recent(&self) -> Vec<Decrypted> {
+        self.recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Records one decrypted packet, keeping the last few.
+    pub fn saw_decrypted(&self, packet: Decrypted) {
+        let mut recent = self
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The window is small on purpose: what a desync needs is the packets either
+        // side of the first failure, not the history of the session.
+        if recent.len() == RECENT_PACKETS {
+            recent.pop_front();
+        }
+        recent.push_back(packet);
+    }
+
     /// The counts as they stand.
     pub fn read(&self) -> PacketCounts {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1024,10 +1079,35 @@ impl MirrorSession {
                 Ok(None)
             }
             MirrorKind::Video { idr } => {
+                let carried_before = self.decryptor.carried();
+                let blocks_before = self.decryptor.blocks();
                 let mut data = self.decrypt(payload)?;
+                // The first bytes, zero padded: a payload shorter than four bytes is a
+                // packet that went wrong, and the report still has to be able to say so.
+                let mut first = [0u8; 4];
+                let shown = data.len().min(4);
+                first[..shown].copy_from_slice(&data[..shown]);
+                // Read before the payload is rewritten: the counter has already moved
+                // past this packet, and the rule is what the position is.
+                let carried_after = self.decryptor.carried();
+                let blocks_after = self.decryptor.blocks();
+                // What this packet looked like, whatever becomes of it. A closure
+                // cannot hold this because the session is borrowed for the whole
+                // match, so the record is built here and stored where it is needed.
+                let record = |read: bool| Decrypted {
+                    kind: format!("video idr={idr}"),
+                    declared: payload.len() as u32,
+                    carried_before,
+                    blocks_before,
+                    blocks_after,
+                    carried_after,
+                    first,
+                    read,
+                };
                 let mut units = match into_annex_b(&mut data) {
                     Ok(units) => units,
                     Err(error) => {
+                        self.dropped.saw_decrypted(record(false));
                         // Upstream marks a frame whose units do not add up and passes
                         // it on rather than ending the stream (`:533-536`), so this is
                         // counted and reported instead of being fatal.                        // The bytes and the reader's objection are what a report needs,
@@ -1051,6 +1131,7 @@ impl MirrorSession {
                     whole.extend_from_slice(&data);
                     data = whole;
                 }
+                self.dropped.saw_decrypted(record(true));
                 self.dropped.count(PacketKind::Video);
                 self.frames += 1;
                 Ok(Some(VideoFrame {
@@ -1956,4 +2037,3 @@ mod tests {
         assert_eq!(first, stream_keys(1, &audio_key));
     }
 }
-
