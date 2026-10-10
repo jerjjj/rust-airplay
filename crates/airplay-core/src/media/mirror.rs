@@ -426,13 +426,35 @@ pub struct MirrorDecryptor {
     /// than the bytes it carried is kept.
     key: [u8; STREAM_KEY_LEN],
     iv: [u8; STREAM_KEY_LEN],
-    /// Whole blocks the packets decrypted so far had, which is how far into the
-    /// stream the next packet's fresh block is.
-    blocks: u64,
-    /// Bytes of the previous packet's tail block that it did not use,
-    /// `og[16 - carry..]` in upstream.
+    /// The block of the stream the next packet's own bytes start on.
+    ///
+    /// A block number and not a byte offset, because that is what the rule is about: a
+    /// packet reads whole blocks, so this moves by the packet's length rounded up to a
+    /// block. Its bytes past the first `carried` ones are read from this block's first
+    /// byte — the counter restarted at a boundary, it did not carry on from where the
+    /// previous packet's bytes stopped.
+    read_block: u64,
+    /// Where in the stream this receiver has come, in bytes of packet data.
+    ///
+    /// Kept apart from `read_at` because the two are not the same quantity: a packet of
+    /// 1265 bytes leaves this at 1265 and `read_at` at 1280. Both were needed to make a
+    /// real session's packets decrypt, and measuring them is what took so long — every
+    /// earlier version of this port used one number where there are two.
+    position: u64,
+    /// The keystream of the block a packet's tail sat in, of which the packet used the
+    /// front: what is behind that is the next packet's first bytes.
+    ///
+    /// This has to be kept rather than generated again, because it is not anywhere in the
+    /// stream: it is the rest of a block that has already been read past. A locator looking
+    /// for those bytes in the stream finds nothing, which is exactly how this was found.
     carry: [u8; 16],
-    /// How many of them there are, upstream's `nextDecryptCount`.
+    /// How far into that block the bytes it left begin.
+    ///
+    /// The bytes are read from here rather than from the front of the buffer, because the
+    /// packet that left them used the front of the block itself.
+    carry_at: usize,
+    /// How many of those bytes the next packet starts with, upstream's
+    /// `nextDecryptCount`.
     carried: usize,
 }
 
@@ -442,7 +464,7 @@ impl std::fmt::Debug for MirrorDecryptor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MirrorDecryptor")
-            .field("blocks", &self.blocks)
+            .field("position", &self.position)
             .field("carried", &self.carried)
             .finish_non_exhaustive()
     }
@@ -461,8 +483,10 @@ impl MirrorDecryptor {
         Ok(Self {
             key: keys.key,
             iv: keys.iv,
-            blocks: 0,
+            position: 0,
+            read_block: 0,
             carry: [0; 16],
+            carry_at: 0,
             carried: 0,
         })
     }
@@ -488,10 +512,22 @@ impl MirrorDecryptor {
         self.carried
     }
 
-    /// The block the next packet's counter starts on, which is how far into the
-    /// stream this receiver has come.
-    pub fn blocks(&self) -> u64 {
-        self.blocks
+    /// Where in the stream the next packet's first byte belongs, in bytes of packet data.
+    ///
+    /// This is the position the stream has come to and not the block the cipher is on: the
+    /// two differ by the part of a block a packet's tail did not fill, and both are needed
+    /// — see [`Self::read_block`].
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// The block of the stream the next packet's bytes are read from.
+    ///
+    /// A block boundary, because the counter restarts on one at every packet: a packet's
+    /// bytes past the first `carried` ones come from the start of this block and not from
+    /// where the previous packet's bytes stopped.
+    pub fn read_block(&self) -> u64 {
+        self.read_block
     }
 
     /// The keystream of `blocks` blocks starting at block `first` of the stream.
@@ -545,49 +581,71 @@ impl MirrorDecryptor {
                 output: output.len(),
             });
         }
-        if self.carried > input.len() {
-            return Err(MirrorError::Carry {
-                carried: self.carried,
-                length: input.len(),
-            });
+        let length = input.len();
+
+        // A packet shorter than the bytes being carried takes what it needs of them and
+        // loses the rest: upstream's carry buffer is one block that the next packet
+        // overwrites whole (`mirror_buffer.c:115-117`), so nothing of a carry outlives the
+        // packet after it, whatever the two lengths are. A client does not send that, and
+        // the oracle's own readers show what it does when one arrives, so this reproduces
+        // it rather than refusing — the lengths are what a receiver has to survive.
+
+        // A packet is read in two parts, and the line between them is what every earlier
+        // version of this port got wrong.
+        //
+        // The cipher reads whole blocks. A packet whose length is not a multiple of the
+        // block fills part of its last block, and the counter comes out of that block at
+        // its end (`mirror_buffer.c:115-117`) — so the bytes the packet did not use are
+        // still in the cipher, and are not anywhere in the stream to be read again: they
+        // are the rest of a block that has already been read past. The next packet starts
+        // with them, because `aes_ctr_start_fresh_block` cannot skip them — the counter is
+        // already past them — and the loop at `:96-98` takes them from the block the
+        // previous packet left.
+        //
+        // The rest of the packet is read from the block the cipher moved on to, starting at
+        // that block's first byte: the counter restarted at a block boundary, it did not
+        // continue from where the previous packet's bytes stopped.
+        // The carried bytes the packet actually takes: all of them when it is long enough,
+        // and only as many as it has when it is not. Either way the carry does not survive
+        // this packet — upstream's buffer holds one block and the next packet fills it.
+        let carried = self.carried.min(length);
+        for (at, byte) in input.iter().take(carried).enumerate() {
+            output[at] = byte ^ self.carry[self.carry_at + at];
         }
-        let carried = self.carried;
-        let whole = ((input.len() - carried) / 16) * 16;
-        let rest = (input.len() - carried) % 16;
-        // Step 1: the first `carried` bytes are XORed with the keystream bytes the
-        // previous packet's tail block did not use (`mirror_buffer.c:96-100`).
-        for (index, byte) in input[..carried].iter().enumerate() {
-            output[index] = byte ^ self.carry[index];
-        }
-        // Steps 2 and 3: the counter starts a fresh block, which is the block after
-        // the ones the packets so far had (`aes_ctr_start_fresh_block`,
-        // `mirror_buffer.c:102-107`). The whole blocks come from it directly, and
-        // the tail is decrypted as one whole block on top of zero padding
-        // (`:111-123`), of which the packet keeps the first `rest` bytes.
-        let fresh = self.keystream(self.blocks, (whole + rest) / 16 + usize::from(rest > 0));
-        for (index, byte) in input[carried..carried + whole].iter().enumerate() {
-            output[carried + index] = byte ^ fresh[index];
-        }
-        self.carried = 0;
-        // The counter advances by the packet's whole blocks and, when the packet did
-        // not end on a block boundary, by the block its tail sat in: the carry it
-        // leaves comes from the front of the **next** block, which is where the next
-        // packet's fresh counter starts. `tests/upstream_oracle.rs` pins this against
-        // upstream's own `mirror_buffer_decrypt`.
-        self.blocks += (whole / 16) as u64;
-        if rest > 0 {
-            let start = input.len() - rest;
-            for index in 0..rest {
-                output[start + index] = input[start + index] ^ fresh[whole + index];
+        if carried < length {
+            let rest = length - carried;
+            let used = rest % 16;
+            // The whole blocks the packet fills, and — only when its last byte does not sit
+            // on a block boundary — the block that byte is in, whose other half is what the
+            // next packet starts with. A packet that ends on a boundary needs nothing more,
+            // and asking for a block it does not use moves the counter one block too far,
+            // which every packet after it then reads from.
+            let tail = usize::from(used > 0);
+            let fresh = self.keystream(self.read_block, rest / 16 + tail);
+            for (at, byte) in input[carried..].iter().enumerate() {
+                output[carried + at] = byte ^ fresh[at];
             }
-            // The bytes the packet did not use are the next packet's keystream, kept
-            // from the front of this buffer; the ones it did use are plaintext, so
-            // they are not carried at all.
-            self.carry = [0; 16];
-            self.carry[..16 - rest].copy_from_slice(&fresh[whole + rest..whole + 16]);
-            self.carried = 16 - rest;
-            self.blocks += 1;
+            if used == 0 {
+                // It ended on a block boundary, so it left nothing behind.
+                self.carry_at = 0;
+                self.carried = 0;
+            } else {
+                // What it leaves for the next one: the bytes of its last block behind the
+                // ones it used.
+                let start = rest / 16 * 16;
+                self.carry.copy_from_slice(&fresh[start..start + 16]);
+                self.carry_at = used;
+                self.carried = 16 - used;
+            }
+        } else {
+            self.carry_at = 0;
+            self.carried = 0;
         }
+        self.position += length as u64;
+        // The blocks this packet consumed: the carry's bytes were the previous packet's,
+        // so what is counted is the part it read fresh — a packet of 24 bytes after eight
+        // carried ones moves the counter one block, not two.
+        self.read_block += (length - carried).div_ceil(16) as u64;
         Ok(())
     }
 }
@@ -1080,7 +1138,7 @@ impl MirrorSession {
             }
             MirrorKind::Video { idr } => {
                 let carried_before = self.decryptor.carried();
-                let blocks_before = self.decryptor.blocks();
+                let blocks_before = self.decryptor.position();
                 let mut data = self.decrypt(payload)?;
                 // The first bytes, zero padded: a payload shorter than four bytes is a
                 // packet that went wrong, and the report still has to be able to say so.
@@ -1090,7 +1148,7 @@ impl MirrorSession {
                 // Read before the payload is rewritten: the counter has already moved
                 // past this packet, and the rule is what the position is.
                 let carried_after = self.decryptor.carried();
-                let blocks_after = self.decryptor.blocks();
+                let blocks_after = self.decryptor.position();
                 // What this packet looked like, whatever becomes of it. A closure
                 // cannot hold this because the session is borrowed for the whole
                 // match, so the record is built here and stored where it is needed.
@@ -1565,9 +1623,9 @@ mod tests {
             // Where the client's counter will be is where the receiver's has to be:
             // both sides have to agree about the block a packet starts on.
             assert_eq!(
-                decryptor.blocks(),
+                decryptor.read_block(),
                 next_block as u64,
-                "the block the packet after {length} starts on"
+                "where the packet after {length} starts reading"
             );
             carried = left;
         }
@@ -1851,8 +1909,11 @@ mod tests {
         );
         assert_eq!(session.frames(), 0);
 
-        // A packet with more carried bytes than it has is off the stream, and the
-        // session reports where rather than guessing.
+        // A packet shorter than the bytes being carried is not refused: upstream takes
+        // what it needs of them and loses the rest, because its carry buffer is one block
+        // that the next packet overwrites whole (`mirror_buffer.c:115-117`). The oracle's
+        // own readers do exactly that for a pair of one-byte packets, so this reproduces
+        // it. What the session does report is the payload, which cannot be units.
         let mut carried = MirrorSession::new(&keys).expect("session");
         let stream = keystream(&keys, 3);
         let body = units(&[&[0x41; 20]]);
@@ -1866,12 +1927,12 @@ mod tests {
         assert!(carried.receive(&header, payload).expect("video").is_some());
         let short = packet(0x00, 0x00, 0x00, 9, &[0u8; 3]);
         let (header, payload) = parse_packet(&short).expect("short");
-        assert_eq!(
-            carried.receive(&header, payload),
-            Err(FrameError::OffTheStream(MirrorError::Carry {
-                carried: 8,
-                length: 3
-            }))
+        assert!(
+            matches!(
+                carried.receive(&header, payload),
+                Err(FrameError::NotUnits(_))
+            ),
+            "a three-byte payload is not a frame however the carry went"
         );
     }
 

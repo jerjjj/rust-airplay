@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "crypto.h"
@@ -382,6 +383,20 @@ static void mirror_vectors(void) {
         memset(blocks, 0, sizeof(blocks));
         aes_ctr_decrypt(probe, blocks, blocks, (int)sizeof(blocks));
         emit("mirror.keystream", blocks, sizeof(blocks));
+        /* And far into the stream, which is where a session ends up: a generator whose
+         * counter is wrong by one byte at the start is right at the start and wrong a
+         * few thousand blocks in, and a picture that is noise says exactly that. The
+         * block is the one a real session reached after its first packet. */
+        aes_ctx_t *far = aes_ctr_init(key_hash, iv_hash);
+        unsigned char skip[16];
+        for (int waste = 0; waste < 3899; waste++) {
+            aes_ctr_decrypt(far, skip, skip, 16);
+        }
+        unsigned char far_blocks[0x10 * 16];
+        memset(far_blocks, 0, sizeof(far_blocks));
+        aes_ctr_decrypt(far, far_blocks, far_blocks, (int)sizeof(far_blocks));
+        emit("mirror.keystream_far", far_blocks, sizeof(far_blocks));
+        aes_ctr_destroy(far);
         aes_ctr_destroy(probe);
     }
 
@@ -405,6 +420,155 @@ static void mirror_vectors(void) {
         emit(label, model, length);
         snprintf(label, sizeof(label), "mirror.length%d", step);
         emit_int(label, length);
+    }
+
+    /* A sequence, which is the case the vectors above cannot reach: one stream read
+     * packet after packet, which is what a session does. Each step decrypts zeros and
+     * prints the bytes it read, so the position after every packet is visible — and a
+     * port whose counter advances differently shows up at the step where the two
+     * disagree rather than at the end. The lengths are a client's own: sizes that are
+     * not multiples of the block, which is what leaves carried bytes behind. */
+    {
+        static const int sequence_lengths[] = {
+            1356, 1358, 1356, 1355, 1346, 1300, 1400, 1420, 64, 33, 47, 1,
+        };
+        const int sequence_count =
+            (int)(sizeof(sequence_lengths) / sizeof(sequence_lengths[0]));
+        unsigned char input[4096];
+        unsigned char model[4096];
+        char label[64];
+        mirror_buffer_t *reader = mirror_buffer_init(logger, mirror_audio_key);
+        mirror_buffer_init_aes(reader, &mirror_connection_id);
+        for (int step = 0; step < sequence_count; step++) {
+            int length = sequence_lengths[step];
+            memset(input, 0, sizeof(input));
+            memset(model, 0, sizeof(model));
+            mirror_buffer_decrypt(reader, input, model, length);
+            /* The first bytes are where the reader is, which is the whole question,
+             * and the length says which packet they belong to. */
+            snprintf(label, sizeof(label), "mirror.sequence%d", step);
+            emit(label, model, length > 64 ? 64 : length);
+            snprintf(label, sizeof(label), "mirror.sequence_length%d", step);
+            emit_int(label, length);
+        }
+        mirror_buffer_destroy(reader);
+    }
+
+    /* What a packet reads when it follows another one, which is the case a session is:
+     * the reader is given the first length and then the second, and prints what it read
+     * for the second. Adjacency and block alignment differ by at most fifteen bytes, so
+     * the answer is the offset the bytes sit at, and a port can compare its own.
+     *
+     * The pairs are a client's own sizes, including a first packet of tens of kilobytes,
+     * because that is what a session starts with. */
+    {
+        static const int pairs[][2] = {
+            /* What each pair is for. The last four vary one thing at a time around the
+             * pair that diverges, so the rule can be read off which of them still does. */
+            {62415, 1265},  /* a first packet of a real session's size */
+            {1265, 9710},   /* the one that diverges */
+            {9710, 1237},   /* and one that does not, for contrast */
+            {1356, 1355},
+            {1265, 1265},   /* the same first packet, second longer than a block */
+            {1265, 4096},   /* and longer still, ending on a block boundary */
+            {1265, 8000},   /* and longer: does the place it parts move with the length? */
+            {33, 8000},     /* a smaller first packet, the same long second one */
+            {1265, 4097},   /* one byte past a boundary */
+            {4096, 8000},   /* no carry at all, and the same long second packet */
+        };
+        const int pair_count = (int)(sizeof(pairs) / sizeof(pairs[0]));
+        unsigned char input[131072];
+        unsigned char model[131072];
+        unsigned char waste[131072];
+        char label[64];
+        for (int pair = 0; pair < pair_count; pair++) {
+            int first = pairs[pair][0];
+            int second = pairs[pair][1];
+            mirror_buffer_t *reader = mirror_buffer_init(logger, mirror_audio_key);
+            mirror_buffer_init_aes(reader, &mirror_connection_id);
+            memset(input, 0, sizeof(input));
+            memset(waste, 0, sizeof(waste));
+            mirror_buffer_decrypt(reader, input, waste, first);
+            memset(input, 0, sizeof(input));
+            memset(model, 0, sizeof(model));
+            mirror_buffer_decrypt(reader, input, model, second);
+            mirror_buffer_destroy(reader);
+            snprintf(label, sizeof(label), "mirror.pair_first%d", pair);
+            emit_int(label, first);
+            snprintf(label, sizeof(label), "mirror.pair_second%d", pair);
+            emit_int(label, second);
+            /* The whole answer, so a port can compare its own byte for byte rather
+             * than search for it. */
+            snprintf(label, sizeof(label), "mirror.pair_read%d", pair);
+            emit(label, model, second);
+        }
+    }
+
+    /* The sequence checked by upstream's own decryptor, byte for byte, without a
+     * vector leaving this program.
+     *
+     * The check above prints the bytes each packet read, and a port compares them with
+     * its own — which is how a wrong expectation gets copied into a test. Here the
+     * expectation cannot be copied: the oracle encrypts a plaintext whose bytes it
+     * knows, with the keystream a reader of its own reads for that packet, and then
+     * checks that the persistent reader gives the plaintext back. If upstream's
+     * decryptor is not self-consistent across a sequence, the line says which step.
+     *
+     * One byte per step also leaves the program, so a port can check its own run against
+     * the same twelve bytes: the checksum of a step's plaintext, which is a number no
+     * search can find in the wrong place. */
+    {
+        static const int self_lengths[] = {
+            1356, 1358, 1356, 1355, 1346, 1300, 1400, 1420, 64, 33, 47, 1,
+        };
+        const int self_count = (int)(sizeof(self_lengths) / sizeof(self_lengths[0]));
+        unsigned char plaintext[4096];
+        unsigned char input[4096];
+        unsigned char model[4096];
+        unsigned char ciphertext[4096];
+        unsigned char decrypted[4096];
+        unsigned char checksums[64];
+        char label[64];
+        mirror_buffer_t *reader = mirror_buffer_init(logger, mirror_audio_key);
+        mirror_buffer_init_aes(reader, &mirror_connection_id);
+        bool consistent = true;
+        for (int step = 0; step < self_count; step++) {
+            int length = self_lengths[step];
+            /* A plaintext of its own per step, so a step that reads the wrong part of
+             * the stream cannot pass by agreeing with the step before it. */
+            sequence(plaintext, length);
+            for (int index = 0; index < length; index++) {
+                plaintext[index] = (unsigned char)(plaintext[index] ^ (step * 31));
+            }
+            /* The keystream this packet is encrypted with: what a reader of its own
+             * reads for the same length from a stream that starts where the vectors
+             * start. */
+            mirror_buffer_t *fresh = mirror_buffer_init(logger, mirror_audio_key);
+            mirror_buffer_init_aes(fresh, &mirror_connection_id);
+            memset(input, 0, sizeof(input));
+            memset(model, 0, sizeof(model));
+            mirror_buffer_decrypt(fresh, input, model, length);
+            mirror_buffer_destroy(fresh);
+
+            mirror_encrypt(plaintext, length, model, ciphertext);
+            memset(decrypted, 0, sizeof(decrypted));
+            memset(input, 0, sizeof(input));
+            memcpy(input, ciphertext, (size_t)length);
+            mirror_buffer_decrypt(reader, input, decrypted, length);
+            if (memcmp(decrypted, plaintext, (size_t)length) != 0) {
+                /* Reported as a value rather than logged: the verdict is the line
+                 * below, and a log line would need a logger this check does not have. */
+                consistent = false;
+            }
+            unsigned char checksum = 0;
+            for (int index = 0; index < length; index++) {
+                checksum = (unsigned char)(checksum + plaintext[index]);
+            }
+            checksums[step] = checksum;
+        }
+        mirror_buffer_destroy(reader);
+        emit_int("mirror.self_consistent", consistent ? 1 : 0);
+        emit("mirror.self_checksums", checksums, self_count);
     }
 
     /* And the round trip: a packet encrypted with that keystream has to come back

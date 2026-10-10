@@ -269,3 +269,95 @@ fn mirror_stream_matches_upstream() {
         );
     }
 }
+
+/// What a packet reads when it follows another one, which is what a session is.
+///
+/// This is the case the per-length vectors cannot reach, and the case this port got
+/// wrong: each of them gives every length a stream of its own, so a packet's position
+/// after the packet before it was never checked. A session desynchronised exactly
+/// there — its first packet decrypted and every later one did not.
+///
+/// The pairs are a real session's own sizes, a first packet of tens of kilobytes among
+/// them, and the answers are upstream's own decryptor read through them: the reader is
+/// given the first length, then the second, and what it read for the second is here in
+/// full. So the comparison is byte for byte and there is nothing to search for and
+/// nothing to copy wrong.
+#[test]
+#[ignore = "needs AIRPLAY_UPSTREAM_ORACLE; run tools/oracle/run.ps1"]
+fn a_packet_reads_the_keystream_the_packet_before_it_ended_at() {
+    let fields = oracle("mirror");
+    let connection_id: u64 = field(&fields, "mirror.connection_id")
+        .parse()
+        .expect("the oracle prints the connection identifier");
+    let keys = stream_keys(connection_id, &[0x5a; 16]);
+
+    let mut pairs = 0;
+    let mut differing = 0;
+    while let Some(first) = fields.get(&format!("mirror.pair_first{pairs}")) {
+        let first: usize = first.parse().expect("a length");
+        let second: usize = fields
+            .get(&format!("mirror.pair_second{pairs}"))
+            .expect("a second length")
+            .parse()
+            .expect("a length");
+        let expected = hex_of(&fields, &format!("mirror.pair_read{pairs}"));
+
+        let mut decryptor = MirrorDecryptor::new(&keys).expect("decryptor");
+        // The first packet, which the second one's position depends on.
+        let mut output = vec![0u8; first];
+        decryptor
+            .decrypt(&vec![0u8; first], &mut output)
+            .unwrap_or_else(|error| panic!("the packet of {first} bytes: {error}"));
+        // And the second, compared in full.
+        let mut output = vec![0u8; second];
+        decryptor
+            .decrypt(&vec![0u8; second], &mut output)
+            .unwrap_or_else(|error| panic!("the packet of {second} bytes after {first}: {error}"));
+        // Every pair reports where each answer sits in the stream: the rule is a number,
+        // and the two numbers side by side are the whole of the evidence.
+        let stream = MirrorDecryptor::new(&keys)
+            .expect("decryptor")
+            .keystream(0, 8192);
+        let at = |bytes: &[u8]| {
+            let head = &bytes[..64.min(bytes.len())];
+            stream
+                .windows(head.len())
+                .position(|window| window == head)
+                .map_or_else(|| "not found".to_owned(), |at| at.to_string())
+        };
+        let differs = output
+            .iter()
+            .zip(&expected)
+            .position(|(ours, theirs)| ours != theirs);
+        if let Some(at) = differs {
+            // The bytes either side of the first difference, from both sides: the shape of
+            // the difference is what says whether it is a shift, a wrong block, or a wrong
+            // carry.
+            let from = at.saturating_sub(4);
+            let to = (at + 12).min(expected.len());
+            println!("  bytes {from}..{to}: ours     {:02x?}", &output[from..to]);
+            println!(
+                "  bytes {from}..{to}: upstream {:02x?}",
+                &expected[from..to]
+            );
+        }
+        println!(
+            "pair {pairs}: first {first}, second {second}: this reads at {}, upstream at {}, \
+             {differs:?}",
+            at(&output),
+            at(&expected)
+        );
+        if differs.is_some() {
+            differing += 1;
+        }
+        pairs += 1;
+    }
+    assert_eq!(
+        differing, 0,
+        "{differing} of {pairs} pairs read a different keystream from upstream"
+    );
+    assert!(
+        pairs >= 6,
+        "the oracle printed {pairs} pairs, which is not enough to show a position rule"
+    );
+}
