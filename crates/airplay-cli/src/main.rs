@@ -196,11 +196,13 @@ fn dump_video_path() -> Option<std::path::PathBuf> {
 
 /// Where to write the audio bytes a client sends, when that has been asked for.
 ///
-/// The bytes are written as they arrive with nothing added between them: what a device
-/// sends is a sequence of frames of one coding, and the coding is the question. A file of
-/// the raw frames can be handed to a decoder this port did not write, which says what the
-/// stream is instead of what this port assumed — and audio that is received, queued and
-/// played without a sound is exactly the case where the assumption is the suspect.
+/// The bytes are written with a four-byte little-endian length in front of each payload
+/// and nothing else added: what a device sends is a sequence of frames of one coding, and
+/// the coding is the question. A file with the lengths in it can be cut back into frames,
+/// handed to a decoder this port did not write, and measured — packet sizes are what say
+/// whether a stream is constant bit rate, and a decoder that is given raw frames has no
+/// sample rate or channel count to work from, so the sizes are the thing that makes either
+/// possible.
 fn dump_audio_path() -> Option<std::path::PathBuf> {
     std::env::var_os("AIRPLAY_DUMP_AUDIO").map(std::path::PathBuf::from)
 }
@@ -600,6 +602,8 @@ async fn run() -> Result<(), String> {
                         }
                         if let Some(file) = dump_frames.as_ref().and_then(|dump| dump.lock().ok()) {
                             use std::io::Write;
+                            let length = frame.payload.len() as u32;
+                            let _ = (&*file).write_all(&length.to_le_bytes());
                             let _ = (&*file).write_all(&frame.payload);
                         }
                         let queued = airplay_renderer::AudioFrame {
