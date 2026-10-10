@@ -112,14 +112,21 @@ cargo run -p airplay-cli --features gst -- --name "Rust AirPlay Test" --port 470
 
 ## 7. 诚实清单（未验收）
 
-- 媒体：**画面已经跑通**（CTR 计数器进位修复之后，真机镜像正常）。**音频还没有被听到过**，而且**是否真的解码出声仍未验证**。
-  - 音频**路径已经接上并且不再阻塞会话**：`SETUP` 里的 `ekey/eiv` 一到达就 `open_audio`（aac-eld @ 44100），帧经**有界队列 + 专用写线程**推给 GStreamer。**这一条是"有声音就卡住"的修复**——此前 `push` 在接收循环的 `select!` 里同步写管道，管道一满就冻住 video/control/timing 三路。现在队列满时**丢帧并计数**，不会退化成卡顿。
-  - **下一步要看日志里的三行**：`first audio frame`（客户端是否真在发）、`N audio frames received`、`N audio frames played of M, K dropped`。`dropped` 持续增长 = 管线消费不过来或 caps/解码器不匹配；`played` 为 0 而 `received` 在涨 = 管线根本没吃数据（多半是 **caps 与客户端实际编码不符**，`--audio-codec alac` 可试）。
-  - 没有做**实时播放同步**：`AudioFrame.timestamp` 被带过来了，但 sink 是 `sync=false`、按管线自己的速度播，所以音频速率与实际时钟无关。这是"能出声"之后的下一步，不是现在的阻塞项。
-  - 客户端只发 `type: 110`（从不发 `type: 96`），所以音频走的是**会话级 `ekey/eiv`**，不是独立的音频流条目。
+- 媒体：**画面已经跑通**（CTR 计数器进位修复之后，真机镜像正常，用户已确认）。**音频从未出过声**，而且现在的证据表明问题**不在我们的解密，也不在编码假设**。
+  - 音频**路径已经接上并且不再阻塞会话**：`SETUP` 里的 `ekey/eiv` 一到达就 `open_audio`，帧经**有界队列 + 专用写线程**推给 GStreamer。**这一条是"有声音就卡住"的修复**（此前 `push` 在接收循环的 `select!` 里同步写管道）。队列满时**丢帧并计数**，不会退化成卡顿。
+  - **编码已确证是 AAC-ELD**：客户端在 `SETUP` 里明确写 `type 96 (ct 8 (AAC-ELD), spf 480)`（`ct` 的解析是本次新加的，此前一直是硬编码假设）。所以"用错解码器"**已被排除**。
+  - **数据已确证有效**：上游在 `raop_buffer.c:139-145` 解密后会核对首字节，合法值是 `8c/8d/8e/80/81/82`；真机 dump 里 **2081 帧全部是 `8e`(1890) 或 `8d`(191)，且前 3 位全是 `100`**（ELD 帧头）。解密算法也与上游一致（AES-CBC 每包 reset）。
+  - **仍未解决的是"把有效帧交给解码器"这一步**，而且已经试过并**失败**的路径（都有实测记录）：
+    - `decodebin` 直接吃 raw 帧 → `Internal data stream error`；
+    - 加 `aacparse` → `Output caps are unfixed`（raw AAC 不带 rate/channels）；
+    - 自己加 ADTS 头（profile 0/1/2/3 全试）→ `No valid frames decoded`；
+    - 加 ELD 的 `AudioSpecificConfig`（`f8 2c 00`）→ 同样失败；
+    - `fdkaacdec` / `avdec_aac` / `faad` / **ffmpeg** 全部拒绝；ffmpeg 给的是**语法错误**（`channel element 1.8 is not allocated`、`Reserved bit set`、`Number of bands ... exceeds limit`）。
+  - **下一步的唯一线索**：ffmpeg 的语法错误说明"按 AAC 解出来是无效语法"。值得先查的是**上游 UxPlay 实际怎么解码 ELD**（它显然能出声）——它的 macOS/Linux 渲染器（`audio_renderer` / ALSA）用的是哪个库、喂的是什么格式（含不含有 4 字节 no-data 标记、有没有额外的起始帧）。**不要再从 GStreamer 的 caps 入手猜**，那条路已经试穷。
+  - 没有做**实时播放同步**：`AudioFrame.timestamp` 带过来了，但 sink 是 `sync=false`。
 - **镜像 CTR 的计数器进位曾经丢过一次，已修复并有专门护栏**（这是"大包解不出"的真正原因）：`keystream` 的进位循环原来写成"某字节不溢出就停"，而"不溢出"≠"没有进位要传播"。这条流的 IV 末字节是 `4f`，块 `b1`（=177）使末字节变 `00` 并需要向**前一字节**进位 1——那个进位被丢掉，整条流少走 **256 块**。触发条件极窄：**只有块 177 及之后**才错，所以 177 块以内的所有向量都通过。真机 62 KB 关键帧 = 3875 块，必然踩中。
-  - **直接护栏**（比密钥流更能定位）：`oracle mirror.counter{块号}` 输出**计数器本身**；`tests/upstream_oracle.rs::the_counter_carries_through_the_whole_of_it` 用测试内**独立重写**的加法比对十个块（含 177、432、433 两个进位点）。密钥流看起来永远是随机字节，而计数器是"该是多少就是多少"。
-  - 真机：RTP 是否真的到达 data 口**尚未验证**；镜像口已确认有包到达，但**修复后还没有跑过一次真机会话**。
+  - **直接护栏**（比密钥流更能定位）：`oracle mirror.counter{块号}` 输出**计数器本身**；`tests/upstream_oracle.rs::the_counter_carries_through_the_whole_of_it` 用测试内**独立重写**的加法比对十个块（含 177、432、433 两个进位点）。
+  - 真机已验证：修复后镜像正常。RTP 是否到达 data 口仍未单独验证。
 - 时钟：时序报文层完成，**时钟算术未做且我试做后回退**（见第 8 节第 9 条）。
 - 渲染：`set_volume` 在 GStreamer 后端只记在内存里，**没有作用到运行中的管线**（要改管线属性，S4-3 做）；`flush` 是空操作（上游的语义也没读透）。
 - 平台：macOS/Linux/BSD/ARM 未构建；`mdns-sd` 仅 Windows 实测；oracle 的 `build.ps1` Linux 分支未验证；CI 从未运行。
