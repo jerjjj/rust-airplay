@@ -41,18 +41,6 @@ const MIRROR_STREAM_TYPE: u16 = 110;
 /// stall a decoder produces and far below anything a receiver would notice holding.
 const QUEUED_FRAMES: usize = 32;
 
-/// The longest a receiver waits between two frames.
-///
-/// This is the floor a frame interval is believed at: a display sends something
-/// between about fifteen and a hundred and twenty frames a second, and a device's
-/// timestamps measure tens of microseconds apart, which is not a frame rate at all.
-/// Waiting that little is the same as not waiting, and a decoder that is never waited
-/// for is a decoder that is overrun — which is a picture that is partly decoded.
-const SLOWEST_FRAME_SECONDS: f64 = 1.0 / 15.0;
-
-/// The shortest a receiver waits between two frames.
-const FASTEST_FRAME_SECONDS: f64 = 1.0 / 240.0;
-
 const USAGE: &str = "\
 rust-airplay - protocol development receiver
 
@@ -671,56 +659,40 @@ async fn run() -> Result<(), String> {
             // next frame are both blocking, and a receive loop is not a place a blocking
             // call can be — one that waits stops reading its socket, which stops the
             // client too, and the picture freezes with it.
+            // How many frames are waiting for the renderer, kept beside the queue
+            // because a channel does not say: it is the number that decides whether a
+            // picture is being kept up with or dropped.
+            let waiting = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let waiting_writer = std::sync::Arc::clone(&waiting);
             let (feed, queued) =
                 std::sync::mpsc::sync_channel::<(Vec<u8>, u64, bool)>(QUEUED_FRAMES);
             let playing = video.map(|video| {
                 std::thread::spawn(move || {
-                    let mut previous: Option<u64> = None;
                     let mut shown: u64 = 0;
                     while let Ok((data, timestamp, idr)) = queued.recv() {
+                        waiting_writer.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         // What the pacing is actually told, for the first frames: the
                         // interval a device sends is not a frame rate this port can
                         // assume, and a wrong one is a wait that stalls a picture
                         // instead of pacing it. Printed rather than silently clamped,
                         // because the number is the whole question.
-                        if shown < 5 {
-                            let raw = previous.map(|previous| {
-                                let gap = timestamp.wrapping_sub(previous);
-                                (gap >> 32) as f64 + f64::from(gap as u32) / 4_294_967_296.0
-                            });
-                            println!(
-                                "media     writer frame {}: {} bytes, interval {raw:?}",
-                                shown + 1,
-                                data.len()
-                            );
+                        if shown < 3 {
+                            println!("media     writer frame {}: {} bytes", shown + 1, data.len());
                         }
-                        if let Some(previous) = previous.replace(timestamp) {
-                            let gap = timestamp.wrapping_sub(previous);
-                            // A stream that restarts, or a screen that wakes, jumps
-                            // rather than advances; the backend caps what it will wait
-                            // anyway.
-                            if gap < u64::MAX / 2 {
-                                let seconds =
-                                    (gap >> 32) as f64 + f64::from(gap as u32) / 4_294_967_296.0;
-                                // The interval is only believed when it is one a screen
-                                // could produce. A device's timestamp is not a frame
-                                // counter — measured gaps are tens of microseconds, which
-                                // no display sends — and a wait computed from those is no
-                                // wait at all, which is how a decoder gets overrun. The
-                                // floor is what makes an unusable interval safe rather
-                                // than useless.
-                                let seconds = if (SLOWEST_FRAME_SECONDS..=FASTEST_FRAME_SECONDS)
-                                    .contains(&seconds)
-                                {
-                                    seconds
-                                } else {
-                                    SLOWEST_FRAME_SECONDS
-                                };
-                                if let Err(error) = video.set_pace(seconds) {
-                                    eprintln!("rust-airplay: the renderer cannot pace: {error}");
-                                }
-                            }
-                        }
+                        // No waiting between frames, and the interval that used to
+                        // drive one is only printed now. Waiting was this port's own
+                        // idea and it was wrong twice over: the pipeline it was
+                        // protecting measures fifty-one frames a second on the machine
+                        // it runs on, so it never needed protecting, and a wait of one
+                        // frame interval sets the rate to exactly what the client sends
+                        // — so the writer plus its own wait could only ever be slower
+                        // than the stream. The queue filled, frames were dropped, and
+                        // every later frame referred to a picture that was never
+                        // finished.
+                        //
+                        // What paces a stream is what reads it: writing to a pipeline
+                        // blocks when the pipeline is full, which is backpressure doing
+                        // the job without a guess about the client's clock.
                         if let Err(error) = video.push(airplay_renderer::VideoFrame {
                             data,
                             timestamp,
@@ -778,8 +750,17 @@ async fn run() -> Result<(), String> {
                     match feed.try_send((frame.data, frame.timestamp, frame.idr)) {
                         Ok(()) => {
                             sent += 1;
+                            waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if sent % 200 == 0 {
-                                println!("media     {sent} video frames queued for the renderer");
+                                // The depth is the number that says whether the
+                                // renderer keeps up: a queue that hovers near empty is
+                                // a pipeline reading at the rate a client sends, and
+                                // one that sits at the limit is a picture about to be
+                                // dropped.
+                                println!(
+                                    "media     {sent} video frames queued, {} waiting",
+                                    waiting.load(std::sync::atomic::Ordering::Relaxed)
+                                );
                             }
                         }
                         Err(std::sync::mpsc::TrySendError::Full(_)) => {
