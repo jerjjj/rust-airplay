@@ -660,6 +660,7 @@ async fn run() -> Result<(), String> {
                 }
             };
             let mut frames: u64 = 0;
+            let mut sent: u64 = 0;
             let mut refused = 0u64;
             // When the frame being pushed belongs, from the client's own timestamps.
             // A mirror stream is one key frame followed by frames that describe only
@@ -677,6 +678,22 @@ async fn run() -> Result<(), String> {
                     let mut previous: Option<u64> = None;
                     let mut shown: u64 = 0;
                     while let Ok((data, timestamp, idr)) = queued.recv() {
+                        // What the pacing is actually told, for the first frames: the
+                        // interval a device sends is not a frame rate this port can
+                        // assume, and a wrong one is a wait that stalls a picture
+                        // instead of pacing it. Printed rather than silently clamped,
+                        // because the number is the whole question.
+                        if shown < 5 {
+                            let raw = previous.map(|previous| {
+                                let gap = timestamp.wrapping_sub(previous);
+                                (gap >> 32) as f64 + f64::from(gap as u32) / 4_294_967_296.0
+                            });
+                            println!(
+                                "media     writer frame {}: {} bytes, interval {raw:?}",
+                                shown + 1,
+                                data.len()
+                            );
+                        }
                         if let Some(previous) = previous.replace(timestamp) {
                             let gap = timestamp.wrapping_sub(previous);
                             // A stream that restarts, or a screen that wakes, jumps
@@ -759,7 +776,12 @@ async fn run() -> Result<(), String> {
                     // sent, which is worth saying once: a frame dropped here is one the
                     // rest of the stream may depend on.
                     match feed.try_send((frame.data, frame.timestamp, frame.idr)) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            sent += 1;
+                            if sent % 200 == 0 {
+                                println!("media     {sent} video frames queued for the renderer");
+                            }
+                        }
                         Err(std::sync::mpsc::TrySendError::Full(_)) => {
                             refused += 1;
                             if refused == 1 {
