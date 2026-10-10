@@ -13,3 +13,6 @@ crates/airplay-renderer-gst/target/
 
 
 tools/oracle/probe_sequence.exe
+tools/oracle/probe_openssl_counter.exe
+tools/oracle/probe_reader_counter.exe
+tools/oracle/probe_counter.exe
