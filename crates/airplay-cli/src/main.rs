@@ -755,6 +755,17 @@ async fn run() -> Result<(), String> {
                             census.last_unknown,
                             census.not_units
                         );
+                        // The first payload a reader could not take, with the bytes it
+                        // was given: a payload that is not units is either a decryption
+                        // gone wrong or a framing this receiver does not have, and the
+                        // bytes are what says which.
+                        if let Some(bad) = &census.first_bad {
+                            println!(
+                                "media     first unreadable payload: {} bytes declared, {} read: \
+                                 {} (bytes: {})",
+                                bad.declared, bad.length, bad.error, bad.preview
+                            );
+                        }
                         last = now;
                     }
                 }

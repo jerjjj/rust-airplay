@@ -832,11 +832,18 @@ pub struct PacketCensus {
     /// The first two bytes of the first unknown packet, packed as `first << 8 | second`.
     last_unknown: std::sync::atomic::AtomicU32,
     not_units: std::sync::atomic::AtomicU64,
+    /// The first payload that was not units, with what it looked like.
+    ///
+    /// Behind a lock rather than an atomic because it is a description and not a
+    /// count, and it is written once.
+    first_bad: std::sync::Mutex<Option<PendingBadPacket>>,
 }
 
 /// A reading of a [`PacketCensus`], which is what a report prints.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub struct PacketCounts {
+    /// The first unit that could not be read, and the bytes it was read from.
+    pub first_bad: Option<PendingBadPacket>,
     /// Video packets that became frames.
     pub video: u64,
     /// Codec configurations, which are kept for the frame they belong to.
@@ -852,6 +859,36 @@ pub struct PacketCounts {
     pub not_units: u64,
 }
 
+/// What a payload that was not units looked like.
+///
+/// A payload that cannot be read as a sequence of units is either a decryption gone
+/// wrong or a framing this receiver does not have; the two are told apart by the
+/// bytes, so the first one is kept with the error that was raised on it.
+#[derive(Debug, Clone)]
+pub struct PendingBadPacket {
+    /// What the reader objected to.
+    pub error: NalError,
+    /// Bytes the payload started with, in hex.
+    pub preview: String,
+    /// Bytes the payload held.
+    pub length: usize,
+    /// The header's payload size, which is what the reader was given.
+    pub declared: u32,
+}
+
+impl PartialEq for PacketCounts {
+    fn eq(&self, other: &Self) -> bool {
+        self.video == other.video
+            && self.codec == other.codec
+            && self.reports == other.reports
+            && self.unknown == other.unknown
+            && self.last_unknown == other.last_unknown
+            && self.not_units == other.not_units
+    }
+}
+
+impl Eq for PacketCounts {}
+
 impl PacketCensus {
     /// The counts as they stand.
     pub fn read(&self) -> PacketCounts {
@@ -862,8 +899,14 @@ impl PacketCensus {
             codec: self.codec.load(Relaxed),
             reports: self.reports.load(Relaxed),
             unknown: self.unknown.load(Relaxed),
-            last_unknown: (packed != 0).then_some((((packed >> 8) & 0xff) as u8, (packed & 0xff) as u8)),
+            last_unknown: (packed != 0)
+                .then_some((((packed >> 8) & 0xff) as u8, (packed & 0xff) as u8)),
             not_units: self.not_units.load(Relaxed),
+            first_bad: self
+                .first_bad
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         }
     }
 
@@ -880,8 +923,17 @@ impl PacketCensus {
             PacketKind::Report => {
                 self.reports.fetch_add(1, Relaxed);
             }
-            PacketKind::NotUnits => {
+            PacketKind::NotUnits(described) => {
                 self.not_units.fetch_add(1, Relaxed);
+                // The first one is kept: a payload that cannot be read says what the
+                // reader was given, and every later one is the same failure.
+                let mut slot = self
+                    .first_bad
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.is_none() {
+                    *slot = Some(*described);
+                }
             }
             PacketKind::Unknown(first, second) => {
                 self.unknown.fetch_add(1, Relaxed);
@@ -898,12 +950,14 @@ impl PacketCensus {
 }
 
 /// The kinds a census counts.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum PacketKind {
     Video,
     Codec,
     Report,
-    NotUnits,
+    /// A payload that was not units, with a description of what it looked like. Boxed
+    /// because every other kind is two bytes and this one carries a preview.
+    NotUnits(Box<PendingBadPacket>),
     Unknown(u8, u8),
 }
 
@@ -976,8 +1030,15 @@ impl MirrorSession {
                     Err(error) => {
                         // Upstream marks a frame whose units do not add up and passes
                         // it on rather than ending the stream (`:533-536`), so this is
-                        // counted and reported instead of being fatal.
-                        self.dropped.count(PacketKind::NotUnits);
+                        // counted and reported instead of being fatal.                        // The bytes and the reader's objection are what a report needs,
+                        // so they are captured where the failure is known.
+                        self.dropped
+                            .count(PacketKind::NotUnits(Box::new(PendingBadPacket {
+                                error,
+                                preview: hex_preview(&data),
+                                length: data.len(),
+                                declared: payload.len() as u32,
+                            })));
                         return Err(FrameError::NotUnits(error));
                     }
                 };
@@ -1022,6 +1083,16 @@ impl MirrorSession {
             .map_err(FrameError::OffTheStream)?;
         Ok(data)
     }
+}
+
+/// The first bytes of a payload, in hex, for a report about one that could not be read.
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(32)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -1885,3 +1956,4 @@ mod tests {
         assert_eq!(first, stream_keys(1, &audio_key));
     }
 }
+
