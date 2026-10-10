@@ -194,6 +194,17 @@ fn dump_video_path() -> Option<std::path::PathBuf> {
     std::env::var_os("AIRPLAY_DUMP_VIDEO").map(std::path::PathBuf::from)
 }
 
+/// Where to write the audio bytes a client sends, when that has been asked for.
+///
+/// The bytes are written as they arrive with nothing added between them: what a device
+/// sends is a sequence of frames of one coding, and the coding is the question. A file of
+/// the raw frames can be handed to a decoder this port did not write, which says what the
+/// stream is instead of what this port assumed — and audio that is received, queued and
+/// played without a sound is exactly the case where the assumption is the suspect.
+fn dump_audio_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("AIRPLAY_DUMP_AUDIO").map(std::path::PathBuf::from)
+}
+
 /// A future that is ready when the receiver is stopping.
 ///
 /// A receiver ends with Ctrl+C, and its receive loops need to be told: a loop that outlived
@@ -537,6 +548,15 @@ async fn run() -> Result<(), String> {
                 });
                 let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                // What a device actually sends, for a decoder that is not this one to
+                // identify: a stream that is received, queued and played without a sound is
+                // one whose coding is the thing in doubt.
+                let dump_frames = dump_audio_path().map(|path| {
+                    println!("media     writing the audio bytes to {}", path.display());
+                    let file = std::fs::File::create(&path)
+                        .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+                    std::sync::Arc::new(std::sync::Mutex::new(file))
+                });
                 // What arrived, so "the client is not sending" and "we are throwing it
                 // away" cannot be confused in a log. A session that never reaches the
                 // frame counter still says which sockets were written to.
@@ -577,6 +597,10 @@ async fn run() -> Result<(), String> {
                             );
                         } else if count % 500 == 0 {
                             println!("media     {count} audio frames received");
+                        }
+                        if let Some(file) = dump_frames.as_ref().and_then(|dump| dump.lock().ok()) {
+                            use std::io::Write;
+                            let _ = (&*file).write_all(&frame.payload);
                         }
                         let queued = airplay_renderer::AudioFrame {
                             data: frame.payload,

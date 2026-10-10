@@ -275,8 +275,17 @@ impl Drop for Pipeline {
             let _ = child.wait();
         }
         // The file it wrote to goes with it: what a pipeline said is for the failure that
-        // was just reported, not for a temporary directory to accumulate.
-        let _ = std::fs::remove_file(&self.stderr);
+        // was just reported, not for a temporary directory to accumulate. A caller that
+        // asked to keep it has said it wants to read it.
+        if std::env::var_os(KEEP_STDERR_ENV).is_some() {
+            eprintln!(
+                "rust-airplay: {} left its output at {}",
+                self.program,
+                self.stderr.display()
+            );
+        } else {
+            let _ = std::fs::remove_file(&self.stderr);
+        }
     }
 }
 
@@ -286,8 +295,21 @@ impl Drop for Pipeline {
 /// reason matters, so its output goes somewhere it can all be read afterwards. A pipe
 /// nobody is reading fills and blocks the program writing to it, and a windowed
 /// application has no console to inherit, so a file is the one place that always works.
+/// Whether to keep a pipeline's output and say where it is.
+///
+/// `gst-launch-1.0 -q` is quiet about everything except what is wrong, and what is wrong
+/// with a pipeline that takes frames and makes no sound is exactly what its output says.
+/// Without this the file goes with the pipeline, which is right for a session and useless
+/// for a diagnosis.
+pub const KEEP_STDERR_ENV: &str = "AIRPLAY_GST_KEEP_STDERR";
+
 fn open_stderr() -> Result<(std::path::PathBuf, Stdio), LaunchError> {
-    let path = std::env::temp_dir().join(format!("airplay-gst-{}.log", std::process::id()));
+    // One file per pipeline and not one per process: a session runs two, and a name they
+    // would share is a name that loses whichever wrote to it first.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let which = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("airplay-gst-{}-{which}.log", std::process::id()));
     let file = std::fs::File::create(&path).map_err(|error| LaunchError::StartFailed {
         reason: format!("cannot write {}: {error}", path.display()),
     })?;
