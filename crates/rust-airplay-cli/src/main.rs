@@ -126,14 +126,16 @@ fn open_gst(options: &Options) -> Result<Arc<dyn Renderer>, String> {
     if let Some(sink) = &options.audio_sink {
         backend.audio_sink = sink.clone();
     }
+    // The sink decides the decoder: replacing one without the other would ask a software
+    // decoder to feed a sink that only takes hardware memory, or the reverse.
     if let Some(sink) = &options.video_sink {
-        backend.video_sink = sink.clone();
+        backend = backend.with_video_sink(sink);
     }
     if let Some(parser) = &options.video_parser {
-        backend.video_parser = parser.clone();
+        backend = backend.with_video_parser(parser);
     }
     if let Some(decoder) = &options.video_decoder {
-        backend.video_decoder = decoder.clone();
+        backend = backend.with_video_decoder(decoder);
     }
     if options.warm_video {
         backend.warm_video = true;

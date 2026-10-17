@@ -103,6 +103,38 @@ pub struct Options {
     pub warm_video: bool,
 }
 
+impl Options {
+    /// The same options with the video sink replaced, and the chain that sink needs.
+    ///
+    /// A decoder and a sink are one choice, not two: `d3d11h264dec` decodes into Direct3D11
+    /// memory that only `d3d11videosink` can take, and the software decoder needs a
+    /// converter in front of every other sink. A caller that changes one without the other
+    /// gets the slower path with the faster sink's name on it, which is a mistake this
+    /// method exists to make impossible.
+    #[must_use]
+    pub fn with_video_sink(mut self, sink: &str) -> Self {
+        self.video_sink = sink.to_owned();
+        let (parser, decoder) = default_video_chain(sink);
+        self.video_parser = parser;
+        self.video_decoder = decoder;
+        self
+    }
+
+    /// The same options with an explicit parser, for a stream this crate does not expect.
+    #[must_use]
+    pub fn with_video_parser(mut self, parser: &str) -> Self {
+        self.video_parser = parser.to_owned();
+        self
+    }
+
+    /// The same options with an explicit decoder chain.
+    #[must_use]
+    pub fn with_video_decoder(mut self, decoder: &str) -> Self {
+        self.video_decoder = decoder.to_owned();
+        self
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         let audio_sink = sink_from_env(AUDIO_SINK_ENV, AUDIO_SINKS);
@@ -459,6 +491,35 @@ impl VideoStream for GstVideo {
 mod tests {
     use super::{VIDEO_SINKS, default_video_chain, video_pipeline};
 
+    #[test]
+    fn changing_the_sink_changes_the_decoder_with_it() {
+        // The bug this pins: the command line replaced the sink and left the decoder at
+        // what the default sink had chosen, so the hardware sink was fed by the software
+        // decoder through a converter - the slower path wearing the faster one's name.
+        let options = super::Options::default().with_video_sink("fakesink");
+        let options_hardware = options.clone().with_video_sink("d3d11videosink");
+        assert_eq!(options_hardware.video_sink, "d3d11videosink");
+        // On a machine with the hardware decoder, the chain is the hardware one; without
+        // it, the software one is still valid. Either way the converter is only there when
+        // the decoder needs it.
+        if gstreamer::ElementFactory::find("d3d11h264dec").is_some() {
+            assert_eq!(options_hardware.video_decoder, "d3d11h264dec");
+        } else {
+            assert!(options_hardware.video_decoder.contains("avdec_h264"));
+        }
+        // And going back to a sink that cannot take hardware memory restores the converter.
+        let back = options_hardware.with_video_sink("fakesink");
+        assert!(
+            back.video_decoder.contains("avdec_h264"),
+            "{}",
+            back.video_decoder
+        );
+        assert!(
+            back.video_decoder.contains("videoconvert"),
+            "{}",
+            back.video_decoder
+        );
+    }
     #[test]
     fn a_sink_that_cannot_take_hardware_memory_gets_the_software_decoder() {
         // `d3d11h264dec` decodes into Direct3D11 memory, which nothing else can consume.
