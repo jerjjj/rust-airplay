@@ -238,6 +238,136 @@ pub struct Config {
     pub dump_audio: Option<std::path::PathBuf>,
 }
 
+/// What the two streams' first frames say about their shared clock.
+///
+/// A session has to put audio and video on one timeline before either can be scheduled,
+/// and the question that decides how is whether the two streams' timestamps count the same
+/// thing. The audio timestamp counts samples, so it is unambiguous once the rate is known;
+/// the video timestamp's unit is not written down anywhere in the protocol. Rather than
+/// assume one, this records the first frame of each stream with the moment it arrived and
+/// reports which candidate makes the two agree: if the timestamps share a clock, the
+/// difference between them and the difference between the arrivals are the same number.
+#[derive(Debug, Default)]
+struct ClockProbe {
+    audio: Option<(u64, u128)>,
+    video: Option<(u64, u128)>,
+}
+
+impl ClockProbe {
+    /// The local time now, which is what a frame's arrival is measured against.
+    fn now() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// Records the first audio frame, and reports the pair when the video side is known.
+    fn audio(&mut self, samples: u64, rate: u32) {
+        if self.audio.is_some() {
+            return;
+        }
+        let arrival = Self::now();
+        self.audio = Some((samples, arrival));
+        log::info!(
+            "clock     audio first frame: ts {} samples ({} s at {rate} Hz), arrived at {} ns",
+            samples,
+            samples as f64 / f64::from(rate.max(1)),
+            arrival
+        );
+        self.report();
+    }
+
+    /// Records the first mirror frame.
+    fn video(&mut self, timestamp: u64) {
+        if self.video.is_some() {
+            return;
+        }
+        let arrival = Self::now();
+        self.video = Some((timestamp, arrival));
+        log::info!("clock     video first frame: ts {timestamp}, arrived at {arrival} ns");
+        log::info!(
+            "clock       candidates: /90000 = {:.6} s, /1000000 = {:.6} s, /1e9 = {:.6} s, \
+             as q32.32 = {}",
+            timestamp as f64 / 90_000.0,
+            timestamp as f64 / 1_000_000.0,
+            timestamp as f64 / 1e9,
+            timestamp >> 32
+        );
+        self.report();
+    }
+
+    /// The candidate timebase that makes the two streams agree, with its residual.
+    ///
+    /// Returns `None` until both first frames have arrived. This is what a device run is
+    /// asked for: the answer goes in the log, and a session that disagrees with every
+    /// candidate has a timeline problem rather than a scheduling one.
+    fn agreement(&self) -> Option<(&'static str, f64)> {
+        let ((audio, audio_arrival), (video, video_arrival)) = (self.audio?, self.video?);
+        let observed = (video_arrival as i64 - audio_arrival as i64) as f64 / 1e9;
+        let audio_seconds = audio as f64 / 44_100.0;
+        let mut best: Option<(&'static str, f64)> = None;
+        for (name, divisor) in [
+            ("90000", 90_000.0),
+            ("1e6", 1_000_000.0),
+            ("1e9", 1e9),
+            ("27e6", 27_000_000.0),
+        ] {
+            let residual = (audio_seconds - video as f64 / divisor) - observed;
+            if best.is_none_or(|(_, lowest)| residual.abs() < lowest.abs()) {
+                best = Some((name, residual));
+            }
+        }
+        best.filter(|(_, residual)| residual.abs() < 0.05)
+    }
+
+    /// Says which candidate timebase makes the two streams agree, once both are known.
+    fn report(&self) {
+        let (Some((audio, audio_arrival)), Some((video, video_arrival))) = (self.audio, self.video)
+        else {
+            return;
+        };
+        // The audio side is taken as the reference: samples over a known rate is a time.
+        // The arrival difference is what a shared clock has to reproduce.
+        let observed = (video_arrival as i64 - audio_arrival as i64) as f64 / 1e9;
+        let audio_seconds = audio as f64 / 44_100.0;
+        log::info!(
+            "clock     the two first frames arrived {:.6} s apart, and their timestamps \
+             differ by {:.6} s at the audio rate",
+            observed,
+            audio_seconds - video as f64 / 90_000.0
+        );
+        for (name, divisor) in [
+            ("90000", 90_000.0),
+            ("1e6", 1_000_000.0),
+            ("1e9", 1e9),
+            ("27e6", 27_000_000.0),
+        ] {
+            let video_seconds = video as f64 / divisor;
+            let residual = (audio_seconds - video_seconds) - observed;
+            log::info!(
+                "clock       if the video clock is {name} Hz: residual {:+.6} s{}",
+                residual,
+                if residual.abs() < 0.05 {
+                    "  <- agrees"
+                } else {
+                    ""
+                }
+            );
+        }
+        match self.agreement() {
+            Some((name, residual)) => log::info!(
+                "clock     the two streams share a clock: video counts {name} Hz \
+                 (residual {:+.6} s)",
+                residual
+            ),
+            None => log::info!(
+                "clock     no candidate timebase makes the two agree: the streams do \
+                 not share a timestamp domain"
+            ),
+        }
+    }
+}
 /// Why a receiver could not start, or could not go on.
 #[derive(Debug, Clone)]
 pub struct Error {
@@ -476,9 +606,12 @@ pub async fn run(config: Config) -> Result<(), Error> {
     // The client's clock, as the timing exchange establishes it. Written by the exchange
     // and read by anything that has to know when a client timestamp happens here.
     let clock = Arc::new(Mutex::new(crate::media::timing::RemoteClock::new()));
+    // What the first frame of each stream says about the timeline they will share.
+    let probe = Arc::new(Mutex::new(ClockProbe::default()));
     let audio_sockets = Arc::clone(&media);
     let audio_stop = audio_stop.clone();
     let audio_flush_task = Arc::clone(&audio_flush);
+    let audio_probes = Arc::clone(&probe);
     tokio::spawn(async move {
         tokio::select! {
             _ = stopped(audio_stop.clone()) => {}
@@ -538,6 +671,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 let timing_sockets = Arc::clone(&audio_sockets);
                 let timing_stop = audio_stop.clone();
                 let timing_clock = Arc::clone(&clock);
+                let audio_probe = audio_probes;
+                let audio_rate = crate::AudioConfig::default().sample_rate;
                 tokio::spawn(async move {
                     let Ok(target) = timing_ready.await else {
                         return;
@@ -628,6 +763,9 @@ pub async fn run(config: Config) -> Result<(), Error> {
                                 frame.sequence,
                                 frame.timestamp
                             );
+                            if let Ok(mut probe) = audio_probe.lock() {
+                                probe.audio(u64::from(frame.timestamp), audio_rate);
+                            }
                         } else if count % 500 == 0 {
                             log::info!("media     {count} audio frames received");
                         }
@@ -716,6 +854,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let mirror_sockets = Arc::clone(&media);
     let mirror_renderer = Arc::clone(&renderer);
     let mirror_stop = stopping.clone();
+    let mirror_probe = Arc::clone(&probe);
     tokio::spawn(async move {
         // The listener accepts from the moment the receiver is up, which is not the
         // moment it has keys: a device may open the mirror connection before the
@@ -1003,6 +1142,9 @@ pub async fn run(config: Config) -> Result<(), Error> {
                             frame.idr,
                             frame.timestamp
                         );
+                        if let Ok(mut probe) = mirror_probe.lock() {
+                            probe.video(frame.timestamp);
+                        }
                     } else if frames % 200 == 0 {
                         log::info!("media     {frames} video frames received");
                     }
@@ -1271,4 +1413,28 @@ pub async fn run(config: Config) -> Result<(), Error> {
         .await;
     advertiser.unregister().ok();
     result.map_err(|error| Error::from(format!("the service stopped: {error}")))
+}
+#[cfg(test)]
+mod tests {
+    use super::ClockProbe;
+
+    #[test]
+    fn a_ninety_kilohertz_video_clock_is_recognised() {
+        // Audio at 44.1 kHz and video at 90 kHz describe the same instants if the numbers
+        // are what they claim: one second of samples is 44100, and one second of the video
+        // clock is 90000. The arrivals have to tell the same story.
+        let mut probe = ClockProbe {
+            audio: Some((44_100, 1_000_000_000)),
+            video: Some((90_000, 1_000_000_000)),
+        };
+        let (name, residual) = probe.agreement().expect("the two agree");
+        assert_eq!(name, "90000");
+        assert!(residual.abs() < 1e-9, "residual {residual}");
+
+        // A stream that starts later has to be described by its timestamp, not by when it
+        // arrived: two seconds of arrival difference and one second of timestamp
+        // difference is a disagreement, and the probe must not claim otherwise.
+        probe.audio = Some((44_100 * 2, 1_000_000_000));
+        assert!(probe.agreement().is_none());
+    }
 }
