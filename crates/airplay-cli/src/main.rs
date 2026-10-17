@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Locks a lock this process shares, ignoring poisoning.
 ////// A callback that panicked once must not turn every later connection into a
@@ -40,6 +40,89 @@ const MIRROR_STREAM_TYPE: u16 = 110;
 /// on. Thirty-two frames is about a second of a screen, which is longer than any
 /// stall a decoder produces and far below anything a receiver would notice holding.
 const QUEUED_FRAMES: usize = 32;
+
+/// Frames waiting for the renderer, where a full queue drops the **oldest**.
+///
+/// A channel would be the obvious thing and it is wrong here. `SyncSender` refuses the
+/// newest frame when it is full, so the frames it already holds are the ones that stay
+/// queued — the renderer works through a picture that is a second old while the client
+/// keeps sending, and what grows is exactly how far behind the screen is.
+///
+/// Dropping the oldest bounds the lag at the queue's depth instead. The picture cost is
+/// the same either way — a frame the rest of the stream depends on is gone — but the
+/// receiver no longer also drifts further behind the thing it is mirroring.
+#[derive(Debug)]
+struct FreshestFrames {
+    state: Mutex<Frames>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Frames {
+    queued: std::collections::VecDeque<(Vec<u8>, u64, bool)>,
+    /// Set when no more frames will arrive, which is what wakes the writer for the last
+    /// time.
+    ended: bool,
+    /// How many frames were dropped to keep the queue at its depth.
+    dropped: u64,
+}
+
+impl FreshestFrames {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(Frames::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Adds a frame, dropping the oldest when the queue is full.
+    ///
+    /// Returns how many are waiting afterwards, so a caller can report a depth without
+    /// asking a second question.
+    fn put(&self, frame: (Vec<u8>, u64, bool)) -> usize {
+        let mut state = lock(&self.state);
+        if state.ended {
+            return 0;
+        }
+        if state.queued.len() >= QUEUED_FRAMES {
+            state.queued.pop_front();
+            state.dropped += 1;
+        }
+        state.queued.push_back(frame);
+        let depth = state.queued.len();
+        drop(state);
+        self.ready.notify_one();
+        depth
+    }
+
+    /// Takes the next frame, waiting until there is one or the queue has ended.
+    fn take(&self) -> Option<(Vec<u8>, u64, bool)> {
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(frame) = state.queued.pop_front() {
+                return Some(frame);
+            }
+            if state.ended {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Says that no more frames are coming, and wakes whoever is waiting.
+    fn end(&self) {
+        lock(&self.state).ended = true;
+        self.ready.notify_all();
+    }
+
+    /// How many frames were dropped to keep the queue at its depth.
+    fn dropped(&self) -> u64 {
+        lock(&self.state).dropped
+    }
+}
 
 /// How many audio frames a writer thread will hold before frames start being dropped.
 ///
@@ -764,15 +847,12 @@ async fn run() -> Result<(), String> {
             // How many frames are waiting for the renderer, kept beside the queue
             // because a channel does not say: it is the number that decides whether a
             // picture is being kept up with or dropped.
-            let waiting = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let waiting_writer = std::sync::Arc::clone(&waiting);
-            let (feed, queued) =
-                std::sync::mpsc::sync_channel::<(Vec<u8>, u64, bool)>(QUEUED_FRAMES);
+            let feed = std::sync::Arc::new(FreshestFrames::new());
+            let queued = std::sync::Arc::clone(&feed);
             let playing = video.map(|video| {
                 std::thread::spawn(move || {
                     let mut shown: u64 = 0;
-                    while let Ok((data, timestamp, idr)) = queued.recv() {
-                        waiting_writer.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    while let Some((data, timestamp, idr)) = queued.take() {
                         // What the pacing is actually told, for the first frames: the
                         // interval a device sends is not a frame rate this port can
                         // assume, and a wrong one is a wait that stalls a picture
@@ -955,44 +1035,34 @@ async fn run() -> Result<(), String> {
                             let _ = file.write_all(&frame.data);
                         }
                     }
-                    // A queue that is full means the picture is behind what a client
-                    // sent, which is worth saying once: a frame dropped here is one the
-                    // rest of the stream may depend on.
-                    match feed.try_send((frame.data, frame.timestamp, frame.idr)) {
-                        Ok(()) => {
-                            sent += 1;
-                            waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if sent % 200 == 0 {
-                                // The depth is the number that says whether the
-                                // renderer keeps up: a queue that hovers near empty is
-                                // a pipeline reading at the rate a client sends, and
-                                // one that sits at the limit is a picture about to be
-                                // dropped.
-                                println!(
-                                    "media     {sent} video frames queued, {} waiting",
-                                    waiting.load(std::sync::atomic::Ordering::Relaxed)
-                                );
-                            }
-                        }
-                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                            refused += 1;
-                            if refused == 1 {
-                                eprintln!(
-                                    "rust-airplay: the renderer is {QUEUED_FRAMES} frames behind; \
-                                     frames are being dropped and the picture will be incomplete"
-                                );
-                            }
-                        }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                    // A full queue means the picture is behind what a client sent. The
+                    // oldest frame goes rather than the newest, so the lag stays at the
+                    // queue's depth instead of growing: what the renderer gets is always
+                    // the most recent frames there are. It is said once, because either
+                    // way a dropped frame is one the rest of the stream may depend on.
+                    sent += 1;
+                    let depth = feed.put((frame.data, frame.timestamp, frame.idr));
+                    if refused == 0 && depth >= QUEUED_FRAMES {
+                        refused = 1;
+                        eprintln!(
+                            "rust-airplay: the renderer is {QUEUED_FRAMES} frames behind; \
+                             frames are being dropped and the picture will be incomplete"
+                        );
+                    }
+                    if sent % 200 == 0 {
+                        println!("media     {sent} video frames queued, {depth} waiting");
                     }
                 })
                 .await;
             // Dropping the queue is what ends the writer, and waiting for it is what
             // makes the count below the frames that were actually handed over.
-            drop(feed);
+            feed.end();
             if let Some(playing) = playing {
                 match playing.join() {
-                    Ok(shown) => println!("media     {shown} video frames shown of {frames}"),
+                    Ok(shown) => println!(
+                        "media     {shown} video frames shown of {frames}, {} dropped to keep up",
+                        feed.dropped()
+                    ),
                     Err(_) => eprintln!("rust-airplay: the video thread ended unexpectedly"),
                 }
             }

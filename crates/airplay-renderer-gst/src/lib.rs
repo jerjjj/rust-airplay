@@ -254,9 +254,36 @@ fn video_pipeline(sink: &str) -> String {
     // H.264 because that is what this port can read: `CodecConfig` parses an `avcC`, and
     // none of the port handles an `hvcC`.
     format!(
-        "fdsrc ! queue ! h264parse ! avdec_h264 ! videoconvert ! \
-         video/x-raw,format=I420 ! {sink} sync=false"
+        "fdsrc ! h264parse ! {} ! {sink} sync=false",
+        video_decoder(sink)
     )
+}
+
+/// The decoder chain for `sink`.
+///
+/// A hardware decoder is measured at about twice the speed of the software one here —
+/// thirty real frames into `d3d11videosink` took 1106 ms through `d3d11h264dec` against
+/// 1459 ms through `avdec_h264` plus a converter — and the difference matters because a
+/// client sends roughly thirty-six frames a second. When a decoder cannot keep up, the
+/// queue in front of it fills and frames are dropped, and every frame after a dropped one
+/// may decode wrongly until the next key frame.
+///
+/// It is used only when it can be: `d3d11h264dec` decodes into Direct3D11 memory, which
+/// only `d3d11videosink` can take, so any other sink gets the software decoder and a
+/// converter. Selecting on the element actually being present keeps a machine without the
+/// plugin on the path that works rather than on one that fails when a client connects.
+fn video_decoder(sink: &str) -> String {
+    if sink == "d3d11videosink" {
+        // The registry has to be up before it can be asked what it holds, and this runs
+        // while the renderer is being built — before any stream has initialised anything.
+        // `init` is idempotent, so the audio path calling it again costs nothing.
+        let _ = gstreamer::init();
+    }
+    if sink == "d3d11videosink" && gstreamer::ElementFactory::find("d3d11h264dec").is_some() {
+        "d3d11h264dec".to_owned()
+    } else {
+        "avdec_h264 ! videoconvert ! video/x-raw,format=I420".to_owned()
+    }
 }
 
 impl Renderer for GstRenderer {
@@ -350,5 +377,35 @@ impl VideoStream for GstVideo {
         // one start quickly. `/FLUSH` still has somewhere to go — `flush` above — and the
         // decoder resynchronises on the next session's first key frame.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VIDEO_SINKS, video_decoder, video_pipeline};
+
+    #[test]
+    fn a_sink_that_cannot_take_hardware_memory_gets_the_software_decoder() {
+        // `d3d11h264dec` decodes into Direct3D11 memory, which nothing else can consume.
+        // Handing it to another sink would fail where a client connects rather than here.
+        let chain = video_decoder("fakesink");
+        assert!(chain.contains("avdec_h264"), "{chain}");
+        assert!(chain.contains("videoconvert"), "{chain}");
+        assert!(!chain.contains("d3d11h264dec"), "{chain}");
+    }
+
+    #[test]
+    fn every_pipeline_names_a_parser_and_a_decoder() {
+        // Not `decodebin`: measured at half the throughput of the named pair (see
+        // `video_pipeline`), and upstream does not use it either.
+        for sink in VIDEO_SINKS {
+            let pipeline = video_pipeline(sink);
+            assert!(pipeline.contains("h264parse"), "{pipeline}");
+            assert!(
+                pipeline.contains("d3d11h264dec") || pipeline.contains("avdec_h264"),
+                "{pipeline}"
+            );
+            assert!(!pipeline.contains("decodebin"), "{pipeline}");
+        }
     }
 }
