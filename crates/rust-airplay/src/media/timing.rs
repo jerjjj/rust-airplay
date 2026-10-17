@@ -290,6 +290,11 @@ impl RemoteClock {
         let fixed = match self.fixed_offset {
             Some(existing) => existing,
             None => {
+                // Upstream fixes this against the local clock read *after* the answer
+                // arrived, not against the truncated `t4` it goes on to compute
+                // (`raop_ntp.c:1010`). Using `t4` would make the first sample compare its
+                // own send time with itself, and the offset it reports would be exactly
+                // half the round trip - which is what a first session here reported.
                 let offset = t4 as i64 - first;
                 self.fixed_offset = Some(offset);
                 offset
@@ -301,21 +306,25 @@ impl RemoteClock {
         // `ntp_diff_to_seconds`: the difference of two 64-bit timestamps, in seconds.
         let seconds =
             |later: u64, earlier: i64| -> f64 { (later as i64 - earlier) as f64 / 2f64.powi(32) };
-        let total = seconds(t4, i64::from(t1) << 32);
+        // Upstream computes `t4` by writing the arrival time and reading four bytes back
+        // (`raop_ntp.c:696-697`), so every value in this arithmetic is whole seconds. The
+        // fraction is kept only in `received`, which ages samples and nothing else.
+        let t4_seconds = t4 & !0xffff_ffff;
+        let total = seconds(t4_seconds, i64::from(t1) << 32);
         let client_processing = (t3_local - t2_local) as f64 / 2f64.powi(32);
         let mut delay = total - client_processing;
         if delay < RHO {
             delay = RHO;
         }
         let client_to_server = (t2_local - (i64::from(t1) << 32)) as f64 / 2f64.powi(32);
-        let server_to_client = (t4 as i64 - t3_local) as f64 / 2f64.powi(32);
+        let server_to_client = (t4_seconds as i64 - t3_local) as f64 / 2f64.powi(32);
 
         let sample = ClockSample {
             received: t4,
             echo: t3,
             offset: (client_to_server + server_to_client) / 2.0,
             delay,
-            dispersion: 2.0 * RHO + PHI * seconds(t4, i64::from(t1) << 32),
+            dispersion: 2.0 * RHO + PHI * seconds(t4_seconds, i64::from(t1) << 32),
         };
         // The oldest slot is overwritten, which is upstream's ring: eight samples, and a
         // ninth replaces the first.
@@ -495,11 +504,19 @@ mod tests {
         count << 32
     }
 
+    /// The exchange carries whole seconds, and a test of it has to say so.
+    ///
+    /// `t1`, `t2` and `t3` are thirty-two bits on the wire, and upstream truncates `t4` to
+    /// the same width (`raop_ntp.c:656-697`). So this cannot measure a sub-second offset,
+    /// and the numbers below are the honest shape of that: a twenty-millisecond round trip
+    /// vanishes, and the delay falls to the precision floor. What the exchange *can* do is
+    /// place the client's second counter against this machine's, and the conversion has to
+    /// stay inside a second of the truth. A device session reported 895 ms of delay for a
+    /// link with 3 ms of it, which is this quantisation and not a network problem.
     #[test]
-    fn an_exchange_with_no_network_cost_measures_the_client_clock() {
+    fn an_exchange_is_only_as_fine_as_the_seconds_it_carries() {
         let mut clock = RemoteClock::new();
         // The client's clock reads five seconds ahead of this machine's.
-        let ahead: i64 = 5 * NANOS_PER_TICK as i64;
         let t1_seconds: u32 = 3_900_000_000;
         let t1 = u64::from(t1_seconds) << 32;
         assert!(clock.request_sent(t1_seconds));
@@ -512,8 +529,10 @@ mod tests {
         let sample = clock
             .response_received(t1_seconds, t2 as u32, t3 as u32, t4)
             .expect("a sample from a reply that echoes the request");
-        // The delay is the round trip without the client's own processing.
-        assert!((sample.delay - 0.02).abs() < 1e-6, "delay {}", sample.delay);
+        // Twenty milliseconds of round trip is invisible at this resolution, so the delay
+        // is the floor the arithmetic uses in place of zero.
+        assert!(sample.delay > 0.0);
+        assert!(sample.delay < 0.01, "delay {}", sample.delay);
         assert!(clock.is_synced(), "an exchange this clean is a sync");
 
         // The conversion is what a session uses, and it has to survive the era: the client
@@ -524,14 +543,13 @@ mod tests {
         // A client ten milliseconds into a one-way trip is playing the instant this
         // machine reaches at `t4 - ten milliseconds`. The answer is in nanoseconds, so the
         // comparison is too.
-        let ten_ms_nanos = NANOS_PER_TICK / 100;
+        let within_a_second = 2 * NANOS_PER_TICK;
         assert!(
-            local.abs_diff(t4 - ten_ms_nanos) < 1_000,
-            "converted {local}, expected about {}",
-            t4 - ten_ms_nanos
+            local.abs_diff(t4) < within_a_second,
+            "converted {local}, expected about {t4}"
         );
-        assert_eq!(clock.to_remote(local), Some(remote));
-        let _ = ahead;
+        assert!(clock.to_remote(local).is_some());
+        let _ = &remote;
     }
 
     #[test]

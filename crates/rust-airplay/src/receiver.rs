@@ -679,11 +679,14 @@ pub async fn run(config: Config) -> Result<(), Error> {
                             // a schedule is built on, and a wrong one is invisible later.
                             log::info!(
                                 "media     clock offset {:+.3} ms, delay {:.3} ms, \
-                                 root distance {:.3} ms, synced {}",
+                                 root distance {:.3} ms, synced {}, raw t1 {} t2 {} t3 {}",
                                 clock.offset_nanos() as f64 / 1e6,
                                 sample.delay * 1e3,
                                 clock.root_distance_nanos() as f64 / 1e6,
-                                clock.is_synced()
+                                clock.is_synced(),
+                                response.t1,
+                                response.t2,
+                                response.t3
                             );
                         } else if seen == 0 {
                             log::debug!("media     timing answer ignored: not an answer to a request");
