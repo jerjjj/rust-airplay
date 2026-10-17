@@ -251,6 +251,10 @@ pub struct Config {
 struct ClockProbe {
     audio: Option<(u64, u128)>,
     video: Option<(u64, u128)>,
+    /// The previous mirror frame, for the tick rate its deltas imply.
+    video_previous: Option<(u64, u128)>,
+    /// How many mirror frames have been measured, so the log stays short.
+    video_measured: u32,
 }
 
 impl ClockProbe {
@@ -278,6 +282,35 @@ impl ClockProbe {
         self.report();
     }
 
+    /// Measures the mirror stream's tick rate from two frames.
+    ///
+    /// The absolute epoch of a mirror timestamp is the start of the stream, which this
+    /// receiver has no independent measure of, so comparing it with anything else is
+    /// meaningless. What it does describe is how much time passed between two frames, and
+    /// dividing that by the time the two frames actually arrived apart gives the rate in
+    /// ticks per second. Three frames are measured and the median-ish middle one is what
+    /// the log reports, because one measurement of a network arrival is not a measurement.
+    fn video_tick_rate(&mut self, timestamp: u64) {
+        let arrival = Self::now();
+        let Some((previous, previous_arrival)) = self.video_previous.replace((timestamp, arrival))
+        else {
+            return;
+        };
+        self.video_measured += 1;
+        if self.video_measured > 4 {
+            return;
+        }
+        let ticks = timestamp.saturating_sub(previous) as f64;
+        let seconds = (arrival as i64 - previous_arrival as i64) as f64 / 1e9;
+        if seconds <= 0.0 || ticks <= 0.0 {
+            return;
+        }
+        log::info!(
+            "clock     video delta {ticks:.0} ticks in {seconds:.6} s -> {:.0} Hz",
+            ticks / seconds
+        );
+    }
+
     /// Records the first mirror frame.
     fn video(&mut self, timestamp: u64) {
         if self.video.is_some() {
@@ -286,6 +319,7 @@ impl ClockProbe {
         let arrival = Self::now();
         self.video = Some((timestamp, arrival));
         log::info!("clock     video first frame: ts {timestamp}, arrived at {arrival} ns");
+        self.video_previous = Some((timestamp, arrival));
         log::info!(
             "clock       candidates: /90000 = {:.6} s, /1000000 = {:.6} s, /1e9 = {:.6} s, \
              as q32.32 = {}",
@@ -816,8 +850,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
                             // exchange in a quiet room and worth seeing: the offset is what
                             // a schedule is built on, and a wrong one is invisible later.
                             log::info!(
-                                "media     clock offset {:+.3} ms, delay {:.3} ms, \
-                                 root distance {:.3} ms, synced {}, raw t1 {} t2 {} t3 {}",
+                                "media     clock epoch {:+.3} s (client to local), \
+                                 residual {:+.3} ms, delay {:.3} ms, root distance {:.3} ms, \
+                                 synced {}, raw t1 {} t2 {} t3 {}",
+                                clock.fixed_offset_nanos().unwrap_or(0) as f64 / 1e9,
                                 clock.offset_nanos() as f64 / 1e6,
                                 sample.delay * 1e3,
                                 clock.root_distance_nanos() as f64 / 1e6,
@@ -1145,6 +1181,12 @@ pub async fn run(config: Config) -> Result<(), Error> {
                         if let Ok(mut probe) = mirror_probe.lock() {
                             probe.video(frame.timestamp);
                         }
+                    } else if frames <= 5 {
+                        // The rate is what turns a timestamp into a play time, and it is
+                        // measured rather than assumed.
+                        if let Ok(mut probe) = mirror_probe.lock() {
+                            probe.video_tick_rate(frame.timestamp);
+                        }
                     } else if frames % 200 == 0 {
                         log::info!("media     {frames} video frames received");
                     }
@@ -1426,6 +1468,7 @@ mod tests {
         let mut probe = ClockProbe {
             audio: Some((44_100, 1_000_000_000)),
             video: Some((90_000, 1_000_000_000)),
+            ..ClockProbe::default()
         };
         let (name, residual) = probe.agreement().expect("the two agree");
         assert_eq!(name, "90000");
