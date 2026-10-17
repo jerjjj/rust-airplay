@@ -469,8 +469,13 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let (mirror_keys, mirror_ready) =
         tokio::sync::watch::channel::<Option<crate::media::mirror::StreamKeys>>(None);
     let mirror_keys = Arc::new(Mutex::new(mirror_keys));
+    // Where the audio task publishes its flush handle once a session starts, so that a
+    // `FLUSH` reaching any control connection can clear that session's window.
+    let audio_flush: Arc<Mutex<Option<crate::media::audio::FlushHandle>>> =
+        Arc::new(Mutex::new(None));
     let audio_sockets = Arc::clone(&media);
     let audio_stop = audio_stop.clone();
+    let audio_flush_task = Arc::clone(&audio_flush);
     tokio::spawn(async move {
         tokio::select! {
             _ = stopped(audio_stop.clone()) => {}
@@ -480,6 +485,11 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 };
                 let stream = open_audio(&audio_renderer, audio_codec);
                 let mut session = crate::media::ports::session(key, iv);
+                // Published before the first datagram, so a `FLUSH` that arrives early is
+                // not lost: the slot holds the request until the session applies it.
+                if let Ok(mut slot) = audio_flush_task.lock() {
+                    *slot = Some(session.flush_handle());
+                }
                 // Audio is pushed by a thread of its own, for the same reason video is:
                 // writing to a pipeline blocks when the pipeline is full, and a write that
                 // blocks inside the receive loop stops everything that loop is watching —
@@ -1025,6 +1035,15 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 // Cloned per connection: the callback is moved into the handler that
                 // reports a verified client, and that handler runs once per session.
                 let on_client = on_client.clone();
+                // A flush carries the sequence the client wants to resume at, so a
+                // handler can flush the session that is already playing.
+                let flushing = Arc::clone(&audio_flush);
+                handlers.set_flush_callback(move |next| {
+                    log::info!("media     the client flushed, resuming at sequence {next}");
+                    if let Some(handle) = flushing.lock().ok().and_then(|slot| slot.clone()) {
+                        handle.request(next);
+                    }
+                });
                 let media_key = Arc::clone(&media_key);
                 let mirror_keys = Arc::clone(&mirror_keys);
                 let timing_target = Arc::clone(&timing_target);

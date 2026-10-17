@@ -17,10 +17,14 @@ fn audio_record_matches_the_upstream_fields() {
     assert_eq!(advertisement.port, 7000);
     assert_eq!(advertisement.raop_name, "AABBCCDDEEFF@Receiver");
     let txt = &advertisement.raop_txt;
+    // The expected values are what a running UxPlay 1.74 advertises, read back with
+    // `dns-sd`, with one deliberate difference: `cn` lists the codings this receiver can
+    // decode rather than the four upstream lists, because offering a coding no renderer
+    // here takes produces noise at the client with no way for it to notice.
     for (key, value) in [
         ("txtvers", "1"),
         ("ch", "2"),
-        ("cn", "0,1,2,3"),
+        ("cn", "1,3"),
         ("da", "true"),
         ("et", "0,3,5"),
         ("vv", "2"),

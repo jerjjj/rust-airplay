@@ -343,6 +343,8 @@ pub struct RouteHandlers {
     identity: DeviceIdentity,
     fairplay: FairPlaySession,
     feedback: Option<Box<dyn FnMut() + Send>>,
+    /// What a FLUSH does, if the caller wants to do anything.
+    flush: Option<Box<dyn FnMut(u16) + Send>>,
     pairing: Option<PairingSession>,
     setup_ports: SetupPorts,
     /// The peer of the connection whose `SETUP` is being served, which is where
@@ -369,6 +371,7 @@ impl RouteHandlers {
             identity,
             fairplay: FairPlaySession::new(),
             feedback: None,
+            flush: None,
             pairing: None,
             setup_ports: SetupPorts::default(),
             peer: None,
@@ -438,11 +441,41 @@ impl RouteHandlers {
     /// Sets the callback reported for `POST /feedback`.
     ///
     /// Upstream's handler only calls `conn_feedback`
-    /// (`upstream/UxPlay/lib/raop_handlers.h:1204-1213`), which is how a
-    /// receiver notices that a client is still there; the response is the
-    /// default `200 OK`.
+    /// (`upstream/UxPlay/lib/raop_handlers.h:1204-1213`), which is how a receiver notices
+    /// that a client is still there; the response is the default `200 OK`.
     pub fn set_feedback_callback(&mut self, callback: impl FnMut() + Send + 'static) {
         self.feedback = Some(Box::new(callback));
+    }
+
+    /// Answers `FLUSH`, naming the sequence the client wants to resume at.
+    ///
+    /// Upstream reads `RTP-Info` for `seq=` and hands that number to its audio thread
+    /// (`upstream/UxPlay/lib/raop_handlers.h`, `raop_handler_flush`). A request without
+    /// it still flushes: what is buffered is stale either way, and the next packet that
+    /// arrives re-establishes the sequence.
+    fn flush(&mut self, request: &RouteRequest<'_>) -> RouteReply {
+        let next = request
+            .head
+            .header("rtp-info")
+            .and_then(|value| {
+                value
+                    .split(';')
+                    .find_map(|part| part.trim().strip_prefix("seq="))
+            })
+            .and_then(|seq| seq.trim().parse::<u16>().ok())
+            .unwrap_or_default();
+        if let Some(callback) = self.flush.as_mut() {
+            callback(next);
+        }
+        RouteReply::ok()
+    }
+
+    /// Sets what a `FLUSH` does.
+    ///
+    /// The request names the sequence number the client considers playable next. A
+    /// receiver that ignores it plays back whatever it buffered before the pause.
+    pub fn set_flush_callback(&mut self, callback: impl FnMut(u16) + Send + 'static) {
+        self.flush = Some(Box::new(callback));
     }
 }
 
@@ -465,6 +498,7 @@ impl RouteHandler for RouteHandlers {
             Route::Setup => Some(self.setup(request)),
             Route::SetParameter => Some(self.set_parameter(request)),
             Route::GetParameter => Some(self.get_parameter(request)),
+            Route::Flush => Some(self.flush(request)),
             _ => None,
         }
     }

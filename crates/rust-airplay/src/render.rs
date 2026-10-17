@@ -32,6 +32,26 @@ pub enum AudioCodec {
 }
 
 impl AudioCodec {
+    /// Every coding this receiver can decode.
+    ///
+    /// The `cn` record in the mDNS text record is built from this list, so a client is
+    /// only offered codings that a renderer here can actually take. The list is short on
+    /// purpose: a receiver that advertises PCM or plain AAC and then feeds those frames
+    /// to an ELD decoder produces noise, and a client has no way to notice.
+    pub const ALL: [Self; 2] = [Self::Alac, Self::AacEld];
+
+    /// The number this coding is known by in the `cn` record.
+    ///
+    /// `0` is PCM, `1` ALAC, `2` AAC and `3` AAC-ELD
+    /// (`upstream/UxPlay/lib/dnssdint.h`, `RAOP_CN`).
+    #[must_use]
+    pub fn codec_number(self) -> u8 {
+        match self {
+            Self::Alac => 1,
+            Self::AacEld => 3,
+        }
+    }
+
     /// The name GStreamer and FFmpeg know this coding by, which a backend needs for
     /// its pipeline and a log needs to be readable.
     pub fn name(self) -> &'static str {
@@ -80,6 +100,13 @@ impl Volume {
     /// Full volume, which is what a session starts at: a client that says nothing
     /// about volume is not asking for silence.
     pub const FULL: Self = Self(1.0);
+
+    /// The volume as a number from `0.0` to `1.0`, which is what a backend's own volume
+    /// control takes.
+    #[must_use]
+    pub fn fraction(self) -> f64 {
+        self.0
+    }
 
     /// A volume, clamped to the range a client can ask for.
     ///

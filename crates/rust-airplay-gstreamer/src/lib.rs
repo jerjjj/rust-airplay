@@ -92,6 +92,11 @@ pub struct GstRenderer {
     audio_sink: String,
     video_sink: String,
     volume: Mutex<Volume>,
+    /// The volume element of the audio stream that is playing, when there is one.
+    ///
+    /// A client's volume can change mid-session, and a pipeline started before the change
+    /// would otherwise keep playing at the volume it opened with.
+    live_audio: Mutex<Option<gstreamer::Element>>,
     /// The video pipeline a session reuses instead of starting its own.
     ///
     /// Held across sessions on purpose: this is the window and the decoder, and dropping
@@ -114,6 +119,7 @@ impl GstRenderer {
             audio_sink: sink_from_env(AUDIO_SINK_ENV, AUDIO_SINKS),
             video_sink: sink_from_env(VIDEO_SINK_ENV, VIDEO_SINKS),
             volume: Mutex::new(Volume::FULL),
+            live_audio: Mutex::new(None),
             warm_video: Mutex::new(None),
         };
         if warming() {
@@ -141,6 +147,7 @@ impl GstRenderer {
             audio_sink: audio_sink.to_owned(),
             video_sink: video_sink.to_owned(),
             volume: Mutex::new(Volume::FULL),
+            live_audio: Mutex::new(None),
             warm_video: Mutex::new(None),
         })
     }
@@ -218,17 +225,7 @@ fn unavailable(error: LaunchError) -> RenderError {
     }
 }
 
-/// What plays the audio stream, and the only thing this backend does not run as a
-/// subprocess.
-///
-/// [`audio`] says why: a raw AAC-ELD frame has no sync word and no sample rate of its own,
-/// so a decoder can only be given these frames one buffer at a time, and a `gst-launch`
-/// pipeline fed bytes on stdin cannot say where a frame ends.
-fn open_audio(config: AudioConfig, sink: &str) -> Result<Box<dyn AudioStream>, RenderError> {
-    Ok(Box::new(audio::GstAudio::open(config, sink)?))
-}
 /// The pipeline one video stream runs.
-///
 /// A mirror stream carries H.264 or H.265 depending on what the device sends and
 /// what the receiver advertised, and the two need different parsers and decoders.
 /// `decodebin` picks them from what arrives, which is what makes one pipeline serve
@@ -288,7 +285,12 @@ fn video_decoder(sink: &str) -> String {
 
 impl Renderer for GstRenderer {
     fn open_audio(&self, config: AudioConfig) -> Result<Box<dyn AudioStream>, RenderError> {
-        open_audio(config, &self.audio_sink)
+        let volume = self.volume().fraction();
+        let stream = audio::GstAudio::open(config, &self.audio_sink, volume)?;
+        // A client can change the volume while this stream plays, so the element is kept
+        // where `set_volume` can reach it.
+        *lock(&self.live_audio) = Some(stream.volume_element());
+        Ok(Box::new(stream))
     }
 
     fn open_video(&self, _config: VideoConfig) -> Result<Box<dyn VideoStream>, RenderError> {

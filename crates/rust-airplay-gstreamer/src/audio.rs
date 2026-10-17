@@ -76,10 +76,10 @@ fn audio_decoder(codec: AudioCodec) -> &'static str {
 /// 44.1 kHz stereo exactly, and a resampler told nothing is a resampler that picks a poor
 /// quality. `sync=false` because a client's clock and a sound card's are not the same
 /// clock, and waiting on one to schedule the other is what makes a receiver stutter.
-fn audio_description(config: AudioConfig, sink: &str) -> String {
+fn audio_description(config: AudioConfig, sink: &str, volume: f64) -> String {
     format!(
-        "appsrc name=audio_source ! queue ! {} ! audioconvert ! audioresample quality=10 ! {sink} \
-         sync=false",
+        "appsrc name=audio_source ! queue ! {} ! audioconvert ! audioresample quality=10 ! \
+         volume name=volume volume={volume} ! {sink} sync=false",
         audio_decoder(config.codec)
     )
 }
@@ -92,6 +92,11 @@ fn audio_description(config: AudioConfig, sink: &str) -> String {
 /// leave a sound card open.
 pub(crate) struct GstAudio {
     appsrc: AppSrc,
+    /// The volume element in this stream's own pipeline.
+    ///
+    /// Kept rather than looked up, because a client can change the volume at any time
+    /// and `set_volume` is called from a connection thread while the pipeline plays.
+    volume: gst::Element,
     /// What the pipeline said was wrong, if it said anything.
     failure: Failure,
     /// Stops the thread that runs the pipeline's main loop, when dropped.
@@ -123,15 +128,15 @@ impl GstAudio {
     ///
     /// Returns [`RenderError::Unavailable`] when an element is missing or the caps cannot
     /// be described, and [`RenderError::Failed`] when the pipeline will not start.
-    pub(crate) fn open(config: AudioConfig, sink: &str) -> Result<Self, RenderError> {
+    pub(crate) fn open(config: AudioConfig, sink: &str, volume: f64) -> Result<Self, RenderError> {
         gst::init().map_err(|error| {
             RenderError::Unavailable(format!("GStreamer cannot be initialised: {error}"))
         })?;
         let caps = audio_caps(config)?;
-        let description = audio_description(config, sink);
+        let description = audio_description(config, sink, volume);
         let failure: Failure = Arc::new(Mutex::new(None));
         let watched = Arc::clone(&failure);
-        let (ready, started) = std::sync::mpsc::channel::<Result<AppSrc, String>>();
+        let (ready, started) = std::sync::mpsc::channel::<Result<(AppSrc, gst::Element), String>>();
         let (stop, stopping) = std::sync::mpsc::channel::<()>();
 
         std::thread::Builder::new()
@@ -141,17 +146,25 @@ impl GstAudio {
                 RenderError::Unavailable(format!("the audio thread cannot start: {error}"))
             })?;
 
-        let appsrc = started
+        let (appsrc, volume) = started
             .recv()
             .map_err(|_| RenderError::Failed("the audio pipeline died at startup".to_owned()))?
             .map_err(RenderError::Unavailable)?;
         Ok(Self {
             appsrc,
+            volume,
             failure,
             stop: Some(stop),
             pushed: AtomicU64::new(0),
             sample_rate: config.sample_rate.max(1),
         })
+    }
+}
+
+impl GstAudio {
+    /// The element a later volume change is applied to.
+    pub(crate) fn volume_element(&self) -> gst::Element {
+        self.volume.clone()
     }
 }
 
@@ -166,7 +179,7 @@ fn run(
     description: &str,
     caps: gst::Caps,
     failure: Failure,
-    ready: Sender<Result<AppSrc, String>>,
+    ready: Sender<Result<(AppSrc, gst::Element), String>>,
     stopping: Receiver<()>,
 ) {
     let context = gst::glib::MainContext::new();
@@ -192,6 +205,10 @@ fn run(
             .and_then(|element| element.downcast::<AppSrc>().ok());
         let Some(appsrc) = source else {
             let _ = ready.send(Err("the audio pipeline has no source".to_owned()));
+            return;
+        };
+        let Some(volume) = pipeline.by_name("volume") else {
+            let _ = ready.send(Err("the audio pipeline has no volume element".to_owned()));
             return;
         };
 
@@ -244,7 +261,7 @@ fn run(
         // Handed out only once the pipeline is playing, so no frame can be pushed into a
         // pipeline that is not ready for it: `appsrc` would take them and the state change
         // would drop them, which is a moment of silence at the start of every session.
-        let _ = ready.send(Ok(appsrc));
+        let _ = ready.send(Ok((appsrc, volume)));
 
         // The thread ends when the pipeline fails, ends, or is told to stop. `quit` is safe
         // to call from another thread and wakes the loop, so a small thread waits on the

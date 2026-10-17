@@ -174,6 +174,25 @@ pub struct AudioSession {
     key: [u8; 16],
     iv: [u8; 16],
     window: ReorderWindow,
+    /// A flush asked for by a control connection, waiting to be applied.
+    ///
+    /// `FLUSH` arrives on the control socket, but the window lives here, on the task
+    /// that drains the data socket. A slot with at most one request is all that is
+    /// needed: applying the newest request is what flushing means.
+    flush_request: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
+}
+
+/// A way to ask a session to flush, held by whoever serves `FLUSH`.
+#[derive(Debug, Clone)]
+pub struct FlushHandle(std::sync::Arc<std::sync::Mutex<Option<u16>>>);
+
+impl FlushHandle {
+    /// Asks the session to restart delivery at `next`.
+    pub fn request(&self, next: u16) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(next);
+        }
+    }
 }
 
 impl AudioSession {
@@ -183,7 +202,35 @@ impl AudioSession {
             key,
             iv,
             window: ReorderWindow::new(capacity),
+            flush_request: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// A handle a control connection can use to flush this session.
+    pub fn flush_handle(&self) -> FlushHandle {
+        FlushHandle(std::sync::Arc::clone(&self.flush_request))
+    }
+
+    /// Applies a flush that arrived since the last datagram.
+    ///
+    /// Returns the sequence the window restarted at, which is worth logging once: a
+    /// flush that arrives mid-stream is either a pause or a seek, and the log is the only
+    /// place that distinction is visible.
+    pub fn apply_flush(&mut self) -> Option<u16> {
+        let next = self
+            .flush_request
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(next) = next {
+            self.window.flush(next);
+        }
+        next
+    }
+
+    /// Discards everything buffered and expects `next` to be the next sequence number.
+    pub fn flush(&mut self, next: u16) {
+        self.window.flush(next);
     }
 
     /// Reads one datagram and returns the frames that are ready for a renderer.
@@ -197,6 +244,7 @@ impl AudioSession {
     /// Returns [`AudioSessionError`] for a datagram this stream cannot use, or
     /// when the payload does not decrypt.
     pub fn receive(&mut self, datagram: &[u8]) -> Result<Vec<AudioFrame>, AudioSessionError> {
+        self.apply_flush();
         let packet = parse_audio_packet(datagram)?;
         let payload = match packet.kind {
             AudioPayloadKind::NoDataMarker => packet.payload.to_vec(),
@@ -342,6 +390,20 @@ impl ReorderWindow {
     /// Sequence numbers this window gave up on since they were last taken.
     pub fn take_lost(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.lost)
+    }
+
+    /// Restarts the window at `next`, discarding everything it holds.
+    ///
+    /// A client sends `FLUSH` when what it played is no longer what it is about to play:
+    /// after a pause, a seek, or a switch of media. Everything queued is audio nobody
+    /// wants, and the sequence the client names is the next one it considers playable
+    /// (`upstream/UxPlay/lib/raop_rtp.c`, `raop_rtp_flush`). Without this, resuming
+    /// plays back whatever was buffered before the pause.
+    pub fn flush(&mut self, next: u16) {
+        self.pending.clear();
+        self.lost.clear();
+        self.next = next;
+        self.started = true;
     }
 
     /// Frames waiting for a gap to be filled.
@@ -503,6 +565,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_flush_discards_what_was_buffered_and_restarts_at_the_named_sequence() {
+        // What a pause looks like: frames 100 and 102 arrive, 101 never does, and then the
+        // client says "resume at 200". Everything held is audio nobody wants any more.
+        let mut window = ReorderWindow::new(16);
+        window.accept(frame(100));
+        window.accept(frame(102));
+        assert_eq!(window.pending(), 1);
+
+        window.flush(200);
+        assert_eq!(window.pending(), 0, "a flush leaves nothing buffered");
+
+        // The next frame is delivered at once rather than waiting for 101, which is what
+        // a client that named 200 is telling the receiver.
+        let delivered = window.accept(frame(200));
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|frame| frame.sequence)
+                .collect::<Vec<_>>(),
+            vec![200]
+        );
+        assert!(window.take_lost().is_empty());
+    }
+
+    #[test]
+    fn a_flush_reaching_the_session_is_applied_to_the_next_datagram() {
+        let mut session = AudioSession::new([0; 16], [0; 16], 16);
+        let handle = session.flush_handle();
+        handle.request(1234);
+        assert_eq!(session.apply_flush(), Some(1234));
+        assert_eq!(session.apply_flush(), None, "one request flushes once");
+    }
     #[test]
     fn delivers_in_order_and_holds_what_arrives_early() {
         let mut window = ReorderWindow::default();

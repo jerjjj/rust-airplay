@@ -31,7 +31,7 @@ const AIRPLAY_SERVICE: &str = "_airplay._tcp.local.";
 /// Records take these values from `upstream/UxPlay@3dbf7cee:lib/dnssdint.h:32-49`.
 const RAOP_TXTVERS: &str = "1";
 const RAOP_CHANNELS: &str = "2";
-const RAOP_CODECS: &str = "0,1,2,3";
+
 const RAOP_ENCRYPTION: &str = "0,3,5";
 const RAOP_RHD: &str = "5.6.0.0";
 const RAOP_SAMPLE_RATE: &str = "44100";
@@ -121,7 +121,7 @@ impl Advertisement {
         let mut raop_txt = HashMap::new();
         raop_txt.insert("txtvers".to_owned(), RAOP_TXTVERS.to_owned());
         raop_txt.insert("ch".to_owned(), RAOP_CHANNELS.to_owned());
-        raop_txt.insert("cn".to_owned(), RAOP_CODECS.to_owned());
+        raop_txt.insert("cn".to_owned(), codecs_string());
         raop_txt.insert("da".to_owned(), "true".to_owned());
         raop_txt.insert("et".to_owned(), RAOP_ENCRYPTION.to_owned());
         raop_txt.insert("vv".to_owned(), identity.vv.to_string());
@@ -173,6 +173,20 @@ impl Advertisement {
     pub fn txt_records(&self) -> (Vec<u8>, Vec<u8>) {
         (encode_txt(&self.airplay_txt), encode_txt(&self.raop_txt))
     }
+}
+
+/// The `cn` record: the codings a client may choose from.
+///
+/// Built from [`AudioCodec::ALL`] rather than written out, so the advertisement cannot
+/// drift from what this receiver decodes. Upstream lists `0,1,2,3` because it decodes all
+/// four; this crate decodes two, and offering the other two would be a promise no part of
+/// the receiver keeps.
+fn codecs_string() -> String {
+    crate::render::AudioCodec::ALL
+        .iter()
+        .map(|codec| codec.codec_number().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Encodes properties in the text record wire format: a sequence of entries,
