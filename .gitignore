@@ -1,8 +1,8 @@
 /target/
 # The GStreamer backend is a crate of its own with its own build directory; its lock file
 # is not, because it is a product and a published repository should pin what it builds
-# (docs/ADR-0003-media-backend.md).
-crates/airplay-renderer-gst/target/
+# (docs/ARCHITECTURE.md).
+crates/rust-airplay-gstreamer/target/
 /upstream/
 # The oracle and the ELD probe are built, not committed.
 /tools/oracle/oracle.exe

@@ -38,53 +38,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "airplay-cli"
-version = "0.1.0"
-dependencies = [
- "airplay-core",
- "airplay-renderer",
- "airplay-renderer-gst",
- "getrandom 0.2.15",
- "tokio",
-]
-
-[[package]]
-name = "airplay-core"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "cbc",
- "cipher",
- "ctr",
- "ed25519-dalek",
- "getrandom 0.2.15",
- "md-5",
- "mdns-sd",
- "num-bigint",
- "num-traits",
- "plist",
- "proptest",
- "sha1",
- "sha2",
- "tokio",
- "x25519-dalek",
-]
-
-[[package]]
-name = "airplay-renderer"
-version = "0.1.0"
-
-[[package]]
-name = "airplay-renderer-gst"
-version = "0.1.0"
-dependencies = [
- "airplay-renderer",
- "gstreamer",
- "gstreamer-app",
-]
-
-[[package]]
 name = "atomic_refcell"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1030,6 +983,50 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rust-airplay"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "cbc",
+ "cipher",
+ "ctr",
+ "ed25519-dalek",
+ "getrandom 0.2.15",
+ "log",
+ "md-5",
+ "mdns-sd",
+ "num-bigint",
+ "num-traits",
+ "plist",
+ "proptest",
+ "sha1",
+ "sha2",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "rust-airplay-cli"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.15",
+ "log",
+ "rust-airplay",
+ "rust-airplay-gstreamer",
+ "tokio",
+]
+
+[[package]]
+name = "rust-airplay-gstreamer"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "gstreamer-app",
+ "rust-airplay",
+]
 
 [[package]]
 name = "rustc_version"

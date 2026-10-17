@@ -1,0 +1,33 @@
+[package]
+name = "rust-airplay-gstreamer"
+description = "GStreamer renderer backend for the rust-airplay receiver"
+repository = "https://github.com/jerjjj/rust-airplay"
+readme = "README.md"
+keywords = ["airplay", "gstreamer", "renderer", "video", "audio"]
+categories = ["multimedia"]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = true
+
+[lib]
+name = "rust_airplay_gstreamer"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[dependencies]
+rust-airplay = { path = "../rust-airplay" }
+# Linked rather than run as a subprocess, because audio needs `appsrc` — one buffer per
+# frame — and a `gst-launch` pipeline fed bytes on stdin cannot express where a frame ends
+# (see `src/audio.rs`). Video is still a subprocess: H.264 has start codes, so a byte
+# stream carries its own framing.
+gstreamer = "0.24"
+gstreamer-app = "0.24"
+
