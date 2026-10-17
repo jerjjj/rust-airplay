@@ -112,17 +112,16 @@ cargo run -p airplay-cli --features gst -- --name "Rust AirPlay Test" --port 470
 
 ## 7. 诚实清单（未验收）
 
-- 媒体：**画面已经跑通**（CTR 计数器进位修复之后，真机镜像正常，用户已确认）。**音频从未出过声**，而且现在的证据表明问题**不在我们的解密，也不在编码假设**。
-  - 音频**路径已经接上并且不再阻塞会话**：`SETUP` 里的 `ekey/eiv` 一到达就 `open_audio`，帧经**有界队列 + 专用写线程**推给 GStreamer。**这一条是"有声音就卡住"的修复**（此前 `push` 在接收循环的 `select!` 里同步写管道）。队列满时**丢帧并计数**，不会退化成卡顿。
-  - **编码已确证是 AAC-ELD**：客户端在 `SETUP` 里明确写 `type 96 (ct 8 (AAC-ELD), spf 480)`（`ct` 的解析是本次新加的，此前一直是硬编码假设）。所以"用错解码器"**已被排除**。
-  - **数据已确证有效**：上游在 `raop_buffer.c:139-145` 解密后会核对首字节，合法值是 `8c/8d/8e/80/81/82`；真机 dump 里 **2081 帧全部是 `8e`(1890) 或 `8d`(191)，且前 3 位全是 `100`**（ELD 帧头）。解密算法也与上游一致（AES-CBC 每包 reset）。
-  - **仍未解决的是"把有效帧交给解码器"这一步**，而且已经试过并**失败**的路径（都有实测记录）：
-    - `decodebin` 直接吃 raw 帧 → `Internal data stream error`；
-    - 加 `aacparse` → `Output caps are unfixed`（raw AAC 不带 rate/channels）；
-    - 自己加 ADTS 头（profile 0/1/2/3 全试）→ `No valid frames decoded`；
-    - 加 ELD 的 `AudioSpecificConfig`（`f8 2c 00`）→ 同样失败；
-    - `fdkaacdec` / `avdec_aac` / `faad` / **ffmpeg** 全部拒绝；ffmpeg 给的是**语法错误**（`channel element 1.8 is not allocated`、`Reserved bit set`、`Number of bands ... exceeds limit`）。
-  - **下一步的唯一线索**：ffmpeg 的语法错误说明"按 AAC 解出来是无效语法"。值得先查的是**上游 UxPlay 实际怎么解码 ELD**（它显然能出声）——它的 macOS/Linux 渲染器（`audio_renderer` / ALSA）用的是哪个库、喂的是什么格式（含不含有 4 字节 no-data 标记、有没有额外的起始帧）。**不要再从 GStreamer 的 caps 入手猜**，那条路已经试穷。
+- 媒体：**画面已经跑通**（CTR 计数器进位修复之后，真机镜像正常，用户已确认）。**音频从未出过声**，但**根因已经查清并证明**，剩下的是一处**架构选择**，不是未知问题。
+  - **`tools/eld_probe.c`（说明见 `tools/eld_probe.md`）是决定性证明**：它链接 GStreamer，按**上游的方式**（`appsrc`、**每个音频 payload 一个 buffer**、caps 带 `codec_data=(buffer)f8e85000`）喂真机 dump，结果 **300 个 buffer 进、300 个出、1 152 000 字节 PCM**。**帧是合法的 AAC-ELD，解密是对的。**
+  - **错在两处，都在"怎么把帧交给解码器"**：
+    1. **caps 缺 `codec_data`**。raw AAC 帧不带采样率，解码器无法确定输出格式，报 `Output caps are unfixed`。上游的值是 `f8e85000`（ELD / 44100 / stereo / 480 samples）；本移植猜的 `f82c00` **不是 ELD**（object type 解出来是 33）。
+    2. **字节流无法承载帧边界**。`appsrc` 是"一 buffer 一帧"；`fdsrc` 给的是字节流，而 raw AAC **没有同步字**，解析器无从切分。三条替代路径全部实测失败：`aacparse`（无同步字可切）、**ADTS**（2 bit profile 字段**表达不了 object type 39**）、**LOAS**（能表达 ELD，但 `aacparse` 拒绝）。
+  - **结论**：**音频不能走"子进程 + stdin 字节流"**，它需要 `appsrc`。视频可以继续走子进程（H.264 有 start code，字节流能切帧）。上游有声正是因为它用 `appsrc`。
+  - **两条实现路径（尚未选定）**：
+    - **A. gstreamer-rs 进程内做音频管线**（与上游最接近）。代价：Rust 构建新增 **GStreamer 开发库依赖**（本机已有 1.28.3 + pkg-config），而这正是 ADR-0003 第 5 条当初要避免的。
+    - **B. 把 `eld_probe.c` 做成流式 feeder**：Rust 写**带长度前缀的帧**给它，它推 `appsrc`。保留"Rust 工作区不依赖 GStreamer 构建期"，但引入一个需单独编译的 C 运行时组件。
+  - 音频**已不再阻塞会话**（有界队列 + 专用写线程），这条修复独立于上面的选择。
   - 没有做**实时播放同步**：`AudioFrame.timestamp` 带过来了，但 sink 是 `sync=false`。
 - **镜像 CTR 的计数器进位曾经丢过一次，已修复并有专门护栏**（这是"大包解不出"的真正原因）：`keystream` 的进位循环原来写成"某字节不溢出就停"，而"不溢出"≠"没有进位要传播"。这条流的 IV 末字节是 `4f`，块 `b1`（=177）使末字节变 `00` 并需要向**前一字节**进位 1——那个进位被丢掉，整条流少走 **256 块**。触发条件极窄：**只有块 177 及之后**才错，所以 177 块以内的所有向量都通过。真机 62 KB 关键帧 = 3875 块，必然踩中。
   - **直接护栏**（比密钥流更能定位）：`oracle mirror.counter{块号}` 输出**计数器本身**；`tests/upstream_oracle.rs::the_counter_carries_through_the_whole_of_it` 用测试内**独立重写**的加法比对十个块（含 177、432、433 两个进位点）。
