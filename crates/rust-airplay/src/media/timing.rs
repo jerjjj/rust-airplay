@@ -387,6 +387,15 @@ impl RemoteClock {
         self.fixed_offset
     }
 
+    /// How many exchanges have produced a sample.
+    ///
+    /// Zero is the state before the client has answered once, which is what a caller
+    /// wants to distinguish from "an answer arrived and was refused".
+    #[must_use]
+    pub fn samples_collected(&self) -> usize {
+        self.samples.iter().flatten().count()
+    }
+
     /// The local time for a client timestamp, in nanoseconds.
     ///
     /// `remote_nanos` is the client's own timestamp: seconds since 1900 with the fraction

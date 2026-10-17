@@ -277,6 +277,7 @@ impl MediaSockets {
         session: &mut AudioSession,
         received: &Received,
         mut on_frame: impl FnMut(AudioFrame),
+        mut on_timing: impl FnMut(&[u8]),
     ) -> std::io::Result<()> {
         use std::sync::atomic::Ordering;
         use tokio::select;
@@ -310,11 +311,13 @@ impl MediaSockets {
                     }
                 }
                 result = self.timing.recv(&mut timing) => {
-                    // Answers to the clock exchange are handed to the caller by
-                    // `receive_timing`; the loop only keeps the socket drained
-                    // until the clock arithmetic lands (`S4-1b-3`).
-                    let _ = result?;
+                    // The clock exchange is a request this receiver sends and an answer
+                    // the client sends back, so the socket has to be drained here as well
+                    // as written to. What the answer means is the caller's: this only
+                    // reports the bytes and counts them.
+                    let length = result?;
                     received.timing.fetch_add(1, Ordering::Relaxed);
+                    on_timing(&timing[..length]);
                 }
             }
         }
@@ -693,9 +696,14 @@ mod tests {
             let mut session = session(key, iv);
             tokio::spawn(async move {
                 sockets
-                    .serve(&mut session, &Received::default(), move |frame| {
-                        collected.lock().expect("lock").push(frame.sequence);
-                    })
+                    .serve(
+                        &mut session,
+                        &Received::default(),
+                        move |frame| {
+                            collected.lock().expect("lock").push(frame.sequence);
+                        },
+                        |_answer| {},
+                    )
                     .await
             })
         };

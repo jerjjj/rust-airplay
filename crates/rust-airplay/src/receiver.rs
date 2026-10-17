@@ -473,6 +473,9 @@ pub async fn run(config: Config) -> Result<(), Error> {
     // `FLUSH` reaching any control connection can clear that session's window.
     let audio_flush: Arc<Mutex<Option<crate::media::audio::FlushHandle>>> =
         Arc::new(Mutex::new(None));
+    // The client's clock, as the timing exchange establishes it. Written by the exchange
+    // and read by anything that has to know when a client timestamp happens here.
+    let clock = Arc::new(Mutex::new(crate::media::timing::RemoteClock::new()));
     let audio_sockets = Arc::clone(&media);
     let audio_stop = audio_stop.clone();
     let audio_flush_task = Arc::clone(&audio_flush);
@@ -534,6 +537,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 // for as long as the session does.
                 let timing_sockets = Arc::clone(&audio_sockets);
                 let timing_stop = audio_stop.clone();
+                let timing_clock = Arc::clone(&clock);
                 tokio::spawn(async move {
                     let Ok(target) = timing_ready.await else {
                         return;
@@ -553,6 +557,12 @@ pub async fn run(config: Config) -> Result<(), Error> {
                             log::warn!("rust-airplay: cannot build a timing request");
                             return;
                         };
+                        // The answer echoes these four bytes, and a reply to a request this
+                        // receiver never made is not a measurement.
+                        let t1 = u32::from_be_bytes([request[24], request[25], request[26], request[27]]);
+                        if let Ok(mut clock) = timing_clock.lock() {
+                            clock.request_sent(t1);
+                        }
                         match timing_sockets.send_timing_request(target, &request).await {
                             Ok(_) => sent += 1,
                             Err(error) => {
@@ -639,6 +649,44 @@ pub async fn run(config: Config) -> Result<(), Error> {
                                      frames are being dropped rather than stalling the session"
                                 );
                             }
+                        }
+                    }, |answer| {
+                        // One answer to one request: `t1` was the second this receiver
+                        // sent, `t2` and `t3` are the client's receive and transmit
+                        // times, and `t4` is now.
+                        let Ok(response) = crate::media::timing::parse_response(answer) else {
+                            return;
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|since| since.as_nanos() as u64)
+                            .unwrap_or(0);
+                        let Ok(t4) = crate::ntp::unix_nanos_to_timestamp(now) else {
+                            return;
+                        };
+                        let Ok(mut clock) = clock.lock() else {
+                            return;
+                        };
+                        let seen = clock.samples_collected();
+                        if let Some(sample) = clock.response_received(
+                            response.t1,
+                            response.t2,
+                            response.t3,
+                            u64::from_be_bytes(t4),
+                        ) {
+                            // Logged every time the estimate is new, which is once per
+                            // exchange in a quiet room and worth seeing: the offset is what
+                            // a schedule is built on, and a wrong one is invisible later.
+                            log::info!(
+                                "media     clock offset {:+.3} ms, delay {:.3} ms, \
+                                 root distance {:.3} ms, synced {}",
+                                clock.offset_nanos() as f64 / 1e6,
+                                sample.delay * 1e3,
+                                clock.root_distance_nanos() as f64 / 1e6,
+                                clock.is_synced()
+                            );
+                        } else if seen == 0 {
+                            log::debug!("media     timing answer ignored: not an answer to a request");
                         }
                     })
                     .await;
