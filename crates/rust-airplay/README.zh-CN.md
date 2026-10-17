@@ -2,14 +2,18 @@
 
 作为库使用的 AirPlay 1/2 接收端。
 
-它通过 mDNS 广播接收端、应答 AirPlay 控制协议、与客户端配对、接收屏幕镜像与音频、解密，并把帧交给渲染器。它没有命令行、不访问文件系统、不打印任何东西，这些决定权留给嵌入它的程序。
+`rust-airplay` 通过 mDNS 广播接收端、应答 AirPlay 控制协议、与客户端配对、接收屏幕镜像与音频、解密，并把帧交给渲染器。它不打开文件、不读环境变量、不打印任何东西，因此日志去哪里、身份存在哪里，都由嵌入它的程序决定。
 
-## 用法
+## 引入
 
 ```toml
 [dependencies]
 rust-airplay = "0.1"
 ```
+
+需要 Rust 1.85 或更新版本。这个 crate 不链接任何 C 库。
+
+## 启动接收端
 
 ```rust,no_run
 use std::collections::HashSet;
@@ -20,7 +24,7 @@ use rust_airplay::{AudioCodec, Config, NullRenderer};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let config = Config {
-    name: "my receiver".to_owned(),
+    name: "Living room".to_owned(),
     port: 7000,
     seed: [0x42; 32],
     device_id: None,
@@ -40,20 +44,23 @@ rust_airplay::run(config).await?;
 # }
 ```
 
-`run` 持续服务客户端，直到进程被要求停止。
+`run` 持续服务客户端，直到进程被要求停止。有两个字段值得解释，因为接收端跨重启的行为就来自它们。`seed` 是身份派生所用的秘密，传入同一个种子，接收端就还是同一个。`clients` 是已验证的客户端密钥集合，`on_client` 在新的密钥加入时被调用，那时正是把它写下来的时机。
 
 ## 播放媒体
 
-帧交给 `Renderer`。`NullRenderer` 全部接受但不播放，适合用于检查会话。要真正播放，实现 `Renderer`，或使用 [`rust-airplay-gstreamer`](https://crates.io/crates/rust-airplay-gstreamer)。
+帧到达 `Renderer`，由调用方实现。`NullRenderer` 全部接受但不播放，适合测试，也适合在没有声卡的机器上检查会话。
 
-## 依赖
+GStreamer 实现是独立的 crate：
 
-Rust 1.85 或更新版本，不链接任何 C 库。
+```toml
+[dependencies]
+rust-airplay = "0.1"
+rust-airplay-gstreamer = "0.1"
+```
 
-## 文档
+## 日志
 
-- [API 参考](https://docs.rs/rust-airplay)
-- [README](https://github.com/jerjjj/rust-airplay) - 命令行接收端与构建指南
+记录通过 `log` 以 `info`、`warn`、`debug` 输出。没有安装 logger 就什么也不打印。客户端需要输入的 PIN 也在 `info` 记录里，因此想把它显示得更醒目的程序应当安装自己的 logger。
 
 ## 许可证
 

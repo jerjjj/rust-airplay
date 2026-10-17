@@ -1,38 +1,56 @@
 # API
 
-Chinese: [API.zh-CN.md](API.zh-CN.md). Generated reference:
+Chinese: [API.zh-CN.md](API.zh-CN.md). The generated reference is on
 [docs.rs/rust-airplay](https://docs.rs/rust-airplay).
 
-## `run`
+## Running a receiver
 
 ```rust
 pub async fn run(config: Config) -> Result<(), Error>
 ```
 
-Serves clients until the process is asked to stop. Binds the control service, announces the
-receiver, sets up a media session per client and hands frames to the renderer. Returns
-`Err` only when a receiver cannot start: a port that cannot be bound, a service that cannot
-be announced, media sockets that cannot be opened.
+This future does the whole job. It binds the control service, registers the mDNS records,
+binds the media sockets, watches the process for a stop signal, and serves clients. Each
+control connection gets its own handler set, but the media session is shared, because a
+client's audio key arrives in one `SETUP` and the mirror stream identifier in a later one,
+possibly on a different connection.
+
+It returns `Ok(())` when the process is asked to stop, and `Err` only for a failure that
+prevents a receiver from starting:
+
+- the control port cannot be bound,
+- the mDNS records cannot be registered,
+- one of the media sockets cannot be opened.
+
+A session that fails after the receiver is running is reported through `log` and the
+receiver keeps serving. Dropping the future has the same effect as a stop signal.
 
 ## `Config`
 
-| Field | Meaning |
-|---|---|
-| `name: String` | the name clients see |
-| `port: u16` | control port; `0` picks a free one |
-| `seed: [u8; 32]` | the bytes the receiver's keys derive from |
-| `device_id: Option<String>` | hardware address to announce; derived from the seed when `None` |
-| `pin: PinMode` | `Disabled`, `OneTime` or `Fixed(digits)` |
-| `password: Option<String>` | digest password required at `SETUP` |
-| `audio_codec: AudioCodec` | `Alac` or `AacEld` |
-| `renderer: Arc<dyn Renderer>` | what plays the media |
-| `clients: Arc<Mutex<HashSet<[u8; 32]>>>` | keys of clients already verified |
-| `on_client: Option<ClientCallback>` | called the first time a client is verified |
-| `trace_log: Option<PathBuf>` | append the request trace here |
-| `dump_video: Option<PathBuf>` | append the first video frames here, as Annex-B |
-| `dump_audio: Option<PathBuf>` | append the audio payloads here, length-prefixed |
+Everything the receiver needs is here, and anything the caller can decide is a field
+instead of a hidden default. The library reads no environment variable and opens no file.
 
-## Renderer
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | `String` | the name clients see in their menu |
+| `port` | `u16` | control port; `0` binds an ephemeral one and advertises it |
+| `seed` | `[u8; 32]` | the secret an identity derives from. Passing a stored seed keeps a receiver recognisable across restarts |
+| `device_id` | `Option<String>` | the hardware address to advertise, when the caller wants a specific one. Derived from the seed when `None` |
+| `pin` | `PinMode` | `Disabled`, `OneTime`, or `Fixed(digits)`. The PIN is surfaced through `log`, so a program that wants to display it differently can install its own logger |
+| `password` | `Option<String>` | when set, `SETUP` also requires this digest password |
+| `audio_codec` | `AudioCodec` | `Alac` or `AacEld`. Clients do not state it, so the caller does |
+| `renderer` | `Arc<dyn Renderer>` | what plays the media |
+| `clients` | `Arc<Mutex<HashSet<[u8; 32]>>>` | client keys already verified. The receiver reads it at startup and adds to it as clients are verified |
+| `on_client` | `Option<ClientCallback>` | called the first time a client is verified, so the caller can persist the key |
+| `trace_log` | `Option<PathBuf>` | when set, request traces are appended here |
+| `dump_video` | `Option<PathBuf>` | when set, the first video frames are appended here as Annex-B |
+| `dump_audio` | `Option<PathBuf>` | when set, audio payloads are appended here behind a length |
+
+`ClientCallback` is `Arc<dyn Fn(&[u8; 32]) + Send + Sync>`. It runs on the connection that
+verified the client, so an implementation that writes a file should keep the work small or
+hand it to another thread.
+
+## The renderer trait
 
 ```rust
 pub trait Renderer: Debug + Send + Sync {
@@ -42,65 +60,80 @@ pub trait Renderer: Debug + Send + Sync {
 }
 ```
 
-`AudioStream` takes `AudioFrame`s and has `set_volume`, `flush` and `close`. `VideoStream`
-takes `VideoFrame`s and has `set_pace`, `flush` and `close`.
+A stream is opened once per session and both are `'static`, because the session moves each
+one onto a thread that does nothing but write frames. This is the part of the design that
+matters most to an implementor: a write may block as long as it likes, and the receive loop
+carries on reading the socket meanwhile. That is why a queue sits in front of every stream,
+and why a backend that needs to block is not a problem.
 
-- `push` blocks when the backend cannot take more; the receive loop never calls it.
-- `close` means no more media for this session.
-- Dropping a stream releases what it holds.
+`AudioStream` takes `AudioFrame` and has `set_volume`, `flush`, `close`. `VideoStream` takes
+`VideoFrame` and has `set_pace`, `flush`, `close`.
 
-`NullRenderer` accepts everything and plays nothing.
+- `push` may block. It is called from a dedicated thread.
+- `close` means the session has no more media. It does not have to destroy the stream.
+- Dropping a stream must release whatever the backend holds.
+
+`NullRenderer` implements the trait by accepting everything and playing nothing. It counts
+what it was given, which makes it useful in tests as well as for inspecting a session.
 
 ## Media types
 
 | Type | Contents |
-|---|---|
+| --- | --- |
 | `AudioConfig` | codec, sample rate, channels, samples per frame |
-| `AudioFrame` | coded payload and a timestamp counted in samples |
-| `VideoConfig` | size, when the client stated one |
-| `VideoFrame` | Annex-B access unit, timestamp, whether it is a key frame |
-| `Volume` | silence to full, clamped |
-| `RenderError` | `Unavailable` or `Failed` |
+| `AudioFrame` | the coded payload and a timestamp in samples of the session rate |
+| `VideoConfig` | width and height, when the client stated them |
+| `VideoFrame` | an Annex-B access unit, a timestamp, and whether it is a key frame |
+| `Volume` | silence to full volume, clamped on construction |
+| `RenderError` | `Unavailable` when nothing can play, `Failed` when playback went wrong |
+
+The audio timestamp counts samples, not nanoseconds, because that is what the client sends.
+A renderer that schedules against a clock has to convert it; the GStreamer backend does.
 
 ## Modules
 
-`receiver` is all a program needs to run a receiver. The rest is public so a program can use
-part of the protocol on its own.
+`receiver` is the only module a program needs to run a receiver. The others are public
+because the pieces are individually useful, for instance in a test that wants to check the
+decryption without running a server.
 
 | Module | Contents |
-|---|---|
+| --- | --- |
 | `receiver` | `run`, `Config`, `Error`, `ClientCallback` |
-| `render` | the renderer traits and media types |
-| `discovery` | `Advertisement`, `Advertiser`, `Protection` |
-| `server` | `Server`, `RouteHandlers`, `DeviceIdentity`, `PairingState`, `PinMode` |
+| `render` | the renderer traits and the media types above |
+| `discovery` | `Advertisement`, `Advertiser`, `Protection`, and the text records |
+| `server` | `Server`, `RouteHandlers`, `DeviceIdentity`, `PairingState`, `PinMode`, `SetupPorts` |
+| `control` | the RTSP request parser and the route table |
 | `media` | audio reordering, mirror decryption, the datagram sockets, the clock exchange |
-| `control` | RTSP request parsing and the route table |
 | `pairing` | the `/pair-verify` and `/pair-setup` cryptography |
-| `srp`, `crypto`, `fairplay`, `plist`, `rtp`, `ntp`, `wire` | the primitives underneath |
+| `srp`, `crypto`, `fairplay`, `plist`, `rtp`, `ntp`, `wire` | the primitives those are built on |
 
-## Command line
+## The command-line receiver
 
-`rust-airplay-cli` builds a binary called `rust-airplay`.
+`rust-airplay-cli` builds a binary called `rust-airplay`. Options:
 
 | Option | Meaning |
-|---|---|
-| `--name <name>` | name clients show |
-| `--port <port>` | control port; `0` picks a free one |
-| `--pin [<digits>]` | ask for a PIN, optionally fixed |
+| --- | --- |
+| `--name <name>` | the name clients see; defaults to `rust-airplay` |
+| `--port <port>` | control port; defaults to 7000, `0` picks a free one |
+| `--pin [<digits>]` | ask for a PIN, optionally a fixed one; this is the default |
 | `--no-pin` | do not ask for a PIN |
-| `--password <password>` | also require the `SETUP` digest password |
-| `--device-id <address>` | hardware address to announce |
-| `--seed <hex>` | 32 bytes of identity seed |
-| `--log <file>` | append the request trace |
-| `--render <null\|gst>` | what plays the media |
-| `--audio-codec <alac\|aac-eld>` | the coding a client sends |
-| `--help` | usage text |
+| `--password <password>` | also require the digest password at `SETUP` |
+| `--device-id <address>` | advertise this hardware address |
+| `--seed <hex>` | 32 bytes of identity, as 64 hex characters |
+| `--log <file>` | append the request trace to a file |
+| `--render <null\|gst>` | what plays the media; `null` by default |
+| `--audio-codec <alac\|aac-eld>` | the coding a client sends; `aac-eld` by default |
+| `--help` | print the usage text and exit |
 
-Its files live in the user's local application data directory: `identity.seed` and
-`clients`. Deleting the first changes the receiver's identity; deleting the second makes
-every client pair again.
+The program stores two files in the local application data directory:
+`rust-airplay/identity.seed` and `rust-airplay/clients`. The first is created on the first
+run and is what keeps the receiver's identity stable; the second is a list of client keys,
+one 64-character hex key per line. Deleting the identity makes every client pair again;
+deleting the client list keeps the identity and forgets the clients.
 
 ## Logging
 
-The library emits `log` records: `info` for progress, `warn` for a session that went wrong,
-`debug` for packet-level detail. Install a logger to see them.
+The library emits `log` records. `info` carries the progress a person watching a session
+wants to see, `warn` carries a session that went wrong, and `debug` carries packet-level
+detail. Nothing is printed if no logger is installed. The command-line receiver installs a
+logger that writes `info` and below to standard output and warnings to standard error.
