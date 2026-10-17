@@ -93,6 +93,26 @@ impl Pacer {
         }
     }
 
+    /// When a frame is due, with the wait it implies capped at `max_lead`.
+    ///
+    /// This is what keeps a measured latency from turning into an observed one. A client
+    /// sends mirror frames in bursts - a second of capture can arrive in fifty
+    /// milliseconds - and spreading a burst over its capture time means the last frame of
+    /// it waits nearly a second before it is shown. Capping the wait makes the stream play
+    /// a little fast at the end of a burst and a little slow at the start of the next one,
+    /// which is a few milliseconds of unevenness rather than a second of lag.
+    ///
+    /// The anchor moves with the cap, so the following frames are spaced from the frame
+    /// that was shown early rather than from the one that was not.
+    pub fn due_limited(&mut self, timestamp: u64, arrival: u64, max_lead: Duration) -> u64 {
+        let due = self.due(timestamp, arrival);
+        if due.saturating_sub(arrival) > max_lead.as_nanos() as u64 {
+            self.anchor = Some((timestamp, arrival));
+            return arrival;
+        }
+        due
+    }
+
     /// How long to wait before a frame that is due at `due` and has arrived at `now`.
     ///
     /// `None` when the frame is already due, which a caller treats as "write it now". A
@@ -167,6 +187,48 @@ mod tests {
         assert_eq!(
             due, 2_000_000_000,
             "a renumbered stream plays at the anchor"
+        );
+    }
+
+    #[test]
+    fn a_burst_does_not_buy_itself_a_second_of_latency() {
+        // Thirty frame intervals is a second of capture. If the whole second arrives at
+        // once, playing it at capture spacing would show the last frame a second late -
+        // which is exactly the lag a device session showed. The cap makes the wait bounded
+        // instead: the anchor moves and the burst plays out at once.
+        let mut pacer = Pacer::new(Ticks::NtpFixed);
+        let first = 1_000u64;
+        let cap = Duration::from_millis(120);
+        assert_eq!(pacer.due_limited(first, 0, cap), 0);
+        let last = first + 29 * 143_156_808;
+        let due = pacer.due_limited(last, 0, cap);
+        assert_eq!(
+            due, 0,
+            "a frame a second in is shown now, not a second later"
+        );
+
+        // And the anchor moved with it: the next frame is spaced from the new anchor
+        // rather than from the one the cap discarded.
+        let next = last + 143_156_808;
+        let due = pacer.due_limited(next, 0, cap);
+        let interval = Duration::from_nanos(due);
+        assert!(
+            interval.abs_diff(Duration::from_micros(33_333)) < Duration::from_micros(100),
+            "the following frame was spaced {interval:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_inside_the_cap_still_waits() {
+        let mut pacer = Pacer::new(Ticks::NtpFixed);
+        let first = 1_000u64;
+        pacer.due_limited(first, 0, Duration::from_millis(120));
+        // Two frames in is sixty-six milliseconds, which is inside the cap.
+        let due = pacer.due_limited(first + 2 * 143_156_808, 0, Duration::from_millis(120));
+        let wait = Duration::from_nanos(due);
+        assert!(
+            wait.abs_diff(Duration::from_micros(66_666)) < Duration::from_micros(200),
+            "a frame inside the cap waited {wait:?}"
         );
     }
 

@@ -407,6 +407,17 @@ impl ClockProbe {
         }
     }
 }
+/// The longest a frame may be held back to keep a stream at its capture spacing.
+///
+/// A client sends a second of mirror frames in a few tens of milliseconds, so pacing them
+/// exactly means the last frame of the burst waits most of a second before it is shown.
+/// That is a latency the viewer sees, and it is the one this bounds: past the budget a
+/// stream plays the frame it has and re-anchors, trading a few milliseconds of unevenness
+/// for not falling behind. It is set from measurement rather than taste - a device session
+/// with the budget unbounded showed the lag - and it is far above one frame interval, so
+/// ordinary jitter is still absorbed.
+const MAX_LEAD: std::time::Duration = std::time::Duration::from_millis(120);
+
 /// Why a receiver could not start, or could not go on.
 #[derive(Debug, Clone)]
 pub struct Error {
@@ -696,7 +707,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                         let opened = std::time::Instant::now();
                         while let Ok(frame) = queued.recv() {
                             let arrival = opened.elapsed().as_nanos() as u64;
-                            let due = pacer.due(frame.timestamp, arrival);
+                            let due = pacer.due_limited(frame.timestamp, arrival, MAX_LEAD);
                             if let Some(wait) = crate::media::pace::Pacer::wait(due, arrival) {
                                 std::thread::sleep(wait);
                             }
@@ -1049,7 +1060,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                         // owns the queue, and the receive loop is on another one dropping
                         // what it cannot hand over.
                         let arrival = started.elapsed().as_nanos() as u64;
-                        let due = pacer.due(timestamp, arrival);
+                        let due = pacer.due_limited(timestamp, arrival, MAX_LEAD);
                         if let Some(wait) = crate::media::pace::Pacer::wait(due, arrival) {
                             std::thread::sleep(wait);
                         }
