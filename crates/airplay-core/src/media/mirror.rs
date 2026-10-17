@@ -420,10 +420,16 @@ pub fn into_annex_b(payload: &mut [u8]) -> Result<usize, NalError> {
 /// packet.
 #[derive(Clone)]
 pub struct MirrorDecryptor {
-    /// The stream's key and IV: a mirror packet's keystream is a function of the
-    /// packet's position in the stream, so nothing about the previous packet other
-    /// than the bytes it carried is kept.
-    key: [u8; STREAM_KEY_LEN],
+    /// The key schedule, built once.
+    ///
+    /// `Aes128::new` expands the key, and that costs more than encrypting the block that
+    /// follows it. Rebuilding it for every packet was paying that price a few dozen times
+    /// a second for nothing: a stream's key does not change until it is re-keyed.
+    cipher: aes::Aes128,
+    /// The initial counter block, which is what a block's counter is derived from.
+    ///
+    /// A mirror packet's keystream is a function of its position in the stream, so nothing
+    /// about the previous packet other than the bytes it carried is kept.
     iv: [u8; STREAM_KEY_LEN],
     /// The block of the stream the next packet's own bytes start on.
     ///
@@ -480,7 +486,10 @@ impl MirrorDecryptor {
         // the arrays here are already sixteen bytes, so it cannot fail.
         let _ = crate::crypto::Aes128CtrState::new(&keys.key, &keys.iv)?;
         Ok(Self {
-            key: keys.key,
+            cipher: {
+                use aes::cipher::KeyInit;
+                aes::Aes128::new(keys.key[..].into())
+            },
             iv: keys.iv,
             position: 0,
             read_block: 0,
@@ -541,8 +550,8 @@ impl MirrorDecryptor {
     /// upstream's own context, block for block, in the differential test.
     #[must_use]
     pub fn keystream(&self, first: u64, blocks: usize) -> Vec<u8> {
-        use aes::cipher::{BlockEncrypt, KeyInit};
-        let cipher = aes::Aes128::new(self.key[..].into());
+        use aes::cipher::BlockEncrypt;
+        let cipher = &self.cipher;
         let mut out = Vec::with_capacity(blocks * 16);
         for index in 0..blocks as u64 {
             let mut counter = self.iv;
@@ -940,8 +949,6 @@ pub struct PacketCounts {
 /// bytes, so the first one is kept with the error that was raised on it.
 #[derive(Debug, Clone)]
 pub struct Decrypted {
-    /// What the packet was.
-    pub kind: String,
     /// Bytes the header declared.
     pub declared: u32,
     /// Carried keystream bytes before it was decrypted.
@@ -954,6 +961,13 @@ pub struct Decrypted {
     pub carried_after: usize,
     /// The first four bytes it decrypted to.
     pub first: [u8; 4],
+    /// Whether the packet was an IDR, which is what the two halves of a video packet are
+    /// told apart by in a report.
+    ///
+    /// A flag rather than the description it used to be: this is recorded for every packet
+    /// of every session, and a `format!` per frame was a heap allocation in the receive
+    /// loop for a word that has two values.
+    pub idr: bool,
     /// Whether it became a frame.
     pub read: bool,
 }
@@ -1160,7 +1174,7 @@ impl MirrorSession {
                 // cannot hold this because the session is borrowed for the whole
                 // match, so the record is built here and stored where it is needed.
                 let record = |read: bool| Decrypted {
-                    kind: format!("video idr={idr}"),
+                    idr,
                     declared: payload.len() as u32,
                     carried_before,
                     blocks_before,

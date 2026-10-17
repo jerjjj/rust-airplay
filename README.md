@@ -16,15 +16,24 @@
 - [源码可行性研究](research/uxplay-rust-feasibility.zh-CN.md)
 - [上游基线及归属](THIRD_PARTY_NOTICES.md)
 
-需要 Rust 1.85 或更新版本。协议核心阶段不依赖 GStreamer SDK；后续媒体后端会作为独立组件接入。
+需要 Rust 1.85 或更新版本。
+
+**默认构建不链接任何 C 库**：`cargo test --workspace --all-targets` 在没有 GStreamer 的机器上就能全绿，这是 [ADR-0003](docs/ADR-0003-media-backend.md) 的要求。真正播放的媒体后端是**独立 crate**（`crates/airplay-renderer-gst`，不在 workspace 成员里），它**构建期需要 GStreamer 开发库**：视频走 `gst-launch-1.0` 子进程，音频则链接 `libgstreamer`（raw AAC-ELD 没有同步字，只能一帧一 buffer 地喂，见 [ADR-0003 第 6 条](docs/ADR-0003-media-backend.md)）。
 
 ```powershell
 cargo test --workspace --all-targets
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
+# 媒体后端自己的门禁（需要 GStreamer 开发库，见 crates/airplay-renderer-gst/README.md）
+cargo test  --manifest-path crates/airplay-renderer-gst/Cargo.toml
+cargo clippy --manifest-path crates/airplay-renderer-gst/Cargo.toml --all-targets -- -D warnings
+
 # 起一个接收端（默认一次性 PIN；Windows 上 7000 可能被 Hyper-V 保留，见下）
 cargo run -p airplay-cli -- --name "Rust AirPlay Test" --port 47000 --log session.log
+
+# 出声出画要带 gst feature；**用 --release**，debug 下解码与解密慢一个数量级
+cargo run --release -p airplay-cli --features gst -- --port 47000 --render gst
 
 # 另一终端确认广告已发布（需系统 Bonjour；Linux 可用 avahi-browse -r _raop._tcp）
 dns-sd -B _raop._tcp local

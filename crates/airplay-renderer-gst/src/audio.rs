@@ -98,6 +98,13 @@ pub(crate) struct GstAudio {
     stop: Option<Sender<()>>,
     /// How many frames were pushed, so a silent session can be told from a stalled one.
     pushed: AtomicU64,
+    /// The rate a frame's timestamp is counted in, which is what makes it a time.
+    ///
+    /// `AudioFrame::timestamp` is the client's own clock, and for audio that clock counts
+    /// samples: a session at 44.1 kHz stamps its frames 480 apart. Treating that number as
+    /// nanoseconds put every buffer at a time that had nothing to do with when it plays,
+    /// which `sync=false` hid and would not have hidden for long.
+    sample_rate: u32,
 }
 
 impl std::fmt::Debug for GstAudio {
@@ -143,6 +150,7 @@ impl GstAudio {
             failure,
             stop: Some(stop),
             pushed: AtomicU64::new(0),
+            sample_rate: config.sample_rate.max(1),
         })
     }
 }
@@ -277,7 +285,17 @@ impl AudioStream for GstAudio {
         // and a decoder given a run of frames reads only the first one.
         let mut buffer = gst::Buffer::from_slice(frame.data);
         if let Some(buffer) = buffer.get_mut() {
-            buffer.set_pts(gst::ClockTime::from_nseconds(frame.timestamp));
+            // Samples to nanoseconds, which is the only clock a buffer has. The absolute
+            // value is the client's rather than this machine's: turning it into a play
+            // time needs a base taken from the first frame and an offset from the clock
+            // exchange, which is what synchronising playback will do — until then the sink
+            // is told not to wait, so nothing here is scheduled against it.
+            let seconds = frame.timestamp / u64::from(self.sample_rate);
+            let nanos = frame.timestamp % u64::from(self.sample_rate) * 1_000_000_000
+                / u64::from(self.sample_rate);
+            buffer.set_pts(gst::ClockTime::from_nseconds(
+                seconds.saturating_mul(1_000_000_000).saturating_add(nanos),
+            ));
         }
         self.appsrc.push_buffer(buffer).map_err(|error| {
             RenderError::Failed(format!("the pipeline refused a frame: {error}"))

@@ -4,7 +4,7 @@
 
 ## 0. 一句话状态
 
-协议核心已完成到 **S3 收口**（发现、控制面、配对、SETUP 密钥派生、Digest 口令；**真机 iPad 已实测发现与配对**），**S4 进行中**：音频收包/解密/重排序/控制通道/端口绑定已完成并接线，**镜像通道整条已完成（CTR 规则 / SPS+PPS 拼装 / 接线，与上游 C 差分通过）**，**渲染边界与 GStreamer 后端已落地并接进 CLI**（接口 + 子进程接入，六个集成测试对真 GStreamer 通过，`--render gst` 起得来、端口与 sink 都报出来了）——**目前仍不出声、不出画，因为还没在真机上验过**。
+协议核心已完成到 **S3 收口**（发现、控制面、配对、SETUP 密钥派生、Digest 口令），**S4 的媒体链路已在真机上跑通**：iPad 镜像**出画**、平板出声时**出音**，且**声音不再冻住画面**。三个阶段性的坑都已定位并修复，各有护栏：镜像 CTR 的**计数器进位**（`tests/upstream_oracle.rs`）、音频的**投递方式**（`appsrc` 一帧一 buffer，`crates/airplay-renderer-gst/tests/audio.rs`）、音视频的**接收循环被阻塞**（写线程 + 有界队列）。**尚未做的**：播放同步（sink 仍 `sync=false`）、时序时钟算术、S4-3 的 RECORD/FLUSH/TEARDOWN 语义、以及 macOS/Linux 上的实测。
 
 ## 1. 接手第一步：跑这三条命令
 
@@ -112,7 +112,7 @@ cargo run -p airplay-cli --features gst -- --name "Rust AirPlay Test" --port 470
 
 ## 7. 诚实清单（未验收）
 
-- 媒体：**画面已经跑通**（CTR 计数器进位修复之后，真机镜像正常，用户已确认）。**音频路径已改为 `appsrc` 并本地验证能解码出 PCM，但还没有在真机上听到过声音**——这是下一步唯一要确认的事。
+- 媒体：**画面与声音都已在真机上跑通**（用户确认）：镜像正常，平板出声时扬声器有声音，且**声音不再冻住画面**。下面是这三条各自的原因与护栏。
   - **根因（已由 `tools/eld_probe.c` 证明，见 `tools/eld_probe.md`）**：帧是合法 AAC-ELD、解密是对的（300/300 buffer → 1 152 000 字节 PCM）。错在两处，都在**投递**：
     1. caps **缺 `codec_data`**。raw AAC 帧不带采样率，解码器无法确定输出格式。上游值是 `f8e85000`（ELD/44100/stereo/480）；本移植猜的 `f82c00` **不是 ELD**（object type 解出 33）。
     2. **字节流不能承载帧边界**。`appsrc` 是"一 buffer 一帧"；`fdsrc` 给的字节流里 raw AAC **没有同步字**。三条替代全部实测失败：`aacparse`、**ADTS**（2 bit profile 表达不了 object type 39）、**LOAS**（能表达，`aacparse` 拒绝）。
@@ -120,13 +120,13 @@ cargo run -p airplay-cli --features gst -- --name "Rust AirPlay Test" --port 470
   - **门禁变化**：`crates/airplay-renderer-gst` 的**构建期**现在需要 GStreamer 开发库（`pkg-config` 找 `gstreamer-1.0`/`gstreamer-app-1.0`；本机 `C:\msys64\ucrt64\bin\pkg-config.exe` 在系统 PATH 上）。默认 workspace（`airplay-core`、`airplay-renderer`、不带 feature 的 `airplay-cli`）**仍然不链接任何 C 库**。
   - **护栏**：`tests/audio.rs` 把真机 40 帧推进 `filesink`，要求**解码出 PCM 才通过**；已用错误 caps 验证过它会失败（`the decoder produced 0 bytes … the caps do not describe them`）。只检查"push 返回 Ok"的测试在这个后端全程静音时**也会通过**，所以不能那样写。
   - 音频**不再阻塞会话**（有界队列 + 专用写线程），这条与上面的改动无关、独立成立。
-  - **没有做实时播放同步**：sink 仍是 `sync=false`，`AudioFrame.timestamp` 目前按纳秒写进 PTS 但被 `sync=false` 忽略（那个字段实际是客户端 RTP 时间戳，不是纳秒——S4-3 做同步时要先换成正确的时间基）。
+  - **没有做实时播放同步**：sink 仍是 `sync=false`。`AudioFrame.timestamp` 是客户端的 RTP 时间戳（**采样数**），后端现在按会话采样率换算成纳秒再写进 PTS；但把它变成"该在第几秒播"还需要一个从首帧取的基准和时钟交换的偏移，那是 S4-3 的事。
 - **镜像 CTR 的计数器进位曾经丢过一次，已修复并有专门护栏**（这是"大包解不出"的真正原因）：`keystream` 的进位循环原来写成"某字节不溢出就停"，而"不溢出"≠"没有进位要传播"。这条流的 IV 末字节是 `4f`，块 `b1`（=177）使末字节变 `00` 并需要向**前一字节**进位 1——那个进位被丢掉，整条流少走 **256 块**。触发条件极窄：**只有块 177 及之后**才错，所以 177 块以内的所有向量都通过。真机 62 KB 关键帧 = 3875 块，必然踩中。
   - **直接护栏**（比密钥流更能定位）：`oracle mirror.counter{块号}` 输出**计数器本身**；`tests/upstream_oracle.rs::the_counter_carries_through_the_whole_of_it` 用测试内**独立重写**的加法比对十个块（含 177、432、433 两个进位点）。
   - 真机已验证：修复后镜像正常。RTP 是否到达 data 口仍未单独验证。
 - 时钟：时序报文层完成，**时钟算术未做且我试做后回退**（见第 8 节第 9 条）。
 - 渲染：`set_volume` 在 GStreamer 后端只记在内存里，**没有作用到运行中的管线**（要改管线属性，S4-3 做）；`flush` 是空操作（上游的语义也没读透）。
-- 平台：macOS/Linux/BSD/ARM 未构建；`mdns-sd` 仅 Windows 实测；oracle 的 `build.ps1` Linux 分支未验证；CI 从未运行。
+- 平台：macOS/Linux/BSD/ARM 未构建；`mdns-sd` 仅 Windows 实测；oracle 的 `build.ps1` 只有 Windows/MSYS2 分支（Linux 分支未写，因此差分测试**不进 CI**，CI 文件里已如实注明）；CI 从未真正运行过。
 - **GStreamer 后端仅在 Windows + MSYS2/UCRT64 GStreamer 1.28.3 上测过**；macOS/Linux 的分支（库名、sink 名）没有实测。
 - 工程：无 `deny.toml`/cargo-deny；无 fuzz 常态化（已有属性测试与深 bplist 回归护栏）。
 

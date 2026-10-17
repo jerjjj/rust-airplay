@@ -796,6 +796,20 @@ async fn run() -> Result<(), String> {
             // Every packet a mirror connection sends, counted before it is
             // interpreted, so that a stream which stops is a stream that stopped
             // arriving rather than one this receiver cannot say anything about.
+            //
+            // The video dump is opened here, once, for the same reason: `AIRPLAY_DUMP_VIDEO`
+            // names a file that the first frames are written to, and doing that per frame
+            // would make a diagnostic cost something in every session that does not use it.
+            let mut dumping = dump_video_path().and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(|error| {
+                        eprintln!("rust-airplay: cannot write {}: {error}", path.display())
+                    })
+                    .ok()
+            });
             let received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let received_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let watching = std::sync::Arc::clone(&received);
@@ -852,12 +866,13 @@ async fn run() -> Result<(), String> {
                             // that broke it is the one just before the first payload
                             // that could not be read.
                             println!(
-                                "media     packets around it (size, carry->carry, blocks->blocks, first bytes, read):"
+                                "media     packets around it (size, carry->carry, blocks->blocks, \
+                                 first bytes, idr, read):"
                             );
                             for packet in watching_recent() {
                                 println!(
                                     "media       {:>7} B  carry {}->{}  blocks {}->{}  \
-                                     {:02x}{:02x}{:02x}{:02x}  {}",
+                                     {:02x}{:02x}{:02x}{:02x}  idr={}  {}",
                                     packet.declared,
                                     packet.carried_before,
                                     packet.carried_after,
@@ -867,6 +882,7 @@ async fn run() -> Result<(), String> {
                                     packet.first[1],
                                     packet.first[2],
                                     packet.first[3],
+                                    packet.idr,
                                     if packet.read { "frame" } else { "NOT READ" }
                                 );
                             }
@@ -901,18 +917,18 @@ async fn run() -> Result<(), String> {
                     }
                     // The bytes handed to a decoder are what a picture is diagnosed
                     // from, and nothing else can say whether a stream is malformed or
-                    // merely hard to follow: `AIRPLAY_DUMP_VIDEO=<path>` writes the
-                    // first frames as an Annex-B stream a second decoder can read.
-                    if let Some(path) = dump_video_path() {
+                    // merely hard to follow: `AIRPLAY_DUMP_VIDEO=<path>` writes the first
+                    // frames as an Annex-B stream a second decoder can read.
+                    //
+                    // The file is opened once, below, and only when the variable is set:
+                    // this runs for every frame of every session, and reading an
+                    // environment variable and opening a file per frame is a cost the
+                    // receive loop pays for a feature that is off in any session nobody is
+                    // diagnosing.
+                    if let Some(file) = dumping.as_mut() {
                         if frames <= 30 {
                             use std::io::Write;
-                            if let Ok(mut file) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&path)
-                            {
-                                let _ = file.write_all(&frame.data);
-                            }
+                            let _ = file.write_all(&frame.data);
                         }
                     }
                     // A queue that is full means the picture is behind what a client
