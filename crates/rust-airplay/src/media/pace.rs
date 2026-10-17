@@ -198,7 +198,7 @@ mod tests {
         // instead: the anchor moves and the burst plays out at once.
         let mut pacer = Pacer::new(Ticks::NtpFixed);
         let first = 1_000u64;
-        let cap = Duration::from_millis(120);
+        let cap = Duration::from_millis(40);
         assert_eq!(pacer.due_limited(first, 0, cap), 0);
         let last = first + 29 * 143_156_808;
         let due = pacer.due_limited(last, 0, cap);
@@ -222,12 +222,12 @@ mod tests {
     fn a_frame_inside_the_cap_still_waits() {
         let mut pacer = Pacer::new(Ticks::NtpFixed);
         let first = 1_000u64;
-        pacer.due_limited(first, 0, Duration::from_millis(120));
-        // Two frames in is sixty-six milliseconds, which is inside the cap.
-        let due = pacer.due_limited(first + 2 * 143_156_808, 0, Duration::from_millis(120));
+        pacer.due_limited(first, 0, Duration::from_millis(40));
+        // One frame in is thirty-three milliseconds, which is inside the cap.
+        let due = pacer.due_limited(first + 143_156_808, 0, Duration::from_millis(40));
         let wait = Duration::from_nanos(due);
         assert!(
-            wait.abs_diff(Duration::from_micros(66_666)) < Duration::from_micros(200),
+            wait.abs_diff(Duration::from_micros(33_333)) < Duration::from_micros(200),
             "a frame inside the cap waited {wait:?}"
         );
     }

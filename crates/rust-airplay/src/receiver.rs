@@ -413,10 +413,14 @@ impl ClockProbe {
 /// exactly means the last frame of the burst waits most of a second before it is shown.
 /// That is a latency the viewer sees, and it is the one this bounds: past the budget a
 /// stream plays the frame it has and re-anchors, trading a few milliseconds of unevenness
-/// for not falling behind. It is set from measurement rather than taste - a device session
-/// with the budget unbounded showed the lag - and it is far above one frame interval, so
-/// ordinary jitter is still absorbed.
-const MAX_LEAD: std::time::Duration = std::time::Duration::from_millis(120);
+/// for not falling behind.
+///
+/// Forty milliseconds is a little over one frame interval, and it is what a device session
+/// asked for: with the budget at a hundred and twenty, the log showed the pacer holding
+/// three frames at once - about a hundred milliseconds of it - while the queue in front of
+/// the writer held another sixty-five. The pacer's share was the part this crate controls,
+/// and cutting it costs only the ability to absorb a burst longer than a frame.
+const MAX_LEAD: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// Why a receiver could not start, or could not go on.
 #[derive(Debug, Clone)]
