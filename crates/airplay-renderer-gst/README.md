@@ -89,6 +89,26 @@ fixed 400 ms until it was measured: `gst-launch` rejects a bad description after
 85 ms, because what takes the time is the process starting rather than the check. It is
 150 ms now — a quarter of a second per connection that the picture spent not being decoded.
 
+### Starting it before a client does
+
+Almost all of that sink cost is paid **before the pipeline is given a frame** — a
+`d3d11videosink` pipeline with zero buffers still costs 702 ms, against 96 ms for
+`fakesink`. The window and the graphics device come up when the pipeline starts, not when
+the first picture arrives. So a session that starts its pipeline when the client connects
+pays for the window while the client is already sending, and the picture appears about a
+second later.
+
+`AIRPLAY_GST_VIDEO_WARM=1` starts the video pipeline with the receiver and keeps it between
+sessions, so a connection has nothing to wait for. It is off by default for one reason: a
+warm pipeline is a window on screen from startup, before anything is being mirrored. A
+television behaves that way; a desktop application may not, and that is the user's call
+rather than this crate's.
+
+A warm stream does not end its pipeline when its session does — that would close the very
+window warming exists to keep — so `VideoStream::close` becomes a no-op for it and the
+decoder resynchronises on the next session's first key frame. A pipeline that has died is
+not reused: the next session gets a fresh one rather than a pipe nobody reads. Both halves
+are tested in `tests/warming.rs`.
 The audio side is not part of this wait. A session opens its audio stream on a task of its
 own (175 ms for `wasapisink` to come up), and the first picture does not queue behind it.
 ## What the tests cover

@@ -38,7 +38,7 @@ use airplay_renderer::{
     AudioConfig, AudioStream, RenderError, Renderer, VideoConfig, VideoFrame, VideoStream, Volume,
 };
 
-use pipeline::{LaunchError, Pipeline, find_launcher};
+use pipeline::{LaunchError, Pipeline, find_launcher, lock};
 
 /// The sinks this backend can play into, in the order it prefers them.
 ///
@@ -71,6 +71,20 @@ pub const MAX_PACE_SECONDS: f64 = 1.0;
 /// Environment variable naming the video sink to use.
 pub const VIDEO_SINK_ENV: &str = "AIRPLAY_GST_VIDEO_SINK";
 
+/// Environment variable that makes the video pipeline start with the receiver.
+///
+/// Measured, this is most of what a connection waits for. A sink that puts a picture on
+/// screen costs, on this machine, 702 ms before it has been given a single frame: the
+/// window and the graphics device come up when the pipeline starts, not when the first
+/// frame arrives, and a session that starts its pipeline when the client connects pays
+/// that while the client is already sending. Starting it at receiver start pays it while
+/// nobody is waiting.
+///
+/// Set to `1` or `true` to turn it on. Off by default for one reason, and it is a real
+/// one: a warm pipeline is a window on screen from startup, before anything is being
+/// mirrored. A television behaves that way and a desktop application may not.
+pub const WARM_VIDEO_ENV: &str = "AIRPLAY_GST_VIDEO_WARM";
+
 /// A renderer whose streams are GStreamer pipelines.
 #[derive(Debug)]
 pub struct GstRenderer {
@@ -78,6 +92,11 @@ pub struct GstRenderer {
     audio_sink: String,
     video_sink: String,
     volume: Mutex<Volume>,
+    /// The video pipeline a session reuses instead of starting its own.
+    ///
+    /// Held across sessions on purpose: this is the window and the decoder, and dropping
+    /// it at the end of a session would mean paying for both again at the next one.
+    warm_video: Mutex<Option<std::sync::Arc<Pipeline>>>,
 }
 
 impl GstRenderer {
@@ -90,12 +109,19 @@ impl GstRenderer {
     /// ([ADR-0003](../../../docs/ADR-0003-media-backend.md)).
     pub fn new() -> Result<Self, RenderError> {
         let program = find_launcher().map_err(unavailable)?;
-        Ok(Self {
+        let renderer = Self {
             program,
             audio_sink: sink_from_env(AUDIO_SINK_ENV, AUDIO_SINKS),
             video_sink: sink_from_env(VIDEO_SINK_ENV, VIDEO_SINKS),
             volume: Mutex::new(Volume::FULL),
-        })
+            warm_video: Mutex::new(None),
+        };
+        if warming() {
+            // A pipeline that cannot start is reported here rather than at the first
+            // client: a receiver that will show nothing should say so at startup.
+            renderer.warm_video()?;
+        }
+        Ok(renderer)
     }
 
     /// A renderer that plays into the sinks named rather than the preferred ones.
@@ -115,7 +141,26 @@ impl GstRenderer {
             audio_sink: audio_sink.to_owned(),
             video_sink: video_sink.to_owned(),
             volume: Mutex::new(Volume::FULL),
+            warm_video: Mutex::new(None),
         })
+    }
+
+    /// Starts the video pipeline now, so that the first client does not wait for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unavailable`] when the pipeline cannot be run.
+    pub fn warm_video(&self) -> Result<(), RenderError> {
+        let description = video_pipeline(&self.video_sink);
+        let pipeline = Pipeline::start(&self.program, &description).map_err(unavailable)?;
+        *lock(&self.warm_video) = Some(std::sync::Arc::new(pipeline));
+        Ok(())
+    }
+
+    /// Whether a video pipeline is being kept for the next session.
+    #[must_use]
+    pub fn video_is_warm(&self) -> bool {
+        lock(&self.warm_video).is_some()
     }
 
     /// The program this renderer runs pipelines in.
@@ -144,6 +189,14 @@ impl GstRenderer {
     pub fn video_sink(&self) -> &str {
         &self.video_sink
     }
+}
+
+/// Whether the environment asks for a pipeline that starts with the receiver.
+fn warming() -> bool {
+    matches!(
+        std::env::var(WARM_VIDEO_ENV).as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on")
+    )
 }
 
 /// Picks a sink: the environment's if it names one, the first of `preferred` otherwise.
@@ -197,10 +250,29 @@ impl Renderer for GstRenderer {
     }
 
     fn open_video(&self, _config: VideoConfig) -> Result<Box<dyn VideoStream>, RenderError> {
+        // A warm pipeline is the same window and decoder the last session used. A dead one
+        // is not reused: a client that dropped while the sink was being brought up leaves a
+        // process that has gone, and the next session deserves a fresh one rather than a
+        // pipe nobody reads.
+        let mut slot = lock(&self.warm_video);
+        if let Some(pipeline) = slot.as_ref().filter(|pipeline| pipeline.is_running()) {
+            return Ok(Box::new(GstVideo {
+                pipeline: std::sync::Arc::clone(pipeline),
+                ends_on_close: false,
+            }));
+        }
         let description = video_pipeline(&self.video_sink);
         let pipeline = Pipeline::start(&self.program, &description).map_err(unavailable)?;
+        let warm = slot.is_some();
+        let pipeline = std::sync::Arc::new(pipeline);
+        if warm {
+            // Warming was asked for and the old pipeline had died, so this one takes its
+            // place rather than being dropped at the end of the session.
+            *slot = Some(std::sync::Arc::clone(&pipeline));
+        }
         Ok(Box::new(GstVideo {
-            pipeline: std::sync::Arc::new(pipeline),
+            pipeline,
+            ends_on_close: !warm,
         }))
     }
 
@@ -224,6 +296,12 @@ struct GstVideo {
     /// Shared, because a stream is handed to whichever thread plays it and the
     /// pipeline has to outlive the value that opened it.
     pipeline: std::sync::Arc<Pipeline>,
+    /// Whether this stream owns the pipeline and may end it.
+    ///
+    /// A warm pipeline outlives the session that used it, so closing it would close the
+    /// window and the next client would pay for a new one — which is the whole thing
+    /// warming exists to avoid.
+    ends_on_close: bool,
 }
 
 impl VideoStream for GstVideo {
@@ -250,6 +328,12 @@ impl VideoStream for GstVideo {
     }
 
     fn close(&self) -> Result<(), RenderError> {
-        self.pipeline.finish().map_err(unavailable)
+        if self.ends_on_close {
+            return self.pipeline.finish().map_err(unavailable);
+        }
+        // Nothing to end: the pipeline stays up for the next session, which is what makes
+        // one start quickly. `/FLUSH` still has somewhere to go — `flush` above — and the
+        // decoder resynchronises on the next session's first key frame.
+        Ok(())
     }
 }

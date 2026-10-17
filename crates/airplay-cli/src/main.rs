@@ -142,6 +142,17 @@ fn open_gst() -> Result<Arc<dyn airplay_renderer::Renderer>, String> {
         renderer.audio_sink(),
         renderer.video_sink()
     );
+    // Whether the video pipeline is already up is the difference between a picture that
+    // appears at once and one that takes about a second, so it is worth saying which of
+    // the two a session will get.
+    println!(
+        "render    video  {}",
+        if renderer.video_is_warm() {
+            "warm (started before any client, so a connection does not wait for a window)"
+        } else {
+            "cold (started when a client connects; AIRPLAY_GST_VIDEO_WARM=1 starts it now)"
+        }
+    );
     Ok(Arc::new(renderer))
 }
 

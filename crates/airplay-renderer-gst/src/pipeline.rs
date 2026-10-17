@@ -330,7 +330,7 @@ fn open_stderr() -> Result<(std::path::PathBuf, Stdio), LaunchError> {
 /// A pipeline whose writer panicked once is still a pipeline, and the alternative — a
 /// stream that can never be written to again — is worse than one written to by whoever is
 /// left.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
