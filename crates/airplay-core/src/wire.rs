@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #![allow(missing_docs)]
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Incremental, bounded RTSP/HTTP wire parsing.
