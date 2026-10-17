@@ -4,7 +4,7 @@
 
 ## 0. 一句话状态
 
-协议核心已完成到 **S3 收口**（发现、控制面、配对、SETUP 密钥派生、Digest 口令），**S4 的媒体链路已在真机上跑通**：iPad 镜像**出画**、平板出声时**出音**，且**声音不再冻住画面**。三个阶段性的坑都已定位并修复，各有护栏：镜像 CTR 的**计数器进位**（`tests/upstream_oracle.rs`）、音频的**投递方式**（`appsrc` 一帧一 buffer，`crates/airplay-renderer-gst/tests/audio.rs`）、音视频的**接收循环被阻塞**（写线程 + 有界队列）。**尚未做的**：播放同步（sink 仍 `sync=false`）、时序时钟算术、S4-3 的 RECORD/FLUSH/TEARDOWN 语义、以及 macOS/Linux 上的实测。
+协议核心已完成到 **S3 收口**（发现、控制面、配对、SETUP 密钥派生、Digest 口令），**S4 的媒体链路已在真机上跑通**：iPad 镜像**出画**、平板出声时**出音**，且**声音不再冻住画面**。三个阶段性的坑都已定位并修复，各有护栏：镜像 CTR 的**计数器进位**（`tests/upstream_oracle.rs`）、音频的**投递方式**（`appsrc` 一帧一 buffer，`crates/airplay-renderer-gst/tests/audio.rs`）、音视频的**接收循环被阻塞**（写线程 + 有界队列）。**连接速度已定位并修复**（广播里 features 第 27 位把 iOS 引向传统配对，见第 8 节第 13 条），用户确认"这下快了"。**尚未做的**：播放同步（sink 仍 `sync=false`）、时序时钟算术、S4-3 的 RECORD/FLUSH/TEARDOWN 语义、以及 macOS/Linux 上的实测。
 
 ## 1. 接手第一步：跑这三条命令
 
@@ -144,3 +144,6 @@ cargo run -p airplay-cli --features gst -- --name "Rust AirPlay Test" --port 470
 10. **子进程 stderr 用管道会阻塞**：GStreamer 出错时写得很多，没人读的管道会填满并把子进程卡在写操作上（本会话实测卡死）。`pipeline.rs` 因此把它重定向到文件；同理 `gst-launch` 的错误是**异步**报的，所以 `Pipeline::start` 会短暂 `settle()` 再检查它是否还活着。
 11. **Windows 参数引号**：把整条管线描述作为一个参数传给 `gst-launch-1.0` 会被引号规则和 caps 里的逗号破坏（"erroneous pipeline: syntax error"）。`Pipeline::start` 用 `split_whitespace()` 逐个传参，`gst-launch` 会自己拼回去。
 12. **嵌套 workspace 的 `target/` 不在根 `.gitignore` 覆盖范围**，第一次提交 GStreamer 后端时把 388 个构建产物提交了进去（已修复）。
+13. **不要从上游头文件抄广播常量，要读运行中的程序。** 这是"连接慢"的真正根因，也是我绕得最远的一次。`dnssdint.h:33` 写着 `FEATURES_1 "0x5A7FFEE6"`，我照抄了；但运行期 `uxplay.cpp:2162` 会用 `setup_legacy_pairing`（默认 `false`，`:164`）覆盖**第 27 位**，实际广播是 `0x527FFEE6`。按 `uxplay.cpp:2161` 的注释，这一位决定**用不用 AirPlay 2 的客户端配对协议**；置 1 就是告诉 iOS"走传统配对"，于是 iPad 先发 `/pair-pin-start` + `/pair-setup-pin`（本移植第二步回 `470`），等超时才回退到能用的流程——这就是"点了之后要等好几秒"。同理 `pw`/`sf`：UxPlay 就算有 PIN 也广播 `pw=false`/`sf=0x4`（`dnssd.c:45-47` 把"PIN 配对"和"要密码"分开），我们却广播 `pw=true`/`sf=0x8c`。
+    **可复现的做法**（该当成常规工具用）：本机构建 UxPlay（MSYS2 工具链齐全，`cmake -S upstream/UxPlay -B target/uxplay-build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build target/uxplay-build`，约 1 分钟），运行它，用 `dns-sd -L "<实例名>" _raop._tcp local` 抓 TXT；对自家接收端做同样的事，逐字段 diff。**同一字段在上游源码里可能有"初值"和"运行期覆盖"两处，只有抓包能定论。**
+    **注意**：iOS 会缓存广播记录，改完后若仍慢，先用 UxPlay 连一次覆盖缓存，再连本移植做交叉验证。
