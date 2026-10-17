@@ -162,6 +162,31 @@ const MAX_DISPERSION: f64 = 16.0;
 /// Weight given to a new estimate when one already exists.
 const ALPHA: f64 = 0.05;
 
+/// Seconds from 1900, the NTP epoch, to 1970.
+///
+/// A client's timing answer carries this added to its own epoch, which is the moment the
+/// device booted, while a mirror frame's timestamp does not. Both count fractions the same
+/// way, so the difference between the two domains is exactly this constant.
+const SECONDS_FROM_1900: i64 = 2_208_988_800;
+
+/// A 32-bit fraction of a second as nanoseconds.
+fn fraction_to_nanos(fraction: u32) -> i64 {
+    (i64::from(fraction) * 1_000_000_000) >> 32
+}
+
+/// A Q32.32 timestamp as nanoseconds in its own epoch.
+///
+/// A mirror frame's timestamp is NTP fixed point: the high half counts seconds from the
+/// client's epoch and the low half a fraction of a second. Consecutive frames of a
+/// 1554x1080 mirror stream differ by about 143 million of these, which is thirty-three
+/// milliseconds - one frame at thirty a second - and that is the measurement that
+/// established the unit.
+#[must_use]
+pub fn q32_32_to_nanos(timestamp: u64) -> i64 {
+    let seconds = (timestamp >> 32) as i64;
+    seconds.saturating_mul(1_000_000_000) + fraction_to_nanos(timestamp as u32)
+}
+
 /// One completed exchange with the client's timing port.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClockSample {
@@ -252,7 +277,8 @@ impl RemoteClock {
     ///
     /// `t1` is the local send time in NTP's timestamp form, `t2` and `t3` are what the
     /// client reported, both as its own 32-bit timestamps, and `t4` is the local arrival
-    /// time as a full 64-bit timestamp. Returns `None` when the answer is a duplicate, when
+    /// time in **nanoseconds** since the Unix epoch. Mixing a timestamp form into that
+    /// argument is what made two versions of this wrong. Returns `None` when the answer is a duplicate, when
     /// it echoes a `t1` that was never sent, or when it leaves no sample worth keeping.
     pub fn response_received(&mut self, t1: u32, t2: u32, t3: u32, t4: u64) -> Option<ClockSample> {
         // The answer has to echo a request this receiver made. Without that check a client
@@ -275,59 +301,45 @@ impl RemoteClock {
             return None;
         }
 
-        // The remote stamps are 32-bit: seconds modulo 136 years, with a 32-bit fraction.
-        // The first one seen fixes how far this machine's clock is from the client's era,
-        // and every later one is adjusted by the same amount, which is what upstream's
-        // `fixed_offset` is for.
-        let remote_nanos = |stamp: u32| -> i64 {
-            let value = i64::from(stamp) << 32;
-            match self.fixed_offset {
-                Some(offset) => value + offset,
-                None => value,
-            }
-        };
-        let first = remote_nanos(t2);
+        // Everything below is integer nanoseconds, because everything on the wire is whole
+        // seconds: `t1`, `t2` and `t3` are thirty-two bits each, and upstream truncates the
+        // arrival time to the same width (`raop_ntp.c:656-697`). Mixing a fraction into
+        // that arithmetic is what made the first version of this report an offset of
+        // exactly half the round trip for every session.
+        let t1_local = (i64::from(t1) - SECONDS_FROM_1900).saturating_mul(1_000_000_000);
+        // The client's epoch is when it booted, and its answer adds the 1900 offset to it.
+        // A mirror frame's timestamp does not, so both are brought to the same domain here:
+        // seconds since the client booted.
+        let t2_client = (i64::from(t2) - SECONDS_FROM_1900).saturating_mul(1_000_000_000);
+        let t3_client = (i64::from(t3) - SECONDS_FROM_1900).saturating_mul(1_000_000_000);
+        let t4_nanos = t4 as i64;
+
+        // Where the client's epoch sits against this clock. Fixed on the first answer and
+        // kept: it is what turns a mirror timestamp into a local time, and it is the only
+        // number in this exchange that is not quantised by the reply's seconds.
         let fixed = match self.fixed_offset {
             Some(existing) => existing,
             None => {
-                // Upstream fixes this against the local clock read *after* the answer
-                // arrived, not against the truncated `t4` it goes on to compute
-                // (`raop_ntp.c:1010`). Using `t4` would make the first sample compare its
-                // own send time with itself, and the offset it reports would be exactly
-                // half the round trip - which is what a first session here reported.
-                let offset = t4 as i64 - first;
+                let offset = t4_nanos - t2_client;
                 self.fixed_offset = Some(offset);
                 offset
             }
         };
-        let t2_local = (i64::from(t2) << 32) + fixed;
-        let t3_local = (i64::from(t3) << 32) + fixed;
 
-        // `ntp_diff_to_seconds`: the difference of two 64-bit timestamps, in seconds.
-        let seconds =
-            |later: u64, earlier: i64| -> f64 { (later as i64 - earlier) as f64 / 2f64.powi(32) };
-        // Upstream computes `t4` by writing the arrival time and reading four bytes back
-        // (`raop_ntp.c:696-697`), so every value in this arithmetic is whole seconds. The
-        // fraction is kept only in `received`, which ages samples and nothing else.
-        let t4_seconds = t4 & !0xffff_ffff;
-        let total = seconds(t4_seconds, i64::from(t1) << 32);
-        let client_processing = (t3_local - t2_local) as f64 / 2f64.powi(32);
-        let mut delay = total - client_processing;
-        if delay < RHO {
-            delay = RHO;
-        }
-        let client_to_server = (t2_local - (i64::from(t1) << 32)) as f64 / 2f64.powi(32);
-        let server_to_client = (t4_seconds as i64 - t3_local) as f64 / 2f64.powi(32);
+        // The round trip without the client's own processing time, and the two legs of it.
+        let total = t4_nanos - t1_local;
+        let client_processing = t3_client - t2_client;
+        let delay_nanos = (total - client_processing).max(1_000_000);
+        let client_to_server = t2_client + fixed - t1_local;
+        let server_to_client = t4_nanos - (t3_client + fixed);
 
         let sample = ClockSample {
             received: t4,
             echo: t3,
-            offset: (client_to_server + server_to_client) / 2.0,
-            delay,
-            dispersion: 2.0 * RHO + PHI * seconds(t4_seconds, i64::from(t1) << 32),
+            offset: ((client_to_server + server_to_client) as f64 / 2.0) / 1e9,
+            delay: delay_nanos as f64 / 1e9,
+            dispersion: 2.0 * RHO + PHI * (total as f64 / 1e9),
         };
-        // The oldest slot is overwritten, which is upstream's ring: eight samples, and a
-        // ninth replaces the first.
         let slot = self
             .samples
             .iter()
@@ -343,15 +355,14 @@ impl RemoteClock {
         self.samples[slot] = Some(sample);
         self.outstanding = [0; OUTSTANDING_REQUESTS];
 
-        Some(self.estimate(t4))
+        self.estimate(t4)
     }
-
     /// Recomputes the offset from the samples that are still worth using.
-    fn estimate(&mut self, now: u64) -> ClockSample {
+    fn estimate(&mut self, now: u64) -> Option<ClockSample> {
         // Age every sample and drop the ones that have drifted too far to mean anything.
         let mut usable: Vec<ClockSample> = Vec::with_capacity(SAMPLE_COUNT);
         for sample in self.samples.iter_mut().flatten() {
-            let elapsed = (now as i64 - sample.received as i64) as f64 / 2f64.powi(32);
+            let elapsed = (now as i64 - sample.received as i64) as f64 / 1e9;
             sample.dispersion += elapsed * PHI;
             if sample.dispersion < MAX_DISPERSION {
                 usable.push(*sample);
@@ -364,7 +375,10 @@ impl RemoteClock {
         for (index, sample) in usable.iter().enumerate() {
             filtered += sample.dispersion / 2f64.powi(index as i32);
         }
-        let leader = usable[0];
+        // Everything aged out. A client whose answers are far enough from this clock to do
+        // that has not proved anything, so the previous estimate stays and no new one is
+        // published.
+        let leader = usable.first().copied()?;
         let root_distance = filtered + leader.delay / 2.0;
 
         let offset = if root_distance > MAX_DISTANCE {
@@ -383,7 +397,7 @@ impl RemoteClock {
         self.offset_nanos = (offset * 1e9) as i64;
         self.root_distance_nanos = (root_distance * 1e9) as u64;
         self.have_estimate = true;
-        leader
+        Some(leader)
     }
 
     /// How far the client's era is from this machine's clock, in nanoseconds.
@@ -407,22 +421,26 @@ impl RemoteClock {
 
     /// The local time for a client timestamp, in nanoseconds.
     ///
-    /// `remote_nanos` is the client's own timestamp: seconds since 1900 with the fraction
-    /// a client sends. The conversion applies the fixed offset first and the smoothed
-    /// residual second, which is the order upstream uses: it adjusts a remote timestamp
-    /// with `raop_ntp_adjust_remote_timestamp_offset` where it reads it, and converts with
+    /// `remote_timestamp` is a Q32.32 NTP time in the client's own epoch - the moment the
+    /// device booted, not 1900, because the 1900 offset is added to timing answers and not
+    /// to media timestamps. A frame of a 1554x1080 mirror stream carries about 8355 in the
+    /// high half, which is how long the device had been up.
+    ///
+    /// The conversion applies the fixed offset first and the smoothed residual second,
+    /// which is the order upstream uses: it adjusts a remote timestamp with
+    /// `raop_ntp_adjust_remote_timestamp_offset` where it reads it, and converts with
     /// `raop_ntp_convert_remote_time` where it schedules.
     ///
     /// `None` until a response has been read. A receiver that guessed would drift away
     /// from the client rather than follow it, and a sound card playing at the wrong rate
     /// is worse than one playing late.
     #[must_use]
-    pub fn to_local(&self, remote_nanos: u64) -> Option<u64> {
+    pub fn to_local(&self, remote_timestamp: u64) -> Option<u64> {
         let fixed = self.fixed_offset?;
         if !self.have_estimate {
             return None;
         }
-        Some(((remote_nanos as i64) + fixed - self.offset_nanos) as u64)
+        Some((q32_32_to_nanos(remote_timestamp) + fixed - self.offset_nanos) as u64)
     }
 
     /// The client's time for a point in the local clock, in nanoseconds.
@@ -432,7 +450,8 @@ impl RemoteClock {
         if !self.have_estimate {
             return None;
         }
-        Some(((local_nanos as i64) + self.offset_nanos - fixed) as u64)
+        let remote = (local_nanos as i64 + self.offset_nanos - fixed).max(0) as u64;
+        Some(remote)
     }
 
     /// The client's clock minus this one, in nanoseconds.
@@ -517,41 +536,84 @@ mod tests {
     fn an_exchange_is_only_as_fine_as_the_seconds_it_carries() {
         let mut clock = RemoteClock::new();
         // The client's clock reads five seconds ahead of this machine's.
-        let t1_seconds: u32 = 3_900_000_000;
-        let t1 = u64::from(t1_seconds) << 32;
+        // The client booted 8354 seconds ago and its answer adds the 1900 offset, which is
+        // what a device was seen to send.
+        const BOOT: u32 = 8_354;
+        let t2 = BOOT.wrapping_add(2_208_988_800);
+        let t3 = t2;
+        // This machine's clock, in the same era: Unix seconds plus the same offset.
+        let t1_seconds: u32 = 1_792_231_849u32.wrapping_add(2_208_988_800);
+
         assert!(clock.request_sent(t1_seconds));
         // A one-way trip of ten milliseconds, and the client takes none of it processing.
-        let ten_ms = (0.01 * 2f64.powi(32)) as u64;
-        let t4 = t1 + 2 * ten_ms;
-        let t2 = (3_900_000_005u64) & 0xffff_ffff;
-        let t3 = t2;
+        let t4 = 1_792_231_849_000_000_000 + 2 * 10_000_000;
 
         let sample = clock
-            .response_received(t1_seconds, t2 as u32, t3 as u32, t4)
+            .response_received(t1_seconds, t2, t3, t4)
             .expect("a sample from a reply that echoes the request");
         // Twenty milliseconds of round trip is invisible at this resolution, so the delay
         // is the floor the arithmetic uses in place of zero.
         assert!(sample.delay > 0.0);
-        assert!(sample.delay < 0.01, "delay {}", sample.delay);
+        assert!((sample.delay - 0.02).abs() < 1e-3, "delay {}", sample.delay);
         assert!(clock.is_synced(), "an exchange this clean is a sync");
 
         // The conversion is what a session uses, and it has to survive the era: the client
         // counts seconds since 1900 in 32 bits, so the fixed offset is what puts its
         // timestamps on this machine's clock.
-        let remote = t2 << 32;
+        // A mirror timestamp in the client's epoch: seconds in the high half.
+        let remote = u64::from(BOOT) << 32;
         let local = clock.to_local(remote).expect("a conversion");
-        // A client ten milliseconds into a one-way trip is playing the instant this
-        // machine reaches at `t4 - ten milliseconds`. The answer is in nanoseconds, so the
-        // comparison is too.
-        let within_a_second = 2 * NANOS_PER_TICK;
+        // The exchange only knows the client's second, so the conversion cannot be finer
+        // than that: two seconds of tolerance is what the wire allows.
+        let tolerance = 2 * NANOS_PER_TICK;
         assert!(
-            local.abs_diff(t4) < within_a_second,
+            local.abs_diff(t4) < tolerance,
             "converted {local}, expected about {t4}"
         );
         assert!(clock.to_remote(local).is_some());
         let _ = &remote;
     }
 
+    #[test]
+    fn a_real_mirror_timestamp_lands_on_the_local_clock() {
+        // Numbers from a device session, kept because they are the only evidence that the
+        // unit is what this code says it is: `t2` was 2208997154 (client boot plus the
+        // 1900 offset), the answer arrived at Unix 1792231849.253 s, and the first mirror
+        // frame carried 35884668244832.
+        let mut clock = RemoteClock::new();
+        let t1_seconds: u32 = 4_001_220_649;
+        clock.request_sent(t1_seconds);
+        let t4 = 1_792_231_849_253_621_800;
+        clock
+            .response_received(t1_seconds, 2_208_997_154, 2_208_997_154, t4)
+            .expect("a matched answer");
+
+        // The mirror timestamp decodes as 8355 seconds and a fraction of a second since
+        // the client booted, and it has to land within a second of the frame's arrival.
+        let frame = 35_884_668_244_832u64;
+        assert_eq!(frame >> 32, 8_355, "the high half counts client seconds");
+        let local = clock.to_local(frame).expect("a conversion");
+        assert!(
+            local.abs_diff(t4) < 1_000_000_000,
+            "converted {local} against an arrival of {t4}"
+        );
+    }
+
+    #[test]
+    fn consecutive_frames_differ_by_one_frame_of_ticks() {
+        // The same session: two frames thirty-three milliseconds apart differed by
+        // 143156808 ticks, and a second is 2^32 of them.
+        let ticks = 143_156_808u64;
+        let seconds = ticks as f64 / 4_294_967_296.0;
+        assert!(
+            (seconds - 1.0 / 30.0).abs() < 0.001,
+            "a frame lasted {seconds} s"
+        );
+        // And the high half counts seconds: 8355 seconds of boot time is 8355 * 2^32
+        // ticks, which is where the observed value's high half sits.
+        let observed = 35_884_668_244_832u64;
+        assert_eq!(observed >> 32, 8_355);
+    }
     #[test]
     fn an_answer_that_echoes_nothing_this_receiver_sent_is_refused() {
         let mut clock = RemoteClock::new();
@@ -568,13 +630,13 @@ mod tests {
     #[test]
     fn the_same_answer_twice_is_ignored() {
         let mut clock = RemoteClock::new();
-        let t1_seconds: u32 = 2_000;
-        let t1 = u64::from(t1_seconds) << 32;
+        let t2: u32 = 8_354u32.wrapping_add(2_208_988_800);
+        let t1_seconds: u32 = 1_792_231_849u32.wrapping_add(2_208_988_800);
         clock.request_sent(t1_seconds);
-        let first = clock.response_received(t1_seconds, 7, 9, t1 + 40_000_000);
+        let first = clock.response_received(t1_seconds, t2, t2, 1_792_231_849_040_000_000);
         assert!(first.is_some());
         assert_eq!(
-            clock.response_received(t1_seconds, 7, 9, t1 + 40_000_000),
+            clock.response_received(t1_seconds, t2, t2, 1_792_231_849_040_000_000),
             None,
             "a repeated t3 is the same exchange counted twice"
         );

@@ -14,31 +14,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_airplay::media::ports::MediaSockets;
 use rust_airplay::media::timing::{RemoteClock, build_request, parse_response};
-use rust_airplay::ntp;
-
-/// The local time now, as the NTP timestamp form the exchange works in.
-fn now_timestamp() -> [u8; 8] {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("a clock")
-        .as_nanos() as u64;
-    ntp::unix_nanos_to_timestamp(nanos).expect("a representable time")
-}
 
 /// A response that echoes `t1` and reports the client's own times.
 ///
 /// The client's clock is `offset_seconds` ahead of this machine's. Its receive time `t2`
 /// is the moment the request arrived plus that offset, its transmit time `t3` is the same
 /// plus `processing_ms`, which is how a real client reports a delay it caused itself.
+/// The client's own epoch, in seconds since it booted. A real answer carries this plus the
+/// 1900 offset, and this is the number the mirror stream's timestamps count from.
+const BOOT_SECONDS: u32 = 8_354;
+
+/// Seconds from 1900, which every timing answer carries and no media timestamp does.
+const SECONDS_FROM_1900: u32 = 2_208_988_800;
+
 fn answer(t1: u32, offset_seconds: u32, processing_ms: u32) -> Vec<u8> {
     let mut datagram = vec![0u8; 32];
     datagram[0] = 0x80;
     datagram[1] = 0x53;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("a clock")
-        .as_secs() as u32;
-    let t2 = now.wrapping_add(offset_seconds);
+    let t2 = BOOT_SECONDS
+        .wrapping_add(offset_seconds)
+        .wrapping_add(SECONDS_FROM_1900);
     let t3 = t2.wrapping_add(processing_ms / 1_000);
     datagram[8..12].copy_from_slice(&t1.to_be_bytes());
     datagram[16..20].copy_from_slice(&t2.to_be_bytes());
@@ -98,7 +93,10 @@ async fn an_answer_over_the_socket_becomes_a_measurement() {
     let response = parse_response(&reply).expect("an answer");
     assert_eq!(echoed, t1);
 
-    let t4 = u64::from_be_bytes(now_timestamp());
+    let t4 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock")
+        .as_nanos() as u64;
     let sample = clock
         .response_received(response.t1, response.t2, response.t3, t4)
         .expect("a matched answer is a measurement");
@@ -109,12 +107,13 @@ async fn an_answer_over_the_socket_becomes_a_measurement() {
     );
     assert_eq!(clock.samples_collected(), 1);
 
-    // The conversion has to be usable: a client timestamp has to land on this machine's
-    // clock, and the estimate must not be wilder than the round trip.
-    let remote = (response.t2 as u64) << 32;
+    // The conversion has to be usable: a mirror timestamp, which counts from the client's
+    // boot in Q32.32, has to land on this machine's clock. The exchange only knows the
+    // client's second, so two seconds of tolerance is what it can promise.
+    let remote = (u64::from(BOOT_SECONDS) + 5) << 32;
     let local = clock.to_local(remote).expect("a conversion");
     assert!(
-        local.abs_diff(t4) < 1_000_000_000,
+        local.abs_diff(t4) < 2_000_000_000,
         "converted {local} against a local time of {t4}"
     );
 

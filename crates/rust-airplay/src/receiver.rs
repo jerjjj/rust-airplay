@@ -305,9 +305,14 @@ impl ClockProbe {
         if seconds <= 0.0 || ticks <= 0.0 {
             return;
         }
+        // A Q32.32 timestamp ticks 2^32 times a second, so this is also a check on the
+        // unit: a delta that divides by 2^32 into one frame interval is fixed point, and
+        // one that divides into nothing is some other unit.
         log::info!(
-            "clock     video delta {ticks:.0} ticks in {seconds:.6} s -> {:.0} Hz",
-            ticks / seconds
+            "clock     video delta {ticks:.0} ticks in {seconds:.6} s -> {:.0} Hz, \
+             {:.3} frame intervals at 2^32 ticks a second",
+            ticks / seconds,
+            seconds * 4_294_967_296.0 / ticks
         );
     }
 
@@ -833,9 +838,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|since| since.as_nanos() as u64)
                             .unwrap_or(0);
-                        let Ok(t4) = crate::ntp::unix_nanos_to_timestamp(now) else {
-                            return;
-                        };
+
                         let Ok(mut clock) = clock.lock() else {
                             return;
                         };
@@ -844,7 +847,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                             response.t1,
                             response.t2,
                             response.t3,
-                            u64::from_be_bytes(t4),
+                            now,
                         ) {
                             // Logged every time the estimate is new, which is once per
                             // exchange in a quiet room and worth seeing: the offset is what
