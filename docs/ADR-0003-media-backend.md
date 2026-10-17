@@ -28,6 +28,12 @@ S3 只做到控制面、配对与发现，媒体（音频 RTP、镜像 TCP、重
    - 用户要把源码发布到 GitHub，因此**默认 `cargo test`/`clippy` 必须在没有 GStreamer 的机器上全绿**，且不应要求贡献者装第二套 Rust 工具链。
    - 子进程接入不需要 `unsafe`、不跟踪 C ABI；代价是管线只能靠描述串配置，`set_volume` 这类需要触碰管线属性的操作被推迟到 S4-3。
 
+6. **音频改为链接（2026-10-12 修订第 5 条，仅音频）**：**视频仍是子进程，音频改为链接 `gstreamer` + `gstreamer-app`**（`gstreamer-rs` 0.24）。这不是取舍偏好，而是**协议本身决定的**：
+   - 子进程的音视频都是"往 stdin 写字节流"。H.264/H.265 有 start code，解码器能在字节流里找到图像边界；**raw AAC-ELD 没有同步字、也不带采样率**，字节流无法表达"一帧到哪里结束"。上游用 `appsrc`**一帧一 buffer**（`renderers/audio_renderer.c:332-367`），这是唯一可行的投递方式。
+   - 实证：`tools/eld_probe.c` 用上游的方式喂真机数据，**300/300 buffer 解码出 PCM**；而同样数据走 `fdsrc` 字节流的每一种封装（`aacparse`、ADTS、LOAS）全部被拒。详见 `tools/eld_probe.md`。
+   - 顺带修掉一个关键错误：raw AAC 的 caps **必须带 `codec_data`**（`AudioSpecificConfig`），上游值是 `f8e85000`（ELD/44100/stereo/480）；本移植此前没有，且猜的 `f82c00` 连 ELD 都不是。
+   - **代价与边界**：`crates/airplay-renderer-gst` 的**构建期**从此需要 GStreamer 开发库（`pkg-config` 找 `gstreamer-1.0`/`gstreamer-app-1.0`）；默认 workspace（含 `airplay-renderer` 与 `airplay-core`）**仍然不链接任何 C 库**，第 2 条的承诺不变。门禁因此需要两种：默认门禁 + `--features airplay-cli/gst` 门禁。
+
 ## 后果
 
 - **新增系统依赖**：GStreamer SDK（`gstreamer-1.0`、`gstreamer-app-1.0`、`gstreamer-video-1.0`、`gstreamer-audio-1.0`）与插件集（ALAC、AAC/AAC-ELD 解码、H.264 解码、音视频 sink）。Windows 上需要 MSVC 版 GStreamer 运行时安装器；macOS 上沿用上游偏好的 `GStreamer.framework`。**第 5 条之后这条放宽为运行期依赖**：构建期不需要 GStreamer，只有运行一个真要出声出画的会话才需要 `gst-launch-1.0` 与相应插件；缺什么在打开流时报明确错误（`RenderError::Unavailable`），按 ADR 原文归为环境问题。

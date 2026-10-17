@@ -3,16 +3,22 @@
 //!
 //! This is the backend ADR-0003 chose first, in the shape upstream gives it: an audio
 //! renderer and a video renderer, each with a pipeline of its own, and the application
-//! choosing a sink (`upstream/UxPlay@3dbf7cee:renderers/`). What is different is how it
-//! reaches GStreamer: it runs `gst-launch-1.0` as a subprocess and writes frames to it,
-//! rather than linking `libgstreamer`. [`pipeline`] says why, and
-//! [`docs/ADR-0003-media-backend.md`] records the decision.
+//! choosing a sink (`upstream/UxPlay@3dbf7cee:renderers/`).
 //!
-//! The shape of a stream is a pipeline description and a pipe:
+//! **Audio is linked; video is a subprocess.** That split is not an accident of history —
+//! it is what the two media allow:
+//!
+//! - **Video** is run as `gst-launch-1.0` with frames written to its stdin. H.264 and H.265
+//!   carry start codes, so a decoder finds its own picture boundaries in a byte stream.
+//!   [`pipeline`] says why the subprocess shape was chosen, and
+//!   [`docs/ADR-0003-media-backend.md`] records the decision.
+//! - **Audio** cannot be: a raw AAC-ELD frame has no sync word and no sample rate of its
+//!   own, so a byte stream says nothing about where a frame ends. It needs one buffer per
+//!   frame — `appsrc` — which is why [`audio`] links `libgstreamer` for it.
 //!
 //! ```text
-//! audio:  fdsrc ! <caps of the coding> ! decodebin ! audioconvert ! <sink>
-//! video:  fdsrc ! h264parse ! avdec_h264 ! videoconvert ! <sink>
+//! audio:  appsrc ! queue ! avdec_aac ! audioconvert ! audioresample ! <sink>
+//! video:  fdsrc ! decodebin ! videoconvert ! video/x-raw,format=I420 ! <sink>
 //! ```
 //!
 //! A coding this backend cannot describe is refused when the stream is opened, not when
@@ -23,13 +29,13 @@
 
 #![deny(missing_docs)]
 
+pub mod audio;
 pub mod pipeline;
 
 use std::sync::Mutex;
 
 use airplay_renderer::{
-    AudioCodec, AudioConfig, AudioFrame, AudioStream, RenderError, Renderer, VideoConfig,
-    VideoFrame, VideoStream, Volume,
+    AudioConfig, AudioStream, RenderError, Renderer, VideoConfig, VideoFrame, VideoStream, Volume,
 };
 
 use pipeline::{LaunchError, Pipeline, find_launcher};
@@ -159,39 +165,15 @@ fn unavailable(error: LaunchError) -> RenderError {
     }
 }
 
-/// The caps a coding's frames are described by, which is what tells a decoder what it
-/// is being handed.
+/// What plays the audio stream, and the only thing this backend does not run as a
+/// subprocess.
 ///
-/// An empty description is a coding this backend cannot describe, which is refused
-/// rather than guessed at: a pipeline fed the wrong caps fails inside GStreamer, where
-/// the reason is far away from the decision that was wrong.
-fn audio_caps(config: AudioConfig) -> Result<String, RenderError> {
-    match config.codec {
-        // The stream's own framing is what the parser reads; the sample rate and
-        // channel count are the ones the session runs at, and a client that uses
-        // others is not one this backend has seen.
-        AudioCodec::AacEld => Ok(format!(
-            "audio/mpeg,mpegversion=4,stream-format=raw,channels={},rate={}",
-            config.channels, config.sample_rate
-        )),
-        AudioCodec::Alac => Ok(format!(
-            "audio/x-alac,channels={},rate={}",
-            config.channels, config.sample_rate
-        )),
-    }
+/// [`audio`] says why: a raw AAC-ELD frame has no sync word and no sample rate of its own,
+/// so a decoder can only be given these frames one buffer at a time, and a `gst-launch`
+/// pipeline fed bytes on stdin cannot say where a frame ends.
+fn open_audio(config: AudioConfig, sink: &str) -> Result<Box<dyn AudioStream>, RenderError> {
+    Ok(Box::new(audio::GstAudio::open(config, sink)?))
 }
-
-/// The pipeline one audio stream runs.
-///
-/// `fdsrc` reads the frames this backend writes; `decodebin` picks the decoder for the
-/// caps, which is what upstream does too rather than naming one decoder per coding.
-fn audio_pipeline(caps: &str, sink: &str) -> String {
-    // A silence the sink can play is what a decoder that gets nothing produces, so the
-    // pipeline is told not to expect a fixed rate: a client's clock and the sound
-    // card's are not the same clock.
-    format!("fdsrc ! {caps} ! decodebin ! audioconvert ! audioresample ! {sink} sync=false")
-}
-
 /// The pipeline one video stream runs.
 ///
 /// A mirror stream carries H.264 or H.265 depending on what the device sends and
@@ -211,12 +193,7 @@ fn video_pipeline(sink: &str) -> String {
 
 impl Renderer for GstRenderer {
     fn open_audio(&self, config: AudioConfig) -> Result<Box<dyn AudioStream>, RenderError> {
-        let caps = audio_caps(config)?;
-        let description = audio_pipeline(&caps, &self.audio_sink);
-        let pipeline = Pipeline::start(&self.program, &description).map_err(unavailable)?;
-        Ok(Box::new(GstAudio {
-            pipeline: std::sync::Arc::new(pipeline),
-        }))
+        open_audio(config, &self.audio_sink)
     }
 
     fn open_video(&self, _config: VideoConfig) -> Result<Box<dyn VideoStream>, RenderError> {
@@ -238,32 +215,6 @@ impl Renderer for GstRenderer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = volume;
         Ok(())
-    }
-}
-
-/// One audio stream, writing frames to a pipeline.
-#[derive(Debug)]
-struct GstAudio {
-    /// Shared, because a stream is handed to whichever thread plays it and the
-    /// pipeline has to outlive the value that opened it.
-    pipeline: std::sync::Arc<Pipeline>,
-}
-
-impl AudioStream for GstAudio {
-    fn push(&self, frame: AudioFrame) -> Result<(), RenderError> {
-        // A frame is written as the pipeline's own bytes: `fdsrc` has no framing of its
-        // own, so what a decoder reads is what a client sent.
-        self.pipeline.write(&frame.data).map_err(unavailable)
-    }
-
-    fn flush(&self) -> Result<(), RenderError> {
-        // A pipeline's buffers are its own; ending it is what drops them, and a stream
-        // is not something this backend can restart in place without a client's help.
-        Ok(())
-    }
-
-    fn close(&self) -> Result<(), RenderError> {
-        self.pipeline.finish().map_err(unavailable)
     }
 }
 

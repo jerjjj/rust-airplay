@@ -20,3 +20,10 @@ all = "warn"
 
 [dependencies]
 airplay-renderer = { path = "../airplay-renderer" }
+# Linked rather than run as a subprocess, because audio needs `appsrc` — one buffer per
+# frame — and a `gst-launch` pipeline fed bytes on stdin cannot express where a frame ends
+# (see `src/audio.rs`). Video is still a subprocess: H.264 has start codes, so a byte
+# stream carries its own framing.
+gstreamer = "0.24"
+gstreamer-app = "0.24"
+
