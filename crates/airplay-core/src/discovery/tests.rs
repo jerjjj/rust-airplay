@@ -24,12 +24,12 @@ fn audio_record_matches_the_upstream_fields() {
         ("da", "true"),
         ("et", "0,3,5"),
         ("vv", "2"),
-        ("ft", "0x5A7FFEE6,0x0"),
+        ("ft", "0x527FFEE6,0x0"),
         ("am", "AppleTV3,2"),
         ("md", "0,1,2"),
         ("rhd", "5.6.0.0"),
-        ("pw", "true"),
-        ("sf", "0x8c"),
+        ("pw", "false"),
+        ("sf", "0x4"),
         ("sr", "44100"),
         ("ss", "16"),
         ("sv", "false"),
@@ -54,7 +54,7 @@ fn control_record_matches_the_upstream_fields() {
     let txt = &advertisement.airplay_txt;
     for (key, value) in [
         ("deviceid", "aa:bb:cc:dd:ee:ff"),
-        ("features", "0x5A7FFEE6,0x0"),
+        ("features", "0x527FFEE6,0x0"),
         ("pw", "true"),
         ("flags", "0x4"),
         ("model", "AppleTV3,2"),
@@ -86,9 +86,13 @@ fn protection_selects_the_password_fields() {
         password.raop_txt.get("sf").map(String::as_str),
         Some("0x84")
     );
+    // A PIN is not a password. A receiver that asks a client to pair with a PIN advertises
+    // `pw=false` and `sf=0x4` — that is what UxPlay 1.74 does, read back from it with
+    // `dns-sd`. Saying otherwise sends a client down its credential path before connecting.
     let pin = Advertisement::new(&identity(), 7000, Protection::Pin);
-    assert_eq!(pin.raop_txt.get("sf").map(String::as_str), Some("0x8c"));
-    assert_eq!(pin.airplay_txt.get("pw").map(String::as_str), Some("true"));
+    assert_eq!(pin.raop_txt.get("sf").map(String::as_str), Some("0x4"));
+    assert_eq!(pin.raop_txt.get("pw").map(String::as_str), Some("false"));
+    assert_eq!(pin.airplay_txt.get("pw").map(String::as_str), Some("false"));
 }
 
 #[test]

@@ -46,9 +46,6 @@ const AIRPLAY_FLAGS: &str = "0x4";
 const RAOP_SF_OPEN: &str = "0x4";
 /// `sf` of the audio record when a digest password is required.
 const RAOP_SF_PASSWORD: &str = "0x84";
-/// `sf` of the audio record when a PIN is required; bit 3 means "pin required"
-/// (`upstream/UxPlay@3dbf7cee:lib/dns_sd/dns_sd.c:250-252`).
-const RAOP_SF_PIN: &str = "0x8c";
 
 /// What a client has to do before the receiver serves it.
 ///
@@ -67,19 +64,30 @@ pub enum Protection {
 
 impl Protection {
     /// `pw` value of both records.
+    ///
+    /// A **password** and nothing else. A client reads these fields to decide whether it
+    /// needs a credential, and UxPlay 1.74 advertises `pw=false` on a receiver that asks
+    /// clients to pair with a PIN — its own comment separates the two
+    /// (`upstream/UxPlay/lib/dnssd.c:45-47`: "1: use onscreen pin ... 2 or 3: require
+    /// password"). Pairing is a protocol step; a password is access control. Saying `true`
+    /// here told clients that a receiver with no password had one.
     fn password_required(self) -> &'static str {
         match self {
-            Self::None => "false",
-            Self::Password | Self::Pin => "true",
+            Self::None | Self::Pin => "false",
+            Self::Password => "true",
         }
     }
 
     /// `sf` value of the audio record.
+    ///
+    /// Read back from a running UxPlay 1.74 with `dns-sd`: `sf=0x4` on a receiver that does
+    /// PIN pairing, and `0x84` only when a password is configured. The value this port
+    /// used to send for PIN pairing, `0x8c`, set both the "pin required" bit and the
+    /// "password required" bit, which no receiver with a PIN alone advertises.
     fn status_flags(self) -> &'static str {
         match self {
-            Self::None => RAOP_SF_OPEN,
+            Self::None | Self::Pin => RAOP_SF_OPEN,
             Self::Password => RAOP_SF_PASSWORD,
-            Self::Pin => RAOP_SF_PIN,
         }
     }
 }

@@ -179,12 +179,26 @@ pub const DEFAULT_MODEL: &str = "AppleTV3,2";
 /// (`upstream/UxPlay/lib/global.h:22`).
 pub const DEFAULT_SOURCE_VERSION: &str = "220.68";
 
-/// AirPlay feature bitmap upstream advertises by default.
+/// AirPlay feature bitmap a receiver advertises by default.
 ///
-/// This is `(FEATURES_2 << 32) | FEATURES_1` with the defaults of
-/// `upstream/UxPlay/lib/dnssdint.h:32-34` joined as
-/// `upstream/UxPlay/lib/dnssd.c:155-158` does; bit 27 (legacy pairing) is set.
-pub const DEFAULT_FEATURES: u64 = 0x5A7F_FEE6;
+/// **Bit 27 is the one that decides how a client connects**, and it is worth being exact
+/// about. `upstream/UxPlay/uxplay.cpp:2161` says what it is:
+///
+/// > bit 27 of Features determines whether the AirPlay2 client-pairing protocol will be
+/// > used (1) or not (0)
+///
+/// UxPlay 1.74 leaves it clear (`setup_legacy_pairing = false`,
+/// `upstream/UxPlay/uxplay.cpp:164`) and advertises `0x527FFEE6`, which was read back from
+/// a running receiver with `dns-sd` rather than taken from a header. With the bit set a
+/// client is told to use the older pairing protocol, and iOS does: it starts
+/// `/pair-pin-start` and `/pair-setup-pin`, and only after that has failed or timed out
+/// does it settle on the modern flow. That is the wait between tapping a receiver and
+/// seeing a picture — a real device's log showed the pin flow answering `470` at the second
+/// step, which is a protocol it was told to try and this port does not complete.
+///
+/// `dnssdint.h:33`'s `0x5A7FFEE6` is the value before `uxplay.cpp` adjusts it; the running
+/// receiver is what matters, and it says `0x527FFEE6`.
+pub const DEFAULT_FEATURES: u64 = 0x527F_FEE6;
 
 /// Pairing identity upstream advertises (`upstream/UxPlay/lib/dnssdint.h:49`).
 pub const DEFAULT_PI: &str = "2e388006-13ba-4041-9a67-25dd4a43d536";
