@@ -689,6 +689,12 @@ async fn run() -> Result<(), String> {
             // A mirror stream cannot be read without its keys, so a connection that got
             // here first waits for the `SETUP` that derives them. The wait is beside the
             // accept rather than in front of it, so a second connection is still taken.
+            // When the client's video socket lands is the client's own idea of being
+            // connected, so it is timed against the same origin every trace line uses.
+            println!(
+                "media     mirror stream connected at +{} ms",
+                started.elapsed().as_millis()
+            );
             let current = loop {
                 if let Some(current) = *keys.borrow() {
                     break current;
@@ -727,6 +733,7 @@ async fn run() -> Result<(), String> {
             // A mirror stream carries its own codec data, so what it needs from the
             // renderer is a video stream and nothing else; the size is whatever the client
             // sends, which is not something `SETUP` says.
+            let opening = std::time::Instant::now();
             let video = match mirror_renderer.open_video(airplay_renderer::VideoConfig {
                 width: None,
                 height: None,
@@ -737,6 +744,11 @@ async fn run() -> Result<(), String> {
                     None
                 }
             };
+            println!(
+                "media     video stream open in {} ms (at +{} ms)",
+                opening.elapsed().as_millis(),
+                started.elapsed().as_millis()
+            );
             let mut frames: u64 = 0;
             let mut sent: u64 = 0;
             let mut refused = 0u64;
@@ -917,7 +929,8 @@ async fn run() -> Result<(), String> {
                     frames += 1;
                     if frames == 1 {
                         println!(
-                            "media     first video frame: {} bytes, {} units, idr={}, ts={}",
+                            "media     first video frame at +{} ms: {} bytes, {} units, idr={}, ts={}",
+                            started.elapsed().as_millis(),
                             frame.data.len(),
                             frame.units,
                             frame.idr,
