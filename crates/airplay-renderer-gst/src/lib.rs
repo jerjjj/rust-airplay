@@ -241,7 +241,22 @@ fn open_audio(config: AudioConfig, sink: &str) -> Result<Box<dyn AudioStream>, R
 /// something but not all of it". `videoconvert` to a format every sink reads removes
 /// the negotiation from the path a picture takes.
 fn video_pipeline(sink: &str) -> String {
-    format!("fdsrc ! decodebin ! videoconvert ! video/x-raw,format=I420 ! {sink} sync=false")
+    // The parser and the decoder are named, the way upstream names them
+    // (`upstream/UxPlay/renderers/video_renderer.c:383-395`: `appsrc ! queue ! <parser> !
+    // <decoder> ! <converter> ! <sink>`). `decodebin` looks like the general answer and is
+    // half the speed of the specific one: measured on a mirror stream of 1554x1080, thirty
+    // real frames took 2036 ms through `decodebin` and 1343 ms through `h264parse !
+    // avdec_h264`, because `decodebin` runs a typefinder and a dynamic pad for a stream
+    // whose format this port already knows. A client sends about 36 frames a second, so the
+    // general pipeline cannot keep up and the queue in front of it drops frames — and a
+    // dropped frame is not one lost frame, it is every frame after it that referred to it.
+    //
+    // H.264 because that is what this port can read: `CodecConfig` parses an `avcC`, and
+    // none of the port handles an `hvcC`.
+    format!(
+        "fdsrc ! queue ! h264parse ! avdec_h264 ! videoconvert ! \
+         video/x-raw,format=I420 ! {sink} sync=false"
+    )
 }
 
 impl Renderer for GstRenderer {
