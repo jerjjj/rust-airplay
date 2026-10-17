@@ -1,19 +1,22 @@
 # The GStreamer backend
 
 This crate renders a session's audio and video through GStreamer. It is **not** a member of
-the default workspace, and it is built and tested on its own:
+the default workspace: its gates need the GStreamer development libraries.
 
 ```powershell
-cd crates/airplay-renderer-gst
-cargo test                                   # the tests that need nothing
-cargo test -- --ignored --test-threads=1     # the ones that need a GStreamer runtime
+cargo test --workspace --all-targets                                 # the default gates
+cargo test -p airplay-renderer-gst -- --ignored --test-threads=1     # the ones that need a runtime
 ```
 
 ## What it needs
 
-A GStreamer runtime with `gst-launch-1.0` on `PATH`, and the plugins for what a client
-sends: a decoder for the audio coding (`alac` or AAC-ELD) and one for H.264, plus a sink.
-This machine's MSYS2/UCRT64 install (GStreamer 1.28.3) has all of them:
+To **build**: the GStreamer development files, found with `pkg-config` (`gstreamer-1.0`,
+`gstreamer-app-1.0`). MSYS2/UCRT64's install provides them, and `pkg-config.exe` there is on
+the system `PATH` on this machine.
+
+To **run**: a GStreamer runtime with `gst-launch-1.0` on `PATH` (video), and the plugins for
+what a client sends — a decoder for the audio coding (`alac` or AAC-ELD), one for H.264, and
+a sink:
 
 ```powershell
 $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
@@ -28,25 +31,36 @@ device, which is how the tests check a pipeline on a machine with no sound card.
 
 [ADR-0003](../../docs/ADR-0003-media-backend.md) chose GStreamer first and said the backend
 must not stop the default workspace's gates from passing on a machine without it. That
-leaves three ways to reach GStreamer on Windows, and this crate takes the third:
+leaves three ways to reach GStreamer on Windows:
 
 1. **Link it with the official bindings.** Needs a GStreamer SDK built for the same
    toolchain. The usual Windows GStreamer is MSYS2's, whose import libraries the MSVC
-   linker does not accept, so a contributor would need a second Rust toolchain. Rejected
-   for a repository anyone should be able to clone and build.
+   linker does not accept, so a contributor would need a second Rust toolchain.
 2. **Hand-written FFI, loaded at run time.** Works, keeps the build clean, and costs an
    `unsafe` surface that has to be maintained against GStreamer's ABI by hand.
 3. **Run `gst-launch-1.0` as a subprocess** and write frames to its standard input. No
    `unsafe`, no toolchain coupling, no ABI to track — the pipeline is GStreamer's own.
 
-The third is what this crate does. What it costs is that the pipeline is a description
-rather than a graph this code builds: a caller cannot reach into it to set a property, and
-a sink has to be one `gst-launch` knows by name. For the operations a session needs —
-open, push, flush, close — that is not a limitation, and `S4-3` is where the ones that need
-a property (volume) have to be looked at again.
+**Video takes the third. Audio takes the first, and has to.** This was settled by
+measurement, not preference (`tools/eld_probe.md` records it):
 
-It also means the runtime is found at run time, which is the right failure mode: a machine
-without GStreamer gets a receiver that says so, not one that will not start.
+- H.264 and H.265 carry start codes, so a decoder finds picture boundaries in a byte
+  stream. Video is a subprocess, and works.
+- A raw AAC-ELD frame has **no sync word and no sample rate**. A byte stream says nothing
+  about where a frame ends, and every framing tried as a substitute fails: `aacparse` has
+  nothing to split on, ADTS's two-bit profile cannot express object type 39, and LOAS —
+  which can — is refused by `aacparse`.
+
+So audio is delivered as `appsrc`, one buffer per frame, which is what upstream does and why
+upstream plays sound. It also means the caps matter in a way they never did for video: they
+must carry `codec_data`, the `AudioSpecificConfig` a raw frame cannot carry
+(`f8e85000` for ELD at 44.1 kHz stereo). Without it every decoder refuses the stream with
+"output caps are unfixed", and nothing says so until forty frames in.
+
+What the split costs: this crate needs GStreamer's development files to build, so it is
+built by the `--features airplay-cli/gst` gate rather than the default one. The default
+workspace — `airplay-core`, `airplay-renderer`, `airplay-cli` without the feature — still
+links nothing.
 
 ## What the tests cover
 
@@ -59,20 +73,26 @@ wrapper:
   intact);
 - a parameter set behind a start code is taken by the video pipeline;
 - a sink a machine does not have is reported when a stream is opened, not as silence;
-- the volume a session sets is read back.
+- the volume a session sets is read back;
+- **forty frames of a real AAC-ELD session are decoded into PCM**
+  (`tests/audio.rs`), which is the check that would have caught this backend playing
+  nothing: `appsrc` accepts a buffer long before a decoder refuses it, so a test that
+  stopped at "push returned Ok" passes in silence.
 
-They are `#[ignore]`d for the same reason the crate is: the default workspace's gates run
-where GStreamer is not installed.
+They are `#[ignore]`d because they need a GStreamer runtime, which not every machine has.
 
 ## What the tests keep
 
 `tests/fixtures/mirror-first-frames.h264` is the first thirty frames of a real
 session: an iPad mirroring a 1554x1080 screen, as this backend handed them to a
-decoder. It is committed because it is the only evidence that survives a session —
-a device is not available to a test, and "the picture looks wrong" cannot be
-asserted, while "the pipeline decoded every frame" can.
+decoder. `tests/fixtures/mirror-first-audio.eld` is forty audio payloads from a session of
+the same kind, each behind its length. Both are committed because they are the only
+evidence that survives a session — a device is not available to a test, and "the picture
+looks wrong" cannot be asserted, while "the pipeline decoded every frame" and "the decoder
+produced PCM" can.
 
-Two tests read it, and they are the ones to run first when a picture is wrong:
+Two tests read the video fixture, and they are the ones to run first when a picture is
+wrong:
 
 ```powershell
 $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
