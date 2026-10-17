@@ -231,13 +231,22 @@ impl Pipeline {
     /// reported before it would have started playing anything, and one it accepts never
     /// exits at all.
     fn settle(&self) {
-        const SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+        // How long a pipeline gets to say it is refused. Measured rather than guessed:
+        // `gst-launch` rejects a bad pipeline (`nope ! fakesink`, and one naming a sink
+        // that does not exist) after 81 to 91 ms, because what takes the time is the
+        // process starting rather than the pipeline being checked; a good one reaches
+        // PLAYING in 82 to 85 ms. This waits a little past the slowest of those.
+        //
+        // It was 400 ms, and that cost every session a quarter of a second before its
+        // first frame for nothing: a client is already sending by the time a mirror
+        // stream opens, so this is time the picture spends not being decoded.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
         let deadline = std::time::Instant::now() + SETTLE;
         while std::time::Instant::now() < deadline {
             if !self.is_running() {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

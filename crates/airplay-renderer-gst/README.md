@@ -62,6 +62,35 @@ built by the `--features airplay-cli/gst` gate rather than the default one. The 
 workspace — `airplay-core`, `airplay-renderer`, `airplay-cli` without the feature — still
 links nothing.
 
+## What a session costs before its first picture
+
+Tapping a receiver on an iPad and waiting for the picture is a race between the client and
+the backend's own start-up, so the start-up is worth knowing in milliseconds. Measured on
+this machine (Windows, GStreamer 1.28.3, the committed video fixture decoded and shown):
+
+| what | cost |
+|---|---|
+| `gst-launch` starting a pipeline and reaching PLAYING | 82–85 ms |
+| the same, for a pipeline it refuses | 81–91 ms |
+| decoding thirty real frames to `fakesink` (no window) | 354 ms |
+| the same to `glimagesink` | 1 114 ms |
+| the same to `d3d11videosink` | 1 387 ms |
+| the same to `autovideosink` (the default) | 1 756 ms |
+
+So almost all of it is the sink bringing up a window on the GPU, not this crate: a
+pipeline with no sink to talk to finishes in a third of the time. `autovideosink` is the
+default because upstream's is (`uxplay.cpp:110`), and it is the slowest of these because it
+searches for a sink at run time. `AIRPLAY_GST_VIDEO_SINK=d3d11videosink` was about 370 ms
+quicker here, and on a machine where that element is missing the pipeline says so when the
+stream is opened rather than showing nothing.
+
+`Pipeline::start` waits for a pipeline to say whether it is refused, and that wait was a
+fixed 400 ms until it was measured: `gst-launch` rejects a bad description after about
+85 ms, because what takes the time is the process starting rather than the check. It is
+150 ms now — a quarter of a second per connection that the picture spent not being decoded.
+
+The audio side is not part of this wait. A session opens its audio stream on a task of its
+own (175 ms for `wasapisink` to come up), and the first picture does not queue behind it.
 ## What the tests cover
 
 The tests that need no runtime check the descriptions this crate builds and the errors it
