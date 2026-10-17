@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// SPDX-License-Identifier: GPL-3.0-or-later
 //! The mirror stream: its keys, and the packets that carry video.
 //!
 //! A mirroring client sets up a stream of its own with `SETUP`, and the two

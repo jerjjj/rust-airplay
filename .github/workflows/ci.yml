@@ -11,7 +11,7 @@ jobs:
   core:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +32,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - run: cargo check --workspace --all-targets --locked
 
-  # The differential tests compare this port with the upstream C implementation.
-  # They are `#[ignore]`d in the ordinary suite, which must not need a C
-  # toolchain; this job is what keeps them from being forgotten.
+  # The GStreamer backend is excluded from the workspace so that the gates above need no
+  # system libraries (docs/ADR-0003-media-backend.md rules 5 and 6). Without this job it
+  # would simply stop being built, which is how a backend rots.
+  gstreamer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # gstreamer-rs finds the libraries with pkg-config, so it needs the development files
+      # and not only the runtime.
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      - run: cargo fmt --manifest-path crates/airplay-renderer-gst/Cargo.toml -- --check
+      - run: cargo test --manifest-path crates/airplay-renderer-gst/Cargo.toml --locked
+      - run: cargo clippy --manifest-path crates/airplay-renderer-gst/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo doc --manifest-path crates/airplay-renderer-gst/Cargo.toml --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # And the CLI with the feature that pulls it in, which is what a session actually
+      # runs: a backend that compiles on its own and not through its caller is not built.
+      - run: cargo clippy -p airplay-cli --features gst --all-targets --locked -- -D warnings
+
+  # The differential tests compare this port with the upstream C implementation, and they
+  # are the ones that found the mirror counter fault. **They do not run here**: the oracle
+  # compiles upstream's C, which is not vendored (`.gitignore` excludes `/upstream/`), and
+  # `tools/oracle/build.ps1` drives MSYS2/UCRT64 on Windows. Running it therefore needs a
+  # local checkout of FDH2/UxPlay at the commit in `research/evidence/upstream-commit.txt`:
+  #
+  #   pwsh -File tools/oracle/run.ps1
+  #
+  # That gap is stated rather than papered over: a CI job that fetches upstream and builds
+  # it on Linux is worth having, and is not written yet.

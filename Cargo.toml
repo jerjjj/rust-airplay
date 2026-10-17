@@ -1,15 +1,18 @@
 [workspace]
-# The GStreamer backend is a member so that the CLI can depend on it behind a feature
-# ("gst", off by default): a machine with no GStreamer still builds, tests and lints this
-# workspace unchanged, and a machine that has one asks for it explicitly. That is the
-# isolation `docs/ADR-0003-media-backend.md` requires, and the crate's README says how to
-# run what needs a runtime.
+# The GStreamer backend is **not** a member: its audio path links `libgstreamer`, so
+# building it needs the GStreamer development files, and a machine without them must still
+# be able to run every gate here (`docs/ADR-0003-media-backend.md` rules 5 and 6). It is
+# excluded rather than merely unlisted because the CLI depends on it by path, and it is
+# built by asking for that feature:
+#
+#   cargo build -p airplay-cli --features gst
+#   cargo test --manifest-path crates/airplay-renderer-gst/Cargo.toml
 members = [
     "crates/airplay-core",
     "crates/airplay-cli",
     "crates/airplay-renderer",
-    "crates/airplay-renderer-gst",
 ]
+exclude = ["crates/airplay-renderer-gst"]
 resolver = "3"
 
 [workspace.package]
