@@ -3,6 +3,7 @@ name = "rust-airplay-gstreamer"
 description = "GStreamer renderer backend for the rust-airplay receiver"
 repository = "https://github.com/jerjjj/rust-airplay"
 readme = "README.md"
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "README.zh-CN.md"]
 keywords = ["airplay", "gstreamer", "renderer", "video", "audio"]
 categories = ["multimedia"]
 version = "0.1.0"
