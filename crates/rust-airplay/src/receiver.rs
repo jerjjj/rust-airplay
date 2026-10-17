@@ -78,7 +78,7 @@ struct FreshestFrames {
 
 #[derive(Debug, Default)]
 struct Frames {
-    queued: std::collections::VecDeque<(Vec<u8>, u64, bool)>,
+    queued: std::collections::VecDeque<(Vec<u8>, u64, bool, u64)>,
     /// Set when no more frames will arrive, which is what wakes the writer for the last
     /// time.
     ended: bool,
@@ -98,7 +98,7 @@ impl FreshestFrames {
     ///
     /// Returns how many are waiting afterwards, so a caller can report a depth without
     /// asking a second question.
-    fn put(&self, frame: (Vec<u8>, u64, bool)) -> usize {
+    fn put(&self, frame: (Vec<u8>, u64, bool, u64)) -> usize {
         let mut state = lock(&self.state);
         if state.ended {
             return 0;
@@ -115,7 +115,7 @@ impl FreshestFrames {
     }
 
     /// Takes the next frame, waiting until there is one or the queue has ended.
-    fn take(&self) -> Option<(Vec<u8>, u64, bool)> {
+    fn take(&self) -> Option<(Vec<u8>, u64, bool, u64)> {
         let mut state = lock(&self.state);
         loop {
             if let Some(frame) = state.queued.pop_front() {
@@ -1036,7 +1036,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                     // established: consecutive frames differed by 143156808 of them.
                     let mut pacer =
                         crate::media::pace::Pacer::new(crate::media::pace::Ticks::NtpFixed);
-                    while let Some((data, timestamp, idr)) = queued.take() {
+                    while let Some((data, timestamp, idr, received)) = queued.take() {
                         // What the pacing is actually told, for the first frames: the
                         // interval a device sends is not a frame rate this crate can
                         // assume, and a wrong one is a wait that stalls a picture
@@ -1059,10 +1059,27 @@ pub async fn run(config: Config) -> Result<(), Error> {
                         // Waiting here cannot stall the session: this is the thread that
                         // owns the queue, and the receive loop is on another one dropping
                         // what it cannot hand over.
-                        let arrival = started.elapsed().as_nanos() as u64;
+                        // Two delays make up what the viewer sees, and they are counted
+                        // apart: how long the frame waited in the queue to be written, and
+                        // how long the pacer then held it. A single number cannot say which
+                        // of them to change.
+                        let now = started.elapsed().as_nanos() as u64;
+                        let arrival = received;
+                        let residence = now.saturating_sub(received);
+                        let wanted = pacer.due(timestamp, arrival);
                         let due = pacer.due_limited(timestamp, arrival, MAX_LEAD);
-                        if let Some(wait) = crate::media::pace::Pacer::wait(due, arrival) {
+                        let mut waited = 0;
+                        if let Some(wait) = crate::media::pace::Pacer::wait(due, now) {
                             std::thread::sleep(wait);
+                            waited = wait.as_millis();
+                        }
+                        if shown < 40 || shown % 120 == 0 {
+                            log::info!(
+                                "media     pace frame {shown}: queued {:.0} ms, \
+                                 pacer wanted {:.0} ms, waited {waited} ms",
+                                residence as f64 / 1e6,
+                                wanted.saturating_sub(arrival) as f64 / 1e6
+                            );
                         }
                         if let Err(error) = video.push(crate::VideoFrame {
                             data,
@@ -1244,7 +1261,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
                     // the most recent frames there are. It is said once, because either
                     // way a dropped frame is one the rest of the stream may depend on.
                     sent += 1;
-                    let depth = feed.put((frame.data, frame.timestamp, frame.idr));
+                    let received = started.elapsed().as_nanos() as u64;
+                    let depth = feed.put((frame.data, frame.timestamp, frame.idr, received));
                     if refused == 0 && depth >= QUEUED_FRAMES {
                         refused = 1;
                         log::warn!(
