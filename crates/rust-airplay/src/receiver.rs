@@ -1136,8 +1136,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
             let received_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let watching = std::sync::Arc::clone(&received);
             let watching_bytes = std::sync::Arc::clone(&received_bytes);
-            let watching_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let watching_frames_task = std::sync::Arc::clone(&watching_frames);
+            // Frames that reached the renderer. The reporter reads a clone, so the count
+            // outlives the serving loop that fills it.
+            let frames_out = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let watching_frames = std::sync::Arc::clone(&frames_out);
             // The census the session keeps is the one the reporter reads: it is shared
             // rather than copied, so there is one answer to what became of the packets.
             let watching_census = session.census();
@@ -1151,7 +1153,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                     let now = (
                         watching.load(std::sync::atomic::Ordering::Relaxed),
                         watching_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        watching_frames_task.load(std::sync::atomic::Ordering::Relaxed),
+                        watching_frames.load(std::sync::atomic::Ordering::Relaxed),
                     );
                     if now != last {
                         log::info!(
@@ -1231,6 +1233,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                     },
                     |frame| {
                     frames += 1;
+                    frames_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if frames == 1 {
                         log::info!(
                             "media     first video frame at +{} ms: {} bytes, {} units, idr={}, ts={}",

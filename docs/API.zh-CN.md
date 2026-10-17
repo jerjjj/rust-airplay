@@ -37,6 +37,7 @@ pub async fn run(config: Config) -> Result<(), Error>
 | `trace_log` | `Option<PathBuf>` | 设置后把请求轨迹追加到该文件 |
 | `dump_video` | `Option<PathBuf>` | 设置后把最早的视频帧以 Annex-B 追加到该文件 |
 | `dump_audio` | `Option<PathBuf>` | 设置后把音频负载带长度前缀追加到该文件 |
+| `pace_video` | `bool` | 是否按采集间隔节流镜像视频。默认关闭：投屏看的是画面跟手的快慢 |
 
 `ClientCallback` 的类型是 `Arc<dyn Fn(&[u8; 32]) + Send + Sync>`。它在验证客户端的连接上执行，因此写文件的实现应当让工作量足够小，或者干脆交给另一个线程。
 
@@ -108,6 +109,7 @@ pub trait Renderer: Debug + Send + Sync {
 | `--video-parser <name>` | 镜像流的 GStreamer parser |
 | `--video-decoder <name>` | 镜像流的 GStreamer 解码器 |
 | `--warm-video` | 视频管线随接收端一起启动 |
+| `--pace-video` | 按采集间隔节流视频 |
 | `--audio-codec <alac\|aac-eld>` | 客户端发送的编码，默认 `aac-eld` |
 | `--help` | 打印用法并退出 |
 

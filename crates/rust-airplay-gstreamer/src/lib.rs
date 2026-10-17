@@ -55,7 +55,7 @@ pub const AUDIO_SINKS: &[&str] = &[
 ];
 
 /// The video sinks this backend can show, in the order it prefers them.
-pub const VIDEO_SINKS: &[&str] = &["autovideosink", "d3d11videosink", "glimagesink", "fakesink"];
+pub const VIDEO_SINKS: &[&str] = &["d3d11videosink", "autovideosink", "glimagesink", "fakesink"];
 
 /// Environment variable naming the audio sink to use.
 pub const AUDIO_SINK_ENV: &str = "AIRPLAY_GST_AUDIO_SINK";

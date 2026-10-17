@@ -45,6 +45,7 @@ instead of a hidden default. The library reads no environment variable and opens
 | `trace_log` | `Option<PathBuf>` | when set, request traces are appended here |
 | `dump_video` | `Option<PathBuf>` | when set, the first video frames are appended here as Annex-B |
 | `dump_audio` | `Option<PathBuf>` | when set, audio payloads are appended here behind a length |
+| `pace_video` | `bool` | whether mirror video is held back to its capture spacing. Off by default: a mirror is judged by how quickly it follows the device |
 
 `ClientCallback` is `Arc<dyn Fn(&[u8; 32]) + Send + Sync>`. It runs on the connection that
 verified the client, so an implementation that writes a file should keep the work small or
@@ -127,6 +128,7 @@ decryption without running a server.
 | `--video-parser <name>` | the parser the mirror pipeline starts with |
 | `--video-decoder <name>` | the decoder that follows it |
 | `--warm-video` | start the video pipeline with the receiver |
+| `--pace-video` | hold video to the spacing it was captured at |
 | `--audio-codec <alac\|aac-eld>` | the coding a client sends; `aac-eld` by default |
 | `--help` | print the usage text and exit |
 
