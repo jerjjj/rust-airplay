@@ -686,7 +686,20 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 let playing = stream.map(|playing| {
                     std::thread::spawn(move || {
                         use std::sync::atomic::Ordering;
+                        // Anchored on the first frame's arrival, then advancing by the
+                        // samples each frame carries: an audio timestamp is an RTP counter
+                        // from a random origin, so only its differences mean anything.
+                        let mut pacer =
+                            crate::media::pace::Pacer::new(crate::media::pace::Ticks::Samples(
+                                crate::AudioConfig::default().sample_rate,
+                            ));
+                        let opened = std::time::Instant::now();
                         while let Ok(frame) = queued.recv() {
+                            let arrival = opened.elapsed().as_nanos() as u64;
+                            let due = pacer.due(frame.timestamp, arrival);
+                            if let Some(wait) = crate::media::pace::Pacer::wait(due, arrival) {
+                                std::thread::sleep(wait);
+                            }
                             // What real-time playback needs and this backend does not do
                             // yet: the frame carries its timestamp and the sink is told to
                             // play as fast as it is given, so audio runs at whatever rate
@@ -1008,6 +1021,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
             let playing = video.map(|video| {
                 std::thread::spawn(move || {
                     let mut shown: u64 = 0;
+                    // A mirror timestamp counts 2^32 to the second, which the device run
+                    // established: consecutive frames differed by 143156808 of them.
+                    let mut pacer =
+                        crate::media::pace::Pacer::new(crate::media::pace::Ticks::NtpFixed);
                     while let Some((data, timestamp, idr)) = queued.take() {
                         // What the pacing is actually told, for the first frames: the
                         // interval a device sends is not a frame rate this crate can
@@ -1021,20 +1038,21 @@ pub async fn run(config: Config) -> Result<(), Error> {
                                 data.len()
                             );
                         }
-                        // No waiting between frames, and the interval that used to
-                        // drive one is only printed now. Waiting was this crate's own
-                        // idea and it was wrong twice over: the pipeline it was
-                        // protecting measures fifty-one frames a second on the machine
-                        // it runs on, so it never needed protecting, and a wait of one
-                        // frame interval sets the rate to exactly what the client sends
-                        // — so the writer plus its own wait could only ever be slower
-                        // than the stream. The queue filled, frames were dropped, and
-                        // every later frame referred to a picture that was never
-                        // finished.
+                        // The frame's own timestamp says when it is due, and the pacer
+                        // is anchored on the first one. This is not the guess that had to
+                        // be removed once: that one derived an interval from the pipeline's
+                        // throughput, while this derives it from the client's clock, which
+                        // is a rate the stream actually has. A frame arriving in a burst
+                        // still plays when it was captured.
                         //
-                        // What paces a stream is what reads it: writing to a pipeline
-                        // blocks when the pipeline is full, which is backpressure doing
-                        // the job without a guess about the client's clock.
+                        // Waiting here cannot stall the session: this is the thread that
+                        // owns the queue, and the receive loop is on another one dropping
+                        // what it cannot hand over.
+                        let arrival = started.elapsed().as_nanos() as u64;
+                        let due = pacer.due(timestamp, arrival);
+                        if let Some(wait) = crate::media::pace::Pacer::wait(due, arrival) {
+                            std::thread::sleep(wait);
+                        }
                         if let Err(error) = video.push(crate::VideoFrame {
                             data,
                             timestamp,

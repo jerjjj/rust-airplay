@@ -129,6 +129,7 @@ pub struct GstRenderer {
     video_parser: String,
     /// The decoder that follows it, with any converter it needs.
     video_decoder: String,
+
     /// The volume element of the audio stream that is playing, when there is one.
     ///
     /// A client's volume can change mid-session, and a pipeline started before the change

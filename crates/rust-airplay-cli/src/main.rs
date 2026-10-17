@@ -36,6 +36,7 @@ Options:
   --video-parser <name>  GStreamer parser for the mirror stream
   --video-decoder <name> GStreamer decoder for the mirror stream
   --warm-video           Start the video pipeline with the receiver
+
   --audio-codec <codec>  alac or aac-eld, what the client's frames are
   --help                 Print this text
 
@@ -93,6 +94,7 @@ impl Default for Options {
             video_parser: None,
             video_decoder: None,
             warm_video: false,
+
             // AirPlay 2 clients send AAC-ELD, which is what an iPhone or iPad paired with
             // this receiver sends.
             audio_codec: AudioCodec::AacEld,
@@ -132,6 +134,7 @@ fn open_gst(options: &Options) -> Result<Arc<dyn Renderer>, String> {
     if options.warm_video {
         backend.warm_video = true;
     }
+
     let program = rust_airplay_gstreamer::GstRenderer::find_launcher()
         .map_err(|error| format!("--render gst: {error}"))?;
     let renderer = rust_airplay_gstreamer::GstRenderer::with_options(&program, backend)
@@ -401,6 +404,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Opt
                 options.video_decoder = Some(next_value(&mut arguments, "--video-decoder")?);
             }
             "--warm-video" => options.warm_video = true,
+
             "--audio-codec" => {
                 let name = next_value(&mut arguments, "--audio-codec")?;
                 options.audio_codec = match name.as_str() {

@@ -78,7 +78,7 @@ fn audio_decoder(codec: AudioCodec) -> &'static str {
 /// clock, and waiting on one to schedule the other is what makes a receiver stutter.
 fn audio_description(config: AudioConfig, sink: &str, volume: f64) -> String {
     format!(
-        "appsrc name=audio_source ! queue ! {} ! audioconvert ! audioresample quality=10 ! \
+        "appsrc name=audio_source is-live=true format=time ! queue ! {} ! audioconvert ! audioresample quality=10 ! \
          volume name=volume volume={volume} ! {sink} sync=false",
         audio_decoder(config.codec)
     )
@@ -103,6 +103,9 @@ pub(crate) struct GstAudio {
     stop: Option<Sender<()>>,
     /// How many frames were pushed, so a silent session can be told from a stalled one.
     pushed: AtomicU64,
+    /// The timestamp of the first frame of this stream, which every presentation time is
+    /// measured from. Set once, by the first frame that arrives.
+    first_timestamp: std::sync::OnceLock<u64>,
     /// The rate a frame's timestamp is counted in, which is what makes it a time.
     ///
     /// `AudioFrame::timestamp` is the client's own clock, and for audio that clock counts
@@ -119,6 +122,17 @@ impl std::fmt::Debug for GstAudio {
             .field("pushed", &self.pushed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
+}
+
+/// How long after a stream's first frame a frame with `samples` elapsed samples is due.
+///
+/// Kept separate from the pipeline so the arithmetic can be tested without one: a
+/// presentation time that is wrong by a factor of the sample rate turns into audio that
+/// plays at the wrong speed, and that is worth a test that does not need a sound card.
+pub(crate) fn relative_nanos(samples: u64, rate: u32) -> u64 {
+    let rate = u64::from(rate.max(1));
+    (samples / rate).saturating_mul(1_000_000_000)
+        + (samples % rate).saturating_mul(1_000_000_000) / rate
 }
 
 impl GstAudio {
@@ -156,6 +170,7 @@ impl GstAudio {
             failure,
             stop: Some(stop),
             pushed: AtomicU64::new(0),
+            first_timestamp: std::sync::OnceLock::new(),
             sample_rate: config.sample_rate.max(1),
         })
     }
@@ -302,17 +317,21 @@ impl AudioStream for GstAudio {
         // and a decoder given a run of frames reads only the first one.
         let mut buffer = gst::Buffer::from_slice(frame.data);
         if let Some(buffer) = buffer.get_mut() {
-            // Samples to nanoseconds, which is the only clock a buffer has. The absolute
-            // value is the client's rather than this machine's: turning it into a play
-            // time needs a base taken from the first frame and an offset from the clock
-            // exchange, which is what synchronising playback will do — until then the sink
-            // is told not to wait, so nothing here is scheduled against it.
-            let seconds = frame.timestamp / u64::from(self.sample_rate);
-            let nanos = frame.timestamp % u64::from(self.sample_rate) * 1_000_000_000
-                / u64::from(self.sample_rate);
-            buffer.set_pts(gst::ClockTime::from_nseconds(
-                seconds.saturating_mul(1_000_000_000).saturating_add(nanos),
-            ));
+            // Presentation time is measured from the stream's first frame, not from the
+            // client's epoch: an audio timestamp is an RTP counter from a random origin,
+            // so its absolute value means nothing here. What it does mean is elapsed
+            // audio, and a sink told to synchronise schedules against exactly that.
+            let first = match self.first_timestamp.get() {
+                Some(first) => *first,
+                None => {
+                    let _ = self.first_timestamp.set(frame.timestamp);
+                    frame.timestamp
+                }
+            };
+            buffer.set_pts(gst::ClockTime::from_nseconds(relative_nanos(
+                frame.timestamp.wrapping_sub(first),
+                self.sample_rate,
+            )));
         }
         self.appsrc.push_buffer(buffer).map_err(|error| {
             RenderError::Failed(format!("the pipeline refused a frame: {error}"))
@@ -344,6 +363,45 @@ impl Drop for GstAudio {
         // a sound card held open by a session that ended.
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::relative_nanos;
+
+    #[test]
+    fn one_frame_of_forty_eight_kilohertz_audio_is_ten_milliseconds() {
+        // What a device sends at 44.1 kHz is 480 samples a frame, which is 10.88 ms.
+        assert_eq!(relative_nanos(480, 44_100), 10_884_353);
+        // And a whole second is a whole second, at both rates this crate opens.
+        assert_eq!(relative_nanos(44_100, 44_100), 1_000_000_000);
+        assert_eq!(relative_nanos(48_000, 48_000), 1_000_000_000);
+    }
+
+    #[test]
+    fn the_presentation_clock_does_not_drift() {
+        // The time of a frame is computed from its timestamp, never accumulated from the
+        // frame before, so a rounding error cannot add up: at the end of a minute of audio
+        // the time is exact to within the nanosecond the division truncates.
+        for frames in [1u64, 30, 1_000, 5_515] {
+            let samples = frames * 480;
+            let expected = samples * 1_000_000_000 / 44_100;
+            let computed = relative_nanos(samples, 44_100);
+            assert!(
+                computed.abs_diff(expected) < 1,
+                "{frames} frames gave {computed}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_frames_are_always_later() {
+        let mut previous = relative_nanos(0, 44_100);
+        for frames in 1..10u64 {
+            let now = relative_nanos(frames * 480, 44_100);
+            assert!(now > previous, "frame {frames} did not advance");
+            previous = now;
         }
     }
 }

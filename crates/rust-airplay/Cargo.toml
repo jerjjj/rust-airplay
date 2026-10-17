@@ -1,6 +1,6 @@
 [package]
 name = "rust-airplay"
-description = "AirPlay 1/2 receiver: the protocol, the media session and the renderer boundary"
+description = "AirPlay  receiver: the protocol, the media session and the renderer boundary"
 repository = "https://github.com/jerjjj/rust-airplay"
 readme = "README.md"
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "README.zh-CN.md"]
