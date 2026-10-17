@@ -103,6 +103,11 @@ pub trait Renderer: Debug + Send + Sync {
 | `--seed <hex>` | 32 字节身份，写成 64 个十六进制字符 |
 | `--log <file>` | 把请求轨迹追加到文件 |
 | `--render <null\|gst>` | 由什么播放媒体，默认 `null` |
+| `--audio-sink <name>` | GStreamer 音频 sink，覆盖环境变量 |
+| `--video-sink <name>` | GStreamer 视频 sink，覆盖环境变量 |
+| `--video-parser <name>` | 镜像流的 GStreamer parser |
+| `--video-decoder <name>` | 镜像流的 GStreamer 解码器 |
+| `--warm-video` | 视频管线随接收端一起启动 |
 | `--audio-codec <alac\|aac-eld>` | 客户端发送的编码，默认 `aac-eld` |
 | `--help` | 打印用法并退出 |
 

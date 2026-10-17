@@ -31,6 +31,11 @@ Options:
   --seed <hex>           Identity seed, 32 bytes of hex (default: stored file)
   --log <file>           Append the request trace to a file, for archiving a session
   --render <backend>     What plays the media: null (default) or gst
+  --audio-sink <name>    GStreamer audio sink
+  --video-sink <name>    GStreamer video sink
+  --video-parser <name>  GStreamer parser for the mirror stream
+  --video-decoder <name> GStreamer decoder for the mirror stream
+  --warm-video           Start the video pipeline with the receiver
   --audio-codec <codec>  alac or aac-eld, what the client's frames are
   --help                 Print this text
 
@@ -53,6 +58,12 @@ struct Options {
     log: Option<String>,
     render: RenderBackend,
     audio_codec: AudioCodec,
+    /// Overrides for the GStreamer backend, when that is the one chosen.
+    audio_sink: Option<String>,
+    video_sink: Option<String>,
+    video_parser: Option<String>,
+    video_decoder: Option<String>,
+    warm_video: bool,
 }
 
 /// What plays the media a client sends.
@@ -77,6 +88,11 @@ impl Default for Options {
             seed: None,
             log: None,
             render: RenderBackend::Null,
+            audio_sink: None,
+            video_sink: None,
+            video_parser: None,
+            video_decoder: None,
+            warm_video: false,
             // AirPlay 2 clients send AAC-ELD, which is what an iPhone or iPad paired with
             // this receiver sends.
             audio_codec: AudioCodec::AacEld,
@@ -89,17 +105,36 @@ impl Default for Options {
 /// `--render gst` in a build without the feature is refused rather than quietly
 /// downgraded: a receiver that plays nothing while its user believes it should be playing
 /// is worse than one that says which build it is.
-fn renderer(backend: RenderBackend) -> Result<Arc<dyn Renderer>, String> {
+fn renderer(backend: RenderBackend, options: &Options) -> Result<Arc<dyn Renderer>, String> {
     match backend {
         RenderBackend::Null => Ok(Arc::new(rust_airplay::NullRenderer::new())),
-        RenderBackend::Gst => open_gst(),
+        RenderBackend::Gst => open_gst(options),
     }
 }
 
 /// The GStreamer backend, when this build has it.
 #[cfg(feature = "gst")]
-fn open_gst() -> Result<Arc<dyn Renderer>, String> {
-    let renderer = rust_airplay_gstreamer::GstRenderer::new()
+fn open_gst(options: &Options) -> Result<Arc<dyn Renderer>, String> {
+    // The defaults come from the environment, and a flag overrides one of them.
+    let mut backend = rust_airplay_gstreamer::Options::default();
+    if let Some(sink) = &options.audio_sink {
+        backend.audio_sink = sink.clone();
+    }
+    if let Some(sink) = &options.video_sink {
+        backend.video_sink = sink.clone();
+    }
+    if let Some(parser) = &options.video_parser {
+        backend.video_parser = parser.clone();
+    }
+    if let Some(decoder) = &options.video_decoder {
+        backend.video_decoder = decoder.clone();
+    }
+    if options.warm_video {
+        backend.warm_video = true;
+    }
+    let program = rust_airplay_gstreamer::GstRenderer::find_launcher()
+        .map_err(|error| format!("--render gst: {error}"))?;
+    let renderer = rust_airplay_gstreamer::GstRenderer::with_options(&program, backend)
         .map_err(|error| format!("--render gst: {error}"))?;
     println!(
         "render    gst    {} -> audio {}, video {}",
@@ -123,7 +158,8 @@ fn open_gst() -> Result<Arc<dyn Renderer>, String> {
 
 /// The GStreamer backend, which this build does not have.
 #[cfg(not(feature = "gst"))]
-fn open_gst() -> Result<Arc<dyn Renderer>, String> {
+fn open_gst(options: &Options) -> Result<Arc<dyn Renderer>, String> {
+    let _ = options;
     Err("--render gst needs a build with the `gst` feature: \
          cargo run -p rust-airplay-cli --features gst"
         .to_owned())
@@ -158,7 +194,7 @@ async fn run() -> Result<(), String> {
     // The renderer is chosen before anything is advertised, because a backend this build
     // or this machine cannot provide is something to say now rather than when a client is
     // already waiting for sound.
-    let renderer = renderer(options.render)?;
+    let renderer = renderer(options.render, &options)?;
     if options.render == RenderBackend::Null {
         println!("render    null   media is read and played nowhere");
     }
@@ -352,6 +388,19 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Opt
                     }
                 };
             }
+            "--audio-sink" => {
+                options.audio_sink = Some(next_value(&mut arguments, "--audio-sink")?)
+            }
+            "--video-sink" => {
+                options.video_sink = Some(next_value(&mut arguments, "--video-sink")?)
+            }
+            "--video-parser" => {
+                options.video_parser = Some(next_value(&mut arguments, "--video-parser")?);
+            }
+            "--video-decoder" => {
+                options.video_decoder = Some(next_value(&mut arguments, "--video-decoder")?);
+            }
+            "--warm-video" => options.warm_video = true,
             "--audio-codec" => {
                 let name = next_value(&mut arguments, "--audio-codec")?;
                 options.audio_codec = match name.as_str() {

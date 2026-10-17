@@ -122,6 +122,11 @@ decryption without running a server.
 | `--seed <hex>` | 32 bytes of identity, as 64 hex characters |
 | `--log <file>` | append the request trace to a file |
 | `--render <null\|gst>` | what plays the media; `null` by default |
+| `--audio-sink <name>` | GStreamer audio sink, overriding the environment |
+| `--video-sink <name>` | GStreamer video sink, overriding the environment |
+| `--video-parser <name>` | the parser the mirror pipeline starts with |
+| `--video-decoder <name>` | the decoder that follows it |
+| `--warm-video` | start the video pipeline with the receiver |
 | `--audio-codec <alac\|aac-eld>` | the coding a client sends; `aac-eld` by default |
 | `--help` | print the usage text and exit |
 

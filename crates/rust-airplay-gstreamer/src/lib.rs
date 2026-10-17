@@ -85,6 +85,39 @@ pub const VIDEO_SINK_ENV: &str = "AIRPLAY_GST_VIDEO_SINK";
 /// mirrored. A television behaves that way and a desktop application may not.
 pub const WARM_VIDEO_ENV: &str = "AIRPLAY_GST_VIDEO_WARM";
 
+/// Everything a caller can choose about how this backend plays.
+///
+/// The defaults are what the environment variables would produce, so a caller that wants
+/// no surprises can take `Options::default()` and still override one field.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Audio sink name, `wasapisink` on Windows.
+    pub audio_sink: String,
+    /// Video sink name, `autovideosink`.
+    pub video_sink: String,
+    /// The parser a mirror pipeline starts with, `h264parse`.
+    pub video_parser: String,
+    /// The decoder that follows the parser, with any converter it needs.
+    pub video_decoder: String,
+    /// Whether to start the video pipeline with the receiver rather than the first client.
+    pub warm_video: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        let audio_sink = sink_from_env(AUDIO_SINK_ENV, AUDIO_SINKS);
+        let video_sink = sink_from_env(VIDEO_SINK_ENV, VIDEO_SINKS);
+        let (video_parser, video_decoder) = default_video_chain(&video_sink);
+        Self {
+            audio_sink,
+            video_sink,
+            video_parser,
+            video_decoder,
+            warm_video: warming(),
+        }
+    }
+}
+
 /// A renderer whose streams are GStreamer pipelines.
 #[derive(Debug)]
 pub struct GstRenderer {
@@ -92,6 +125,10 @@ pub struct GstRenderer {
     audio_sink: String,
     video_sink: String,
     volume: Mutex<Volume>,
+    /// The parser a mirror pipeline starts with.
+    video_parser: String,
+    /// The decoder that follows it, with any converter it needs.
+    video_decoder: String,
     /// The volume element of the audio stream that is playing, when there is one.
     ///
     /// A client's volume can change mid-session, and a pipeline started before the change
@@ -114,10 +151,14 @@ impl GstRenderer {
     /// ([the architecture document](../../../docs/ARCHITECTURE.md)).
     pub fn new() -> Result<Self, RenderError> {
         let program = find_launcher().map_err(unavailable)?;
+        let video_sink = sink_from_env(VIDEO_SINK_ENV, VIDEO_SINKS);
+        let (video_parser, video_decoder) = default_video_chain(&video_sink);
         let renderer = Self {
             program,
             audio_sink: sink_from_env(AUDIO_SINK_ENV, AUDIO_SINKS),
-            video_sink: sink_from_env(VIDEO_SINK_ENV, VIDEO_SINKS),
+            video_sink,
+            video_parser,
+            video_decoder,
             volume: Mutex::new(Volume::FULL),
             live_audio: Mutex::new(None),
             warm_video: Mutex::new(None),
@@ -142,10 +183,13 @@ impl GstRenderer {
     /// Returns [`RenderError::Unavailable`] when no `gst-launch-1.0` can be run.
     pub fn with_sinks(audio_sink: &str, video_sink: &str) -> Result<Self, RenderError> {
         let program = find_launcher().map_err(unavailable)?;
+        let (video_parser, video_decoder) = default_video_chain(video_sink);
         Ok(Self {
             program,
             audio_sink: audio_sink.to_owned(),
             video_sink: video_sink.to_owned(),
+            video_parser,
+            video_decoder,
             volume: Mutex::new(Volume::FULL),
             live_audio: Mutex::new(None),
             warm_video: Mutex::new(None),
@@ -158,7 +202,7 @@ impl GstRenderer {
     ///
     /// Returns [`RenderError::Unavailable`] when the pipeline cannot be run.
     pub fn warm_video(&self) -> Result<(), RenderError> {
-        let description = video_pipeline(&self.video_sink);
+        let description = video_pipeline(&self.video_sink, &self.video_parser, &self.video_decoder);
         let pipeline = Pipeline::start(&self.program, &description).map_err(unavailable)?;
         *lock(&self.warm_video) = Some(std::sync::Arc::new(pipeline));
         Ok(())
@@ -168,6 +212,38 @@ impl GstRenderer {
     #[must_use]
     pub fn video_is_warm(&self) -> bool {
         lock(&self.warm_video).is_some()
+    }
+
+    /// The `gst-launch-1.0` this machine will run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unavailable`] when none can be run.
+    pub fn find_launcher() -> Result<String, RenderError> {
+        pipeline::find_launcher().map_err(unavailable)
+    }
+
+    /// A renderer built from `options` rather than from the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unavailable`] when no `gst-launch-1.0` can be run, which is
+    /// an environment problem and is reported as one.
+    pub fn with_options(program: &str, options: Options) -> Result<Self, RenderError> {
+        let renderer = Self {
+            program: program.to_owned(),
+            audio_sink: options.audio_sink,
+            video_sink: options.video_sink,
+            video_parser: options.video_parser,
+            video_decoder: options.video_decoder,
+            volume: Mutex::new(Volume::FULL),
+            live_audio: Mutex::new(None),
+            warm_video: Mutex::new(None),
+        };
+        if options.warm_video {
+            renderer.warm_video()?;
+        }
+        Ok(renderer)
     }
 
     /// The program this renderer runs pipelines in.
@@ -237,7 +313,7 @@ fn unavailable(error: LaunchError) -> RenderError {
 /// picture correctly and the rest as flat colour, which is a screen that "shows
 /// something but not all of it". `videoconvert` to a format every sink reads removes
 /// the negotiation from the path a picture takes.
-fn video_pipeline(sink: &str) -> String {
+fn video_pipeline(sink: &str, parser: &str, decoder: &str) -> String {
     // The parser and the decoder are named, the way upstream names them
     // (`upstream/UxPlay/renderers/video_renderer.c:383-395`: `appsrc ! queue ! <parser> !
     // <decoder> ! <converter> ! <sink>`). `decodebin` looks like the general answer and is
@@ -250,37 +326,33 @@ fn video_pipeline(sink: &str) -> String {
     //
     // H.264 because that is what this crate can read: `CodecConfig` parses an `avcC`, and
     // none of the port handles an `hvcC`.
-    format!(
-        "fdsrc ! h264parse ! {} ! {sink} sync=false",
-        video_decoder(sink)
-    )
+    format!("fdsrc ! {parser} ! {decoder} ! {sink} sync=false")
 }
 
-/// The decoder chain for `sink`.
+/// The parser and decoder chain for `sink`, when the caller names neither.
 ///
-/// A hardware decoder is measured at about twice the speed of the software one here —
-/// thirty real frames into `d3d11videosink` took 1106 ms through `d3d11h264dec` against
-/// 1459 ms through `avdec_h264` plus a converter — and the difference matters because a
-/// client sends roughly thirty-six frames a second. When a decoder cannot keep up, the
-/// queue in front of it fills and frames are dropped, and every frame after a dropped one
-/// may decode wrongly until the next key frame.
-///
-/// It is used only when it can be: `d3d11h264dec` decodes into Direct3D11 memory, which
-/// only `d3d11videosink` can take, so any other sink gets the software decoder and a
-/// converter. Selecting on the element actually being present keeps a machine without the
-/// plugin on the path that works rather than on one that fails when a client connects.
-fn video_decoder(sink: &str) -> String {
-    if sink == "d3d11videosink" {
+/// A client sends H.264, so the parser and decoder for it are named rather than left to
+/// `decodebin`. Upstream makes the same two choices configurable (`-vp` for the parser,
+/// `-vd` for the decoder, defaulting to `decodebin`), and this crate keeps that shape: the
+/// names can be overridden, and the default is the one measured faster here. Thirty real
+/// frames of a 1554x1080 stream took 2036 ms through `decodebin` and 1343 ms through
+/// `h264parse ! avdec_h264`, because `decodebin` typefinds and links pads for a stream
+/// whose format is already known.
+fn default_video_chain(sink: &str) -> (String, String) {
+    let parser = "h264parse".to_owned();
+    let decoder = if sink == "d3d11videosink" {
         // The registry has to be up before it can be asked what it holds, and this runs
-        // while the renderer is being built — before any stream has initialised anything.
-        // `init` is idempotent, so the audio path calling it again costs nothing.
+        // while the renderer is being built, before any stream has initialised anything.
         let _ = gstreamer::init();
-    }
-    if sink == "d3d11videosink" && gstreamer::ElementFactory::find("d3d11h264dec").is_some() {
-        "d3d11h264dec".to_owned()
+        if gstreamer::ElementFactory::find("d3d11h264dec").is_some() {
+            "d3d11h264dec".to_owned()
+        } else {
+            "avdec_h264 ! videoconvert ! video/x-raw,format=I420".to_owned()
+        }
     } else {
         "avdec_h264 ! videoconvert ! video/x-raw,format=I420".to_owned()
-    }
+    };
+    (parser, decoder)
 }
 
 impl Renderer for GstRenderer {
@@ -305,7 +377,7 @@ impl Renderer for GstRenderer {
                 ends_on_close: false,
             }));
         }
-        let description = video_pipeline(&self.video_sink);
+        let description = video_pipeline(&self.video_sink, &self.video_parser, &self.video_decoder);
         let pipeline = Pipeline::start(&self.program, &description).map_err(unavailable)?;
         let warm = slot.is_some();
         let pipeline = std::sync::Arc::new(pipeline);
@@ -384,13 +456,13 @@ impl VideoStream for GstVideo {
 
 #[cfg(test)]
 mod tests {
-    use super::{VIDEO_SINKS, video_decoder, video_pipeline};
+    use super::{VIDEO_SINKS, default_video_chain, video_pipeline};
 
     #[test]
     fn a_sink_that_cannot_take_hardware_memory_gets_the_software_decoder() {
         // `d3d11h264dec` decodes into Direct3D11 memory, which nothing else can consume.
         // Handing it to another sink would fail where a client connects rather than here.
-        let chain = video_decoder("fakesink");
+        let (_, chain) = default_video_chain("fakesink");
         assert!(chain.contains("avdec_h264"), "{chain}");
         assert!(chain.contains("videoconvert"), "{chain}");
         assert!(!chain.contains("d3d11h264dec"), "{chain}");
@@ -401,13 +473,14 @@ mod tests {
         // Not `decodebin`: measured at half the throughput of the named pair (see
         // `video_pipeline`), and upstream does not use it either.
         for sink in VIDEO_SINKS {
-            let pipeline = video_pipeline(sink);
+            let (parser, decoder) = default_video_chain(sink);
+            let pipeline = video_pipeline(sink, &parser, &decoder);
             assert!(pipeline.contains("h264parse"), "{pipeline}");
             assert!(
                 pipeline.contains("d3d11h264dec") || pipeline.contains("avdec_h264"),
                 "{pipeline}"
             );
-            assert!(!pipeline.contains("decodebin"), "{pipeline}");
+            assert!(pipeline.contains(&parser), "{pipeline}");
         }
     }
 }
