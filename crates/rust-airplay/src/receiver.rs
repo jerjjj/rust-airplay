@@ -58,7 +58,7 @@ fn hex(bytes: &[u8]) -> String {
 /// full is reported, because a dropped frame is one the rest of the stream may depend
 /// on. Thirty-two frames is about a second of a screen, which is longer than any
 /// stall a decoder produces and far below anything a receiver would notice holding.
-const QUEUED_FRAMES: usize = 32;
+const QUEUED_FRAMES: usize = 8;
 
 /// Frames waiting for the renderer, where a full queue drops the **oldest**.
 ///
@@ -236,6 +236,13 @@ pub struct Config {
     pub dump_video: Option<std::path::PathBuf>,
     /// Where to write the audio payloads, for diagnosing a stream.
     pub dump_audio: Option<std::path::PathBuf>,
+    /// Whether video is held back to keep the spacing it was captured at.
+    ///
+    /// Off by default. A mirror is judged by how quickly the picture follows the device,
+    /// and pacing spends latency to buy smoothness: writing each frame as it arrives shows
+    /// the newest picture at the cost of an uneven one when a burst arrives. Turn it on for
+    /// a stream that arrives in bursts and a viewer who watches rather than types.
+    pub pace_video: bool,
 }
 
 /// What the two streams' first frames say about their shared clock.
@@ -922,6 +929,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let mirror_renderer = Arc::clone(&renderer);
     let mirror_stop = stopping.clone();
     let mirror_probe = Arc::clone(&probe);
+    let pace_video = config.pace_video;
     tokio::spawn(async move {
         // The listener accepts from the moment the receiver is up, which is not the
         // moment it has keys: a device may open the mirror connection before the
@@ -1073,7 +1081,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
                         let wanted = pacer.due(timestamp, arrival);
                         let due = pacer.due_limited(timestamp, arrival, MAX_LEAD);
                         let mut waited = 0;
-                        if let Some(wait) = crate::media::pace::Pacer::wait(due, now) {
+                        if pace_video && let Some(wait) = crate::media::pace::Pacer::wait(due, now)
+                        {
                             std::thread::sleep(wait);
                             waited = wait.as_millis();
                         }

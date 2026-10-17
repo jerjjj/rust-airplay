@@ -36,6 +36,7 @@ Options:
   --video-parser <name>  GStreamer parser for the mirror stream
   --video-decoder <name> GStreamer decoder for the mirror stream
   --warm-video           Start the video pipeline with the receiver
+  --pace-video           Hold video to its capture spacing (smoother, later)
 
   --audio-codec <codec>  alac or aac-eld, what the client's frames are
   --help                 Print this text
@@ -65,6 +66,8 @@ struct Options {
     video_parser: Option<String>,
     video_decoder: Option<String>,
     warm_video: bool,
+    /// Whether the mirror stream is paced by its timestamps.
+    pace_video: bool,
 }
 
 /// What plays the media a client sends.
@@ -94,6 +97,7 @@ impl Default for Options {
             video_parser: None,
             video_decoder: None,
             warm_video: false,
+            pace_video: false,
 
             // AirPlay 2 clients send AAC-ELD, which is what an iPhone or iPad paired with
             // this receiver sends.
@@ -230,6 +234,7 @@ async fn run() -> Result<(), String> {
         trace_log: options.log.map(std::path::PathBuf::from),
         dump_video: std::env::var_os("AIRPLAY_DUMP_VIDEO").map(std::path::PathBuf::from),
         dump_audio: std::env::var_os("AIRPLAY_DUMP_AUDIO").map(std::path::PathBuf::from),
+        pace_video: options.pace_video,
     };
     rust_airplay::run(config)
         .await
@@ -404,6 +409,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Opt
                 options.video_decoder = Some(next_value(&mut arguments, "--video-decoder")?);
             }
             "--warm-video" => options.warm_video = true,
+            "--pace-video" => options.pace_video = true,
 
             "--audio-codec" => {
                 let name = next_value(&mut arguments, "--audio-codec")?;
