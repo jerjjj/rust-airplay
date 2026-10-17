@@ -102,7 +102,7 @@ pairing vectors and the counter arithmetic.
 
 It needs:
 
-1. a UxPlay checkout at the commit recorded in `research/evidence/upstream-commit.txt`,
+1. a UxPlay checkout at the pinned commit 57ea83411d5f7e0b38c5841987439340543f025c,
    placed at `upstream/UxPlay` (that directory is ignored by git);
 2. the oracle built with `pwsh -File tools/oracle/build.ps1`, which expects MSYS2/UCRT64;
 3. `AIRPLAY_UPSTREAM_ORACLE` pointing at the built executable, or `pwsh -File

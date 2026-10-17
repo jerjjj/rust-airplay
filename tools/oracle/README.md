@@ -4,7 +4,7 @@
 program and prints fixed vectors. The Rust tests under
 `crates/airplay-core/tests/upstream_oracle.rs` and the ignored test
 `srp::tests::upstream_verifier_accepts_our_proof` run it and compare its answers
-with this port, so protocol claims are checked against the C implementation
+with this crate, so protocol claims are checked against the C implementation
 instead of against a second reading of it.
 
 The oracle is a test tool. It is never linked into the product, and it is built
@@ -48,12 +48,12 @@ cargo test -p airplay-core --lib -- --ignored upstream_verifier --nocapture
 |---|---|
 | `verify.keystream0/1` | The server signs with the first 64 bytes of the shared AES-CTR keystream and the client's signature arrives in the second 64 (`pairing.c:414-415`, `:440-443`) |
 | `setup.decrypt_iv` / `setup.encrypt_iv` | Pair-Setup AES-GCM uses the base IV incremented once for the request and twice for the reply (`pairing.c:615`, `:636`) |
-| `setup.request_*` / `setup.reply_*` | Both GCM directions produce the bytes this port produces, tag included |
+| `setup.request_*` / `setup.reply_*` | Both GCM directions produce the bytes this crate produces, tag included |
 | `fairplay.setup_response` | PlayFair's 142-byte setup reply is byte-identical |
 | `fairplay.handshake_response` | PlayFair's 32-byte handshake reply is byte-identical |
 | `fairplay.decrypted_key` | The FairPlay key unwrap of a 72-byte key is byte-identical |
 | `srp.server_public` | The server public value is the minimal encoding, also when it is 255 bytes long |
-| `srp-verify` accepting our proof | Upstream's own verifier authenticates the proof this port computes, and derives the same server proof and session key |
+| `srp-verify` accepting our proof | Upstream's own verifier authenticates the proof this crate computes, and derives the same server proof and session key |
 
 ## Notes
 

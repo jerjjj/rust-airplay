@@ -771,7 +771,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                     let mut shown: u64 = 0;
                     while let Some((data, timestamp, idr)) = queued.take() {
                         // What the pacing is actually told, for the first frames: the
-                        // interval a device sends is not a frame rate this port can
+                        // interval a device sends is not a frame rate this crate can
                         // assume, and a wrong one is a wait that stalls a picture
                         // instead of pacing it. Printed rather than silently clamped,
                         // because the number is the whole question.
@@ -783,7 +783,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                             );
                         }
                         // No waiting between frames, and the interval that used to
-                        // drive one is only printed now. Waiting was this port's own
+                        // drive one is only printed now. Waiting was this crate's own
                         // idea and it was wrong twice over: the pipeline it was
                         // protecting measures fifty-one frames a second on the machine
                         // it runs on, so it never needed protecting, and a wait of one

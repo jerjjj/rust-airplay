@@ -20,11 +20,11 @@
 //! * Every rejection is a bare status line. Upstream's `431` path returns
 //!   before it adds anything (`raop.c:236-238`), and the port extends that to
 //!   all rejections so an unusable request never influences a response header.
-//! * Routes upstream serves but this port has not ported answer `501 Not
+//! * Routes upstream serves but this crate has not ported answer `501 Not
 //!   Implemented` (see [`Route::is_ported`]).
 //! * `ANNOUNCE` is an extension: upstream has no such route, and the port keeps
 //!   it out of [`PUBLIC_METHODS`] so it is never advertised.
-//! * [`ControlState`] is this port's summary of the RTSP lifecycle. Upstream
+//! * [`ControlState`] is this crate's summary of the RTSP lifecycle. Upstream
 //!   tracks a connection type plus `raop_rtp`/`raop_rtp_mirror` handles instead,
 //!   so this state is informational and never rejects a request.
 //! * `SETUP`, `RECORD`, `FLUSH` and `TEARDOWN` are answered with the
@@ -152,14 +152,14 @@ pub enum Route {
     Hls,
     /// `ANNOUNCE`, which upstream does not dispatch at all.
     ///
-    /// This port keeps it as a documented extension so a session can be
+    /// This crate keeps it as a documented extension so a session can be
     /// announced before `SETUP`; it is deliberately absent from
     /// [`PUBLIC_METHODS`] because upstream never advertises it.
     Announce,
 }
 
 impl Route {
-    /// Whether this port implements the route's control-plane behavior.
+    /// Whether this crate implements the route's control-plane behavior.
     ///
     /// An unported route answers `501 Not Implemented` rather than the upstream
     /// handler's `200 OK`, so an unimplemented handler can never be mistaken for
@@ -225,9 +225,9 @@ impl<'a> RequestFacts<'a> {
 /// Result of one upstream route lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dispatch {
-    /// Upstream serves the route and this port implements it.
+    /// Upstream serves the route and this crate implements it.
     Ported(Route),
-    /// Upstream serves the route but this port has not ported it, so the
+    /// Upstream serves the route but this crate has not ported it, so the
     /// response is `501 Not Implemented`.
     NotImplemented(Route),
     /// Upstream selected no handler and answers its default `200 OK` with no body.
@@ -334,7 +334,7 @@ fn dispatch_http(facts: &RequestFacts<'_>) -> Dispatch {
     classify(route)
 }
 
-/// Lifecycle state this port observes for one connection.
+/// Lifecycle state this crate observes for one connection.
 ///
 /// The transitions are informational: upstream's routing layer is stateless, so
 /// no request is ever rejected because of this state
@@ -489,7 +489,7 @@ impl RouteReply {
     ///
     /// Upstream answers this for an unknown RTSP method
     /// (`upstream/UxPlay/lib/raop.c:442-444`) and for an unsupported FairPlay
-    /// setup challenge (`raop_handlers.h:558`). This port also uses it for every
+    /// setup challenge (`raop_handlers.h:558`). This crate also uses it for every
     /// route upstream serves that it has not implemented yet, so an unimplemented
     /// handler can never be mistaken for the upstream `200 OK`.
     pub fn not_implemented() -> Self {

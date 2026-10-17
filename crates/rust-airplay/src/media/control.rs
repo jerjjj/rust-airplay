@@ -107,7 +107,7 @@ impl std::error::Error for ControlError {}
 
 /// Reads one control packet.
 ///
-/// Upstream reads `packet[1]` without looking at the length first; this port
+/// Upstream reads `packet[1]` without looking at the length first; this crate
 /// refuses what it cannot read instead of reading past the datagram.
 ///
 /// # Errors

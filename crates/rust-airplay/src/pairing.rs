@@ -139,7 +139,7 @@ pub fn verify_pair_signature(
     crate::crypto::ed25519_verify(peer_ed25519_public, &message, signature)
 }
 
-/// Fields of a `Digest` authorization header this port has to check.
+/// Fields of a `Digest` authorization header this crate has to check.
 ///
 /// Upstream extracts the same names by searching the header with `strstr` and
 /// writing a NUL into the copy it made (`upstream/UxPlay/lib/pairing.c`,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! What the packet path costs, so that "make it faster" is a measurement.
 //!
-//! The mirror stream is the only part of this port that runs continuously at a device's
+//! The mirror stream is the only part of this crate that runs continuously at a device's
 //! pace: a 1554x1080 screen arrives as about thirty packets a second, from forty bytes to
 //! tens of kilobytes each. Everything the session does per packet is therefore worth
 //! knowing in nanoseconds rather than in intuition.
@@ -36,7 +36,7 @@ fn packet(payload_size: usize, idr: bool) -> (MirrorHeader, Vec<u8>) {
     datagram[4] = 0x00;
     datagram[5] = if idr { 0x10 } else { 0x00 };
     datagram[8..16].copy_from_slice(&42u64.to_le_bytes());
-    let (header, payload) = parse_packet(&datagram).expect("a packet this port built");
+    let (header, payload) = parse_packet(&datagram).expect("a packet this crate built");
     (header, payload.to_vec())
 }
 

@@ -13,7 +13,6 @@ tools/oracle/                   a C oracle built from UxPlay, for differential t
 tools/eld_probe.c               a standalone check that raw AAC-ELD frames decode
 docs/                           architecture, API, build guide, each in English and Chinese
 upstream/UxPlay/                the reference checkout; ignored by git, not vendored
-research/                       feasibility evidence from before the port; ignored by nothing
 ```
 
 ## The gates
@@ -73,7 +72,7 @@ plausible implementation is wrong.
 ## Working with upstream
 
 `upstream/UxPlay` is a checkout of the reference implementation, at the commit recorded in
-`research/evidence/upstream-commit.txt`. It is not vendored and must not be edited.
+the pinned commit 57ea83411d5f7e0b38c5841987439340543f025c. It is not vendored and must not be edited.
 
 When porting behaviour from it:
 

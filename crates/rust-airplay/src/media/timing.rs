@@ -63,7 +63,7 @@ pub const RESPONSE_MIN_LEN: usize = RESPONSE_T3_OFFSET + 4;
 /// # Errors
 ///
 /// Returns the error of [`ntp::unix_nanos_to_timestamp`] when the time cannot be
-/// represented in the NTP era this port uses.
+/// represented in the NTP era this crate uses.
 pub fn build_request(send_time: u64) -> Result<[u8; TIMING_REQUEST_LEN], crate::wire::ParseError> {
     let mut request = [0u8; TIMING_REQUEST_LEN];
     request[..REQUEST_HEADER.len()].copy_from_slice(&REQUEST_HEADER);

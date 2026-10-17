@@ -287,7 +287,7 @@ mod tests {
         );
         // The protocol itself is bounded too, and the longest accepted token is
         // the eight bytes upstream copies into its own buffer. A protocol that is
-        // not one of the two this port knows is rejected by the start line check.
+        // not one of the two this crate knows is rejected by the start line check.
         assert_eq!(
             parse_request_head(b"GET /info RTSPX/1.0\r\nCSeq: 1\r\n\r\n"),
             Err(ParseError::Invalid("start line"))

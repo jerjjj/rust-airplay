@@ -455,7 +455,7 @@ pub enum PairingError {
     NotPlist,
     /// The body carried neither the keys of a known step nor their types.
     UnexpectedKeys,
-    /// A value had a length this port does not accept.
+    /// A value had a length this crate does not accept.
     InvalidLength(&'static str),
     /// A step arrived before the step it depends on.
     OutOfOrder(&'static str),
@@ -649,7 +649,7 @@ impl PairingSession {
     /// The material is handed out at most once, and only after the second
     /// `/pair-verify` step verified the client's signature
     /// (`upstream/UxPlay/lib/pairing.c:108-119` hands it out for any connection
-    /// that started a handshake, which this port deliberately narrows). A caller
+    /// that started a handshake, which this crate deliberately narrows). A caller
     /// that gets `None` has no verified session on this connection and must not
     /// derive stream keys.
     pub(crate) fn take_session_keys(&mut self) -> Option<SessionKeys> {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! A renderer that plays through GStreamer.
 //!
-//! This is the backend the architecture note chose first, in the shape upstream gives it: an audio
+//! This is the backend the architecture document chose first, in the shape upstream gives it: an audio
 //! renderer and a video renderer, each with a pipeline of its own, and the application
 //! choosing a sink (`upstream/UxPlay@3dbf7cee:renderers/`).
 //!
@@ -106,7 +106,7 @@ impl GstRenderer {
     ///
     /// Returns [`RenderError::Unavailable`] when no `gst-launch-1.0` can be run, which
     /// is an environment problem and is reported as one
-    /// ([the architecture note](../../../docs/ARCHITECTURE.md)).
+    /// ([the architecture document](../../../docs/ARCHITECTURE.md)).
     pub fn new() -> Result<Self, RenderError> {
         let program = find_launcher().map_err(unavailable)?;
         let renderer = Self {
@@ -247,11 +247,11 @@ fn video_pipeline(sink: &str) -> String {
     // half the speed of the specific one: measured on a mirror stream of 1554x1080, thirty
     // real frames took 2036 ms through `decodebin` and 1343 ms through `h264parse !
     // avdec_h264`, because `decodebin` runs a typefinder and a dynamic pad for a stream
-    // whose format this port already knows. A client sends about 36 frames a second, so the
+    // whose format this crate already knows. A client sends about 36 frames a second, so the
     // general pipeline cannot keep up and the queue in front of it drops frames — and a
     // dropped frame is not one lost frame, it is every frame after it that referred to it.
     //
-    // H.264 because that is what this port can read: `CodecConfig` parses an `avcC`, and
+    // H.264 because that is what this crate can read: `CodecConfig` parses an `avcC`, and
     // none of the port handles an `hvcC`.
     format!(
         "fdsrc ! h264parse ! {} ! {sink} sync=false",

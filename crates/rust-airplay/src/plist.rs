@@ -24,7 +24,7 @@
 //!   truncated request body can never abort the process.
 //!
 //! Values are handed out as [`plist::Value`] on purpose: navigation of deeper
-//! structures (for example `streams[]`) needs the full value API, and this port
+//! structures (for example `streams[]`) needs the full value API, and this crate
 //! has no reason to hide it.
 
 use std::io::Cursor;

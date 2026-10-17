@@ -29,7 +29,7 @@ device, which is how the tests check a pipeline on a machine with no sound card.
 
 ## Why it is shaped this way
 
-[the architecture note](../../docs/ARCHITECTURE.md) chose GStreamer first and said the backend
+[the architecture document](../../docs/ARCHITECTURE.md) chose GStreamer first and said the backend
 must not stop the default workspace's gates from passing on a machine without it. That
 leaves three ways to reach GStreamer on Windows:
 

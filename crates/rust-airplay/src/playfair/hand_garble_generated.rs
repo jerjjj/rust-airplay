@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Translation of UxPlay's FairPlay hand garbling transform.
 //!
-//! Buffers use `i128` slots to model C's integer promotions; each write is
-//! truncated to one byte exactly as an `unsigned char` assignment.
+//! Buffers use `i128` slots to model C's integer promotions; each write is truncated to one
+//! byte exactly as an `unsigned char` assignment.
+//!
+//! Comments inside the translated body are the upstream author's, kept verbatim so the
+//! transcription stays checkable against its source. They are not this project's voice.
 
 #![allow(clippy::all, non_snake_case, unused_mut, unused_parens)]
 

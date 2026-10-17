@@ -4,7 +4,7 @@
 //! Upstream splits the work in two: `lib/` receives the media and `renderers/` is a
 //! sub-project of its own that decodes and plays it, with the application wiring the
 //! two together (`upstream/UxPlay@3dbf7cee:renderers/`). [`docs/ARCHITECTURE.md`] took the
-//! same shape for this port and deferred the exact interface to the moment the first
+//! same shape for this crate and deferred the exact interface to the moment the first
 //! renderer landed: this crate is that moment.
 //!
 //! The interface exists so that a media backend can be replaced without touching the
@@ -19,7 +19,7 @@ use std::fmt;
 /// The audio coding a stream carries.
 ///
 /// `SETUP` does not say which one a client picked; what says it is the stream's own
-/// compression type, which this port does not read yet, so a caller has to be told
+/// compression type, which this crate does not read yet, so a caller has to be told
 /// which one it has. Getting it wrong is not silent: a decoder fed one kind of frame
 /// as another fails, which is why the choice is a parameter and not a default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +133,7 @@ pub enum RenderError {
     /// The backend is not available on this machine, with what is missing.
     ///
     /// A missing decoder or sink is an environment problem, not a protocol one
-    /// ([the architecture note](../../../docs/ARCHITECTURE.md)), so it is reported
+    /// ([the architecture document](../../../docs/ARCHITECTURE.md)), so it is reported
     /// rather than worked around: a receiver that silently plays nothing is worse
     /// than one that says why.
     Unavailable(String),
@@ -155,9 +155,9 @@ impl std::error::Error for RenderError {}
 /// What renders a session's media.
 ///
 /// A backend implements this; the application injects it; the protocol core never sees
-/// it (the architecture note rule 2). The two streams are separate because a session can have one
+/// it (the architecture document rule 2). The two streams are separate because a session can have one
 /// without the other — an audio-only client never opens a video stream — and because
-/// two backends can serve one session, one per stream (the architecture note rule 4).
+/// two backends can serve one session, one per stream (the architecture document rule 4).
 ///
 /// Every method takes `&self` rather than `&mut self` so that a session can hold the
 /// renderer while its receive loop holds the streams; a backend that needs mutable

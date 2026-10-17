@@ -81,7 +81,7 @@ impl Protection {
     /// `sf` value of the audio record.
     ///
     /// Read back from a running UxPlay 1.74 with `dns-sd`: `sf=0x4` on a receiver that does
-    /// PIN pairing, and `0x84` only when a password is configured. The value this port
+    /// PIN pairing, and `0x84` only when a password is configured. The value this crate
     /// used to send for PIN pairing, `0x8c`, set both the "pin required" bit and the
     /// "password required" bit, which no receiver with a PIN alone advertises.
     fn status_flags(self) -> &'static str {

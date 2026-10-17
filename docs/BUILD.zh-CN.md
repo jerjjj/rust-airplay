@@ -86,7 +86,7 @@ GStreamer 运行时，且下列元素可用：
 
 需要：
 
-1. 在 `upstream/UxPlay` 放一份上游检出，提交号见 `research/evidence/upstream-commit.txt`（该目录被 git 忽略）；
+1. 在 `upstream/UxPlay` 放一份上游检出，提交号为 57ea83411d5f7e0b38c5841987439340543f025c（该目录被 git 忽略）；
 2. 用 `pwsh -File tools/oracle/build.ps1` 构建 oracle，它依赖 MSYS2/UCRT64；
 3. 设置 `AIRPLAY_UPSTREAM_ORACLE` 指向构建出的可执行文件，或直接用 `pwsh -File tools/oracle/run.ps1`（它会替你设置）。
 

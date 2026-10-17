@@ -13,7 +13,7 @@
 //!
 //! both truncated to sixteen bytes, with the audio key being the one the
 //! session's `SETUP` carried. `streamConnectionID` is what the client sent in the
-//! `type: 110` stream entry, which this port already keeps
+//! `type: 110` stream entry, which this crate already keeps
 //! (`server::SetupStream::stream_connection_id`).
 //!
 //! The same file records a consequence that is easy to miss: a re-key means a new
@@ -56,7 +56,7 @@ const IV_PREFIX: &str = "AirPlayStreamIV";
 /// bytes before it looks at anything else).
 pub const HEADER_LEN: usize = 128;
 
-/// Largest payload this port reads.
+/// Largest payload this crate reads.
 ///
 /// A bound exists so that a client cannot make a receiver allocate without limit,
 /// but it has to sit above what a real frame is. Upstream does not bound this at
@@ -94,7 +94,7 @@ pub enum MirrorKind {
     KeepAlive,
     /// An unencrypted report about the stream, sent once a second.
     StreamingReport,
-    /// A pair this port does not know, kept as it arrived.
+    /// A pair this crate does not know, kept as it arrived.
     Unknown {
         /// `packet[4]`.
         first: u8,
@@ -444,7 +444,7 @@ pub struct MirrorDecryptor {
     /// Kept apart from `read_at` because the two are not the same quantity: a packet of
     /// 1265 bytes leaves this at 1265 and `read_at` at 1280. Both were needed to make a
     /// real session's packets decrypt, and measuring them is what took so long — every
-    /// earlier version of this port used one number where there are two.
+    /// earlier version of this crate used one number where there are two.
     position: u64,
     /// The keystream of the block a packet's tail sat in, of which the packet used the
     /// front: what is behind that is the next packet's first bytes.
@@ -546,7 +546,7 @@ impl MirrorDecryptor {
     /// (`mirror_buffer.c:94-124`), and it must not depend on any state a cipher
     /// implementation keeps for itself.
     ///
-    /// It is public because it is also the clearest way to check this port against
+    /// It is public because it is also the clearest way to check this crate against
     /// upstream's own context, block for block, in the differential test.
     #[must_use]
     pub fn keystream(&self, first: u64, blocks: usize) -> Vec<u8> {
@@ -558,13 +558,12 @@ impl MirrorDecryptor {
             // The counter is the IV plus the block index, big-endian, the way OpenSSL's CTR
             // mode counts, and the carry is propagated through the whole 128-bit counter.
             //
-            // This loop was wrong for a long time and the cost was a session's picture. It
-            // stopped as soon as a byte did not overflow, which is not the same as having
-            // nothing left to carry: with an IV ending in `4f`, block 177 adds `b1`, the
-            // last byte becomes `00`, and one has to carry into the byte before it — and
-            // that carry was dropped, leaving the counter a byte short and the stream 256
-            // blocks out. Every vector was shorter than 177 blocks, so nothing caught it; a
-            // real packet of 62 kB is 3875 blocks and catches it at once.
+            // Stopping at the first byte that does not overflow drops the carry that is
+            // still pending. With an IV ending in `4f`, block 177 adds `b1`: the last byte
+            // becomes `00` and one must carry into the byte before it. Dropping that leaves
+            // the counter a byte short and the stream 256 blocks out, which only shows up
+            // from block 177 onwards — a 62 kB packet is 3875 blocks and shows it at once,
+            // while every shorter test vector passes.
             let mut carry = first + index;
             for byte in counter.iter_mut().rev() {
                 if carry == 0 {
@@ -607,7 +606,7 @@ impl MirrorDecryptor {
         // it rather than refusing — the lengths are what a receiver has to survive.
 
         // A packet is read in two parts, and the line between them is what every earlier
-        // version of this port got wrong.
+        // version of this crate got wrong.
         //
         // The cipher reads whole blocks. A packet whose length is not a multiple of the
         // block fills part of its last block, and the counter comes out of that block at
@@ -758,7 +757,7 @@ impl CodecConfig {
         //
         // So the picture set's size sits at `sps_size + 9` and the set at
         // `sps_size + 11` (`raop_rtp_mirror.c:725-728`), one byte later than the
-        // AVCDecoderConfigurationRecord layout puts them. This port had the format's
+        // AVCDecoderConfigurationRecord layout puts them. This crate had the format's
         // offsets: it read `0x9b86` as a size and refused the packet, which means a
         // configuration a real client sent was dropped by a reader that was right
         // about a document and wrong about the wire.
@@ -1221,7 +1220,7 @@ impl MirrorSession {
                 }))
             }
             // Keep-alives and streaming reports carry nothing a decoder can use, and a
-            // packet this port does not recognise is the one worth being able to see:
+            // packet this crate does not recognise is the one worth being able to see:
             // a stream that changes into something unreadable looks exactly like a
             // stream that stopped, unless the two bytes are recorded.
             MirrorKind::KeepAlive | MirrorKind::StreamingReport => {

@@ -3,7 +3,7 @@
 //!
 //! The oracle under `tools/oracle/` compiles UxPlay's own `crypto.c`,
 //! `pairing.c` and `playfair/*` into a small program that prints fixed vectors.
-//! These tests run it and compare its answers with this port, so a protocol claim
+//! These tests run it and compare its answers with this crate, so a protocol claim
 //! is checked against the C code instead of against a second reading of it.
 //!
 //! Ignored by default because it needs a C toolchain; see
@@ -272,7 +272,7 @@ fn mirror_stream_matches_upstream() {
 
 /// What a packet reads when it follows another one, which is what a session is.
 ///
-/// This is the case the per-length vectors cannot reach, and the case this port got
+/// This is the case the per-length vectors cannot reach, and the case this crate got
 /// wrong: each of them gives every length a stream of its own, so a packet's position
 /// after the packet before it was never checked. A session desynchronised exactly
 /// there — its first packet decrypted and every later one did not.
@@ -350,7 +350,7 @@ fn a_packet_reads_the_keystream_the_packet_before_it_ended_at() {
     );
 }
 
-/// Every block the oracle printed by number, against this port's own generator.
+/// Every block the oracle printed by number, against this crate's own generator.
 ///
 /// A block number is the whole of the mirror rule, so this is the comparison that says
 /// whether the two agree about the stream at all: no packets, no carries, no positions —
@@ -372,7 +372,7 @@ fn the_keystream_agrees_block_by_block_far_into_the_stream() {
         let ours = decryptor.keystream(block, 1);
         assert_eq!(
             ours, expected,
-            "block {block} of the stream: this port generates different bytes from upstream"
+            "block {block} of the stream: this crate generates different bytes from upstream"
         );
         compared += 1;
     }
@@ -402,7 +402,7 @@ fn the_counter_carries_through_the_whole_of_it() {
         let ours = counter_for(&keys.iv, block);
         assert_eq!(
             ours, expected,
-            "the counter of block {block}: this port builds a different one"
+            "the counter of block {block}: this crate builds a different one"
         );
         compared += 1;
     }

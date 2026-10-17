@@ -60,7 +60,7 @@ jobs:
   # are the ones that found the mirror counter fault. **They do not run here**: the oracle
   # compiles upstream's C, which is not vendored (`.gitignore` excludes `/upstream/`), and
   # `tools/oracle/build.ps1` drives MSYS2/UCRT64 on Windows. Running it therefore needs a
-  # local checkout of FDH2/UxPlay at the commit in `research/evidence/upstream-commit.txt`:
+  # local checkout of FDH2/UxPlay at the pinned commit 57ea83411d5f7e0b38c5841987439340543f025c:
   #
   #   pwsh -File tools/oracle/run.ps1
   #

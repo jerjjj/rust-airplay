@@ -5,7 +5,7 @@
 //! `upstream/UxPlay/lib/raop_handlers.h`. A handler contributes only the status
 //! code, reason phrase, body and headers its upstream counterpart adds: the
 //! routing decision, the `Audio-Jack-Status`/`Server`/`CSeq` envelope and the
-//! status of a route this port has not ported yet stay in [`crate::control`].
+//! status of a route this crate has not ported yet stay in [`crate::control`].
 
 use std::sync::Arc;
 
@@ -32,7 +32,7 @@ const MAX_SETUP_STREAMS: usize = 4;
 ///
 /// Upstream answers the ports it has bound by the time the request arrives
 /// (`upstream/UxPlay@3dbf7cee:lib/raop_handlers.h:908`, `:935-936`, `:958`,
-/// `:985`). This port has no media or timing sockets yet, and a field it cannot
+/// `:985`). This crate has no media or timing sockets yet, and a field it cannot
 /// honour is left out instead of being filled with a placeholder, so a client
 /// never believes it may send media somewhere nothing listens.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -108,7 +108,7 @@ pub struct SetupRequest {
     /// Port the client listens on for the clock exchange, from `timingPort`.
     ///
     /// The exchange is the receiver's to start: upstream sends its first timing
-    /// request as soon as `SETUP` is answered, to this port
+    /// request as soon as `SETUP` is answered, to this crate
     /// (`upstream/UxPlay@3dbf7cee:lib/raop_ntp.c:614-618`), and a client that never
     /// receives one has no reason to send its media. `None` is a client that did
     /// not name a port, which upstream logs as the AirPlay 2 "Remote Control"
@@ -194,7 +194,7 @@ pub const DEFAULT_SOURCE_VERSION: &str = "220.68";
 /// `/pair-pin-start` and `/pair-setup-pin`, and only after that has failed or timed out
 /// does it settle on the modern flow. That is the wait between tapping a receiver and
 /// seeing a picture — a real device's log showed the pin flow answering `470` at the second
-/// step, which is a protocol it was told to try and this port does not complete.
+/// step, which is a protocol it was told to try and this crate does not complete.
 ///
 /// `dnssdint.h:33`'s `0x5A7FFEE6` is the value before `uxplay.cpp` adjusts it; the running
 /// receiver is what matters, and it says `0x527FFEE6`.
@@ -478,7 +478,7 @@ impl RouteHandlers {
     /// Runs one pairing step on this connection's session.
     ///
     /// Without a [`PairingState`] the route stays unimplemented, which is what
-    /// the control layer reports for a route upstream serves and this port does
+    /// the control layer reports for a route upstream serves and this crate does
     /// not.
     fn pairing_reply(
         &mut self,
@@ -576,7 +576,7 @@ impl RouteHandlers {
                 if let Some(session) = self.pairing.as_mut() {
                     if let Some(keys) = session.take_session_keys() {
                         // `raop_handlers.h:848-854`: the key is hashed with the
-                        // shared secret of a pairing session, which this port
+                        // shared secret of a pairing session, which this crate
                         // only produces for a connection that verified the
                         // client (`pairing.c:108-119` is what it narrows).
                         let digest = sha512_concat(&[&key, &keys.ecdh_secret]);
@@ -592,7 +592,7 @@ impl RouteHandlers {
 
         // `raop_handlers.h:897-901`: the port the client listens on for the clock
         // exchange, which the receiver has to send its requests to. The receiver
-        // starts that exchange, so a session that never learns this port never
+        // starts that exchange, so a session that never learns this crate never
         // ticks.
         // What the request actually carried, for a device session that has to be
         // read afterwards. A `SETUP` is where clients differ most.
@@ -773,7 +773,7 @@ impl RouteHandlers {
     ///
     /// Upstream reads the body of a `text/parameters` request with `sscanf` and
     /// hands the result to its media layer; cover art and DMAP metadata go the
-    /// same way. This port parses the two values strictly, reports them, and
+    /// same way. This crate parses the two values strictly, reports them, and
     /// answers `200` for the content types whose payload belongs to the media
     /// layer that does not exist yet — it does not claim to have stored them.
     fn set_parameter(&mut self, request: &RouteRequest<'_>) -> RouteReply {
@@ -829,7 +829,7 @@ impl RouteHandlers {
     ///
     /// A client that asks about `volume` gets the value its own player reported,
     /// which upstream reads from its media callbacks and defaults to `0.0`
-    /// without them (`:1093-1097`). This port has no media layer, so it answers
+    /// without them (`:1093-1097`). This crate has no media layer, so it answers
     /// that default instead of inventing a level.
     fn get_parameter(&mut self, request: &RouteRequest<'_>) -> RouteReply {
         let Some(content_type) = request.head.header("content-type") else {
@@ -950,7 +950,7 @@ impl RouteHandlers {
     /// A 16-byte challenge starts a session and is answered with a 142-byte
     /// reply, a 164-byte challenge completes it and is answered with 32 bytes.
     /// Any other length is a client error upstream only logs
-    /// (`raop_handlers.h:585-587`), and a version or mode this port does not
+    /// (`raop_handlers.h:585-587`), and a version or mode this crate does not
     /// implement answers `501 Not Implemented` like upstream's version check
     /// (`raop_handlers.h:558`).
     fn fairplay_setup(&mut self, request: &RouteRequest<'_>) -> RouteReply {

@@ -1,3 +1,0 @@
-﻿57ea83411d5f7e0b38c5841987439340543f025c
-2026-09-17
-Add bus watch for "prepare_window_handle" message

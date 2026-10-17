@@ -119,7 +119,7 @@ fn reads_the_codec_packet_a_device_actually_sent() {
 fn refuses_a_stream_payload_beyond_what_a_frame_can_be() {
     // The bound is a guard against a client making a receiver allocate without
     // limit, not a judgement about frames: a 1080p screen that has just changed
-    // arrives as one 76298-byte packet, which a real session sent and this port
+    // arrives as one 76298-byte packet, which a real session sent and this crate
     // refused when the bound was 32768. So the test parses a packet of exactly
     // that size rather than asserting the constant is large enough, which would
     // be a statement about the constant and not about what it does.
@@ -238,7 +238,7 @@ fn patterned(length: usize) -> Vec<u8> {
 
 /// The client's side of the wire, written from the rule `mirror_buffer_decrypt`
 /// follows (`upstream/UxPlay@3dbf7cee:lib/mirror_buffer.c:94-124`) rather than from
-/// this port: the counter restarts on the block after the blocks used so far, the
+/// this crate: the counter restarts on the block after the blocks used so far, the
 /// bytes carried from the previous packet go in front, and a packet that does not
 /// end on a block boundary puts its tail, zero padded, into one whole block whose
 /// unused bytes it carries.
@@ -435,7 +435,7 @@ fn carries_the_tail_block_into_the_next_packet() {
     // Upstream's fixed vector, byte by byte: a 40-byte packet uses two whole
     // blocks and eight bytes of a third, and the other eight bytes of that third
     // block are what the next packet's head is XORed with
-    // (`mirror_buffer.c:96-100`, `:111-123`). An earlier attempt at this port lost
+    // (`mirror_buffer.c:96-100`, `:111-123`). A rule stated without this check loses
     // those eight bytes, which is what this test reports.
     let keys = stream_keys(1, &[0x11; STREAM_KEY_LEN]);
     let stream = keystream(&keys, 6);

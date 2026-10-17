@@ -74,7 +74,7 @@ fn every_coding_of_the_boundary_has_a_description_the_runtime_accepts() {
             !text.contains("erroneous pipeline"),
             "{codec:?}'s description was refused by gst-launch itself: {text}"
         );
-        // Anything else is this machine lacking a decoder for it, which the architecture note calls an
+        // Anything else is this machine lacking a decoder for it, which the architecture document calls an
         // environment problem and this test reports rather than fails on.
         eprintln!("{codec:?} has no decoder on this machine: {text}");
     }

@@ -2,7 +2,7 @@
 //! The sockets one media session listens on.
 //!
 //! A client does not send media anywhere it likes: `SETUP` tells it which ports
-//! to use, and until now this port told it nothing, because nothing was
+//! to use, and until now this crate told it nothing, because nothing was
 //! listening. This module binds the three sockets an audio session needs and
 //! drives the receive path over them, so the ports a receiver advertises are the
 //! ports that answer:
@@ -19,7 +19,7 @@
 //!
 //! Nothing here decides policy: the key and IV come from the `SETUP` that a
 //! caller accepted, and frames go to a caller's callback, which is where a
-//! renderer plugs in ([the architecture note](../../../docs/ARCHITECTURE.md)).
+//! renderer plugs in ([the architecture document](../../../docs/ARCHITECTURE.md)).
 
 use std::net::SocketAddr;
 

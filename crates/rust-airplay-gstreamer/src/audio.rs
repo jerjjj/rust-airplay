@@ -16,7 +16,7 @@
 //! - **the caps carry `codec_data`**, the MPEG-4 `AudioSpecificConfig` that says what the
 //!   frames are. A raw frame cannot say it, so a decoder without it cannot fix its output
 //!   format and refuses the stream with "output caps are unfixed". The values are
-//!   upstream's (`audio_renderer.c:60-68`), and the one this port had guessed for ELD was
+//!   upstream's (`audio_renderer.c:60-68`), and the value a build must not invent for ELD is
 //!   not even ELD — its object type decodes to 33 rather than 39;
 //! - **one push is one frame**, because that is the only boundary a raw AAC stream has.
 

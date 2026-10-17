@@ -52,7 +52,7 @@ fn upstream_references_name_a_known_commit() {
     }
     assert!(
         unknown.is_empty(),
-        "these references name a commit this port was not written against:\n{}",
+        "these references name a commit this crate was not written against:\n{}",
         unknown.join("\n")
     );
 }

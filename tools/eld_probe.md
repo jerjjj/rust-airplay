@@ -1,6 +1,6 @@
 # The ELD probe: does a dump's audio decode when it is fed the way upstream feeds it?
 
-`tools/eld_probe.c` answers one question and nothing else: are the audio frames this port
+`tools/eld_probe.c` answers one question and nothing else: are the audio frames this crate
 receives valid AAC-ELD, or is the fault in the data? It reads a dump written by
 `AIRPLAY_DUMP_AUDIO`, pushes every payload into GStreamer as **its own buffer**, with the
 caps and the `AudioSpecificConfig` upstream uses, and reports how many buffers came back.
@@ -24,7 +24,7 @@ What was actually wrong, in two parts:
    decoder given one cannot fix its output format and refuses with "output caps are unfixed".
    Upstream's caps (`renderers/audio_renderer.c:68`) carry
    `codec_data=(buffer)f8e85000` — the `AudioSpecificConfig` for ELD, 44100 Hz, stereo,
-   480 samples a frame. This port had guessed `f82c00`, which is not even ELD: its object
+   480 samples a frame. This crate had guessed `f82c00`, which is not even ELD: its object
    type decodes to 33, and an earlier attempt that used it failed for that reason.
 
 2. **A byte stream cannot carry frame boundaries.** `appsrc` gives the decoder one buffer per

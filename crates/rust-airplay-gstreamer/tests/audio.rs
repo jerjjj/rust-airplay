@@ -11,7 +11,7 @@
 //! decoder that did not. That distinction matters because a push that succeeds only means
 //! `appsrc` took the buffer — the decoder's opinion arrives on the bus a moment later, and
 //! a test that stopped at "push returned Ok" would pass with caps that are wrong, which is
-//! exactly the mistake this port made for several sessions.
+//! exactly the mistake a push-only test makes: it passes while nothing is decoded.
 
 use rust_airplay::{AudioCodec, AudioConfig, AudioFrame, Renderer};
 use rust_airplay_gstreamer::GstRenderer;
