@@ -43,5 +43,30 @@ dns-sd -B _raop._tcp local
 
 所有里程碑以可审查 Git 提交交付；未通过实机测试的功能不会标注为“兼容完成”。当前尚未配置远程仓库，提交保存在本地。
 
+### 反复构建很慢时：先看接收端是不是还在跑
+
+接收端是常驻进程，而 Windows 上**正在运行的可执行文件不能被覆盖**。如果上一次 `cargo run` 起的接收端还在（另一个窗口、或没有 Ctrl+C），下一次构建会在链接阶段失败：
+
+```
+error: linking with `link.exe` failed: exit code: 1104
+LINK : fatal error LNK1104: 无法打开文件 "...\target\release\deps\rust_airplay.exe"
+```
+
+cargo 会把这次编译判为失败，**下一个命令再重做同样的编译与链接**——于是"每次都要等很久"，而且常常只看到一句被刷过去的错误。查一下有没有残留进程：
+
+```powershell
+Get-Process rust-airplay -ErrorAction SilentlyContinue | Select-Object Id, StartTime
+```
+
+长期跑接收端又同时改代码时，把二进制复制出来运行，构建就不会再去碰它：
+
+```powershell
+cargo build --release -p airplay-cli --features gst
+Copy-Item target\release\rust-airplay.exe "$env:TEMP\airplay-receiver.exe" -Force
+& "$env:TEMP\airplay-receiver.exe" --port 47000 --render gst
+```
+
+文件不被占用时，一次"改一行再跑"的成本是：**dev 约 2 秒，release 约 3 秒**（其中链接分别约 0.35 秒和 3 秒；release 的链接要处理整张 GStreamer + tokio 的依赖图）。日常改动用 `cargo test` / dev 构建迭代，只有要真机验收时才用 `--release`。
+
 项目代码按 GPL-3.0-or-later 发布。上游原有代码、数据表和文档的归属及适用许可需要继续保留，详见 notices。
 
