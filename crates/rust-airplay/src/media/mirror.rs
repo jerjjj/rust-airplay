@@ -683,6 +683,8 @@ impl MirrorDecryptor {
 pub struct CodecConfig {
     /// The units with start codes, waiting for the video packet they belong to.
     pending: Option<Pending>,
+    /// The coding the stream carries, which the first configuration packet settles.
+    codec: VideoCodec,
 }
 
 /// An SPS and PPS waiting for their video packet.
@@ -695,6 +697,21 @@ struct Pending {
     units: Vec<u8>,
 }
 
+/// The coding a mirror stream carries.
+///
+/// A client sends one of the two and does not change mid-session, and the two need
+/// different parsers and decoders: `h264parse` cannot read an HEVC unit, and an HEVC
+/// decoder cannot read H.264. Upstream keeps the same distinction as a flag
+/// (`upstream/UxPlay/lib/raop_rtp_mirror.c:195`, `h265_video`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    /// H.264, which is what every client sends unless told otherwise.
+    #[default]
+    H264,
+    /// HEVC, which a 4K-capable client sends when the receiver asks for it.
+    H265,
+}
+
 /// Why a codec configuration packet could not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecDataError {
@@ -702,6 +719,13 @@ pub enum CodecDataError {
     TooShort {
         /// Length it has.
         length: usize,
+    },
+    /// A parameter set does not start with its marker, so this is not the layout it claims.
+    NotAParameterSet {
+        /// Where the marker should have been.
+        offset: usize,
+        /// The byte that was there instead.
+        byte: u8,
     },
     /// The sizes do not leave room for both units in the payload.
     SizeOutOfRange {
@@ -725,6 +749,10 @@ impl std::fmt::Display for CodecDataError {
                 formatter,
                 "the codec packet claims {sps} + {pps} bytes of parameter sets in {length}"
             ),
+            Self::NotAParameterSet { offset, byte } => write!(
+                formatter,
+                "the parameter set at {offset} starts with {byte:#04x}, not its marker"
+            ),
         }
     }
 }
@@ -745,6 +773,13 @@ impl CodecConfig {
     /// parameter sets, which is dropped rather than prepended to a frame: a
     /// decoder fed a wrong byte stream does not fail cleanly.
     pub fn codec_data(&mut self, timestamp: u64, payload: &[u8]) -> Result<(), CodecDataError> {
+        // A mirroring client says which coding it is about to send in the four bytes after
+        // the six-byte header: `avc1` for H.264 and `hvc1` for HEVC
+        // (`upstream/UxPlay/lib/raop_rtp_mirror.c:627-633`). A stream sends one or the
+        // other and does not change, so the first answer is the answer.
+        if payload.get(4..8) == Some(b"hvc1") {
+            return self.hevc_data(timestamp, payload);
+        }
         // The offsets are upstream's, and a device's own packet is what shows why they
         // are not the ones the format's description suggests. For an iPad's 1080p H.264
         // configuration:
@@ -791,6 +826,50 @@ impl CodecConfig {
         units.extend_from_slice(pps);
         self.pending = Some(Pending { timestamp, units });
         Ok(())
+    }
+
+    /// Reads an HEVC configuration packet, which carries three parameter sets.
+    ///
+    /// The layout is upstream's (`upstream/UxPlay/lib/raop_rtp_mirror.c:643-693`) and it is
+    /// nothing like a `hvcC` box: at offset 0x75 the payload holds `a0 00 01` and a
+    /// sixteen-bit size, then the video parameter set; `a1 00 01` and a size, then the
+    /// sequence set; `a2 00 01` and a size, then the picture set. The decoder needs all
+    /// three behind start codes, in that order.
+    fn hevc_data(&mut self, timestamp: u64, payload: &[u8]) -> Result<(), CodecDataError> {
+        let mut units = Vec::new();
+        let mut at = 0x75usize;
+        for marker in [0xa0u8, 0xa1, 0xa2] {
+            let header = payload.get(at..at + 5).ok_or(CodecDataError::TooShort {
+                length: payload.len(),
+            })?;
+            if header[0] != marker || header[1] != 0x00 || header[2] != 0x01 {
+                return Err(CodecDataError::NotAParameterSet {
+                    offset: at,
+                    byte: header[0],
+                });
+            }
+            let size = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            let start = at + 5;
+            let set = payload
+                .get(start..start + size)
+                .ok_or(CodecDataError::SizeOutOfRange {
+                    sps: size,
+                    pps: 0,
+                    length: payload.len(),
+                })?;
+            units.extend_from_slice(&START_CODE);
+            units.extend_from_slice(set);
+            at = start + size;
+        }
+        self.codec = VideoCodec::H265;
+        self.pending = Some(Pending { timestamp, units });
+        Ok(())
+    }
+
+    /// The coding this stream carries, as far as its configuration said.
+    #[must_use]
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
     }
 
     /// Whether a configuration is waiting for its video packet.
@@ -1256,3 +1335,70 @@ fn hex_preview(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod hevc_tests {
+    use super::{CodecConfig, VideoCodec};
+
+    /// A codec packet the way an HEVC mirroring client lays it out.
+    fn hevc_packet(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0u8; 0x75];
+        payload[4..8].copy_from_slice(b"hvc1");
+        for (marker, set) in [(0xa0u8, vps), (0xa1, sps), (0xa2, pps)] {
+            payload.push(marker);
+            payload.extend_from_slice(&[0x00, 0x01]);
+            payload.extend_from_slice(&(set.len() as u16).to_be_bytes());
+            payload.extend_from_slice(set);
+        }
+        payload
+    }
+
+    #[test]
+    fn an_hevc_configuration_becomes_three_units_behind_start_codes() {
+        let vps = [0x40u8, 0x01, 0x0c];
+        let sps = [0x42u8, 0x01, 0x01];
+        let pps = [0x44u8, 0x01, 0xc0];
+        let payload = hevc_packet(&vps, &sps, &pps);
+        let mut config = CodecConfig::new();
+        config.codec_data(7, &payload).expect("a conforming packet");
+        assert_eq!(config.codec(), VideoCodec::H265);
+        let units = config.prepend_to(7).expect("the packet it belongs to");
+        let expected: Vec<u8> = [
+            &[0u8, 0, 0, 1][..],
+            &vps,
+            &[0, 0, 0, 1],
+            &sps,
+            &[0, 0, 0, 1],
+            &pps,
+        ]
+        .concat();
+        assert_eq!(units, expected);
+    }
+
+    #[test]
+    fn an_h264_configuration_is_still_h264() {
+        // The H.264 layout: a size at six, the set at eight. Its four-character code is
+        // `avc1`, which is what keeps the two apart.
+        let mut payload = vec![0u8; 6];
+        payload.extend_from_slice(&[0x00, 0x02]);
+        payload.extend_from_slice(&[0x67, 0x42]);
+        payload.push(0x01);
+        payload.extend_from_slice(&[0x00, 0x01]);
+        payload.extend_from_slice(&[0x68]);
+        let mut config = CodecConfig::new();
+        config.codec_data(1, &payload).expect("a conforming packet");
+        assert_eq!(config.codec(), VideoCodec::H264);
+    }
+
+    #[test]
+    fn a_marker_out_of_place_is_refused() {
+        let mut payload = hevc_packet(&[0x40], &[0x42], &[0x44]);
+        payload[0x75] = 0x99;
+        let mut config = CodecConfig::new();
+        assert!(config.codec_data(1, &payload).is_err());
+        assert!(
+            !config.is_pending(),
+            "a refused packet leaves nothing waiting"
+        );
+    }
+}
