@@ -70,6 +70,33 @@ does it is the reason it is written down this precisely here.
 Frames leave the media path as Annex-B access units. A client that sends its parameter sets
 separately gets them prepended to the frame they belong to.
 
+## Keeping audio and video together
+
+A mirroring client sends two streams with timestamps that have nothing in common. A mirror
+frame carries NTP fixed point - the high half counts seconds since the device booted, which
+one session showed as 8355 - and consecutive frames differ by about 143 million ticks, which
+is 2^32 times thirty-three milliseconds. An audio frame carries an RTP counter that starts at
+a random value and advances 480 samples a frame at 44.1 kHz. Subtracting one from the other
+is subtracting two arbitrary origins, and every attempt to convert between them absolutely
+was wrong by millions of seconds.
+
+What the streams do share is a rate, so the receiver anchors each on the arrival of its first
+frame and advances it by that rate: 2^32 ticks a second for the mirror stream, the sample
+rate for audio. The client captures both at the same instant and sends them together, so the
+two anchors are a network's width apart and stay there.
+
+The timing exchange is not what does this, and it took a device session to establish why. Its
+answers carry whole seconds, so its delay and offset are quantised at a second; the offset it
+reports is a residual that is zero by construction on the exchange that fixes the epoch. It
+is kept for the epoch it establishes - which converts a client timestamp to a local one for
+diagnostics - and not for scheduling.
+
+Waiting is bounded in both writers. A client sends a second of mirror frames in a few tens of
+milliseconds, so pacing the burst at capture spacing would show the last frame of it a second
+late; past forty milliseconds a frame is shown at once and the anchor moves to it. Pacing is
+off by default for video altogether: a mirror is judged by how quickly it follows the device,
+and `pace_video` trades that for even spacing when someone wants it.
+
 ## Rendering
 
 Frames cross a trait boundary as owned buffers with a timestamp. The receive loop must never
