@@ -958,7 +958,11 @@ fn ported_reply(route: Route, audio_delay_micros: u32) -> RouteReply {
         Route::Teardown => RouteReply::ok()
             .with_header("Connection", "close")
             .closing(),
-        _ => RouteReply::ok(),
+        // A route this crate does not serve says so. Answering `200 OK` while doing
+        // nothing is a promise to the client that the receiver is not keeping, and a
+        // client that waits for a recording or a stream to start has no way to tell the
+        // difference between "not yet" and "never".
+        _ => RouteReply::not_implemented(),
     }
 }
 

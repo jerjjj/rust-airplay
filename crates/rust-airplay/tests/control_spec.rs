@@ -348,10 +348,14 @@ fn options_and_setup_are_never_rejected_by_state() {
         ("OPTIONS", "*", 5),
     ] {
         let response = respond(&mut session, &request(method, target, "RTSP/1.0", cseq, ""));
-        // SETUP is served by a handler, and this session has none, so its answer
-        // is `501` rather than a rejection by state; the server tests cover the
-        // route itself.
-        let expected = if method == "SETUP" { 501 } else { 200 };
+        // SETUP and FLUSH are served by handlers, and this session has none, so their
+        // answers are `501` rather than rejections by state; the server tests cover the
+        // routes themselves. OPTIONS needs no handler and is always served.
+        let expected = if method == "SETUP" || method == "FLUSH" {
+            501
+        } else {
+            200
+        };
         assert_eq!(response.status, expected, "{method} #{cseq}");
     }
     assert_eq!(session.state(), ControlState::New);
